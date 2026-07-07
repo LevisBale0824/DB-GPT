@@ -1,0 +1,1471 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>04 · Agent 系统 — DB-GPT 源码精读</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="layout">
+
+<aside class="sidebar">
+  <h2>DBGPT 精读</h2>
+  <ul><li><a href="index.html">总览</a></li></ul>
+  <div class="group-title">入门</div>
+  <ul>
+    <li><a href="01-architecture.html">01 · 整体架构</a></li>
+    <li><a href="02-startup.html">02 · 启动流程</a></li>
+  </ul>
+  <div class="group-title">核心子系统</div>
+  <ul>
+    <li><a href="03-awel.html">03 · AWEL 工作流</a></li>
+    <li><a href="04-agent.html" class="active">04 · Agent 系统</a></li>
+    <li><a href="05-rag.html">05 · RAG 检索</a></li>
+    <li><a href="06-model.html">06 · 模型层</a></li>
+    <li><a href="07-datasource.html">07 · 数据源</a></li>
+  </ul>
+  <div class="group-title">应用层</div>
+  <ul>
+    <li><a href="08-scene.html">08 · Scene 场景</a></li>
+    <li><a href="09-serve.html">09 · Serve 服务</a></li>
+    <li><a href="10-ext.html">10 · Ext 扩展</a></li>
+  </ul>
+  <div class="group-title">实战</div>
+  <ul><li><a href="11-trace.html">11 · 链路追踪</a></li></ul>
+</aside>
+
+<main class="main">
+<h1>04 · Agent 系统 <span class="tag">Core</span></h1>
+<p class="subtitle">从 Agent 抽象到 ReAct 推理循环、Resource 体系、多 Agent 协作、Hybrid Memory 与 Skill 中间件的全景剖析</p>
+
+<div class="toc">
+  <div class="toc-title">本章导览</div>
+  <ol>
+    <li><a href="#what">Agent 是什么 · 与 AWEL 的关系</a></li>
+    <li><a href="#abstractions">六大核心抽象一览</a></li>
+    <li><a href="#lifecycle">Agent 生命周期与 a_call 主循环</a></li>
+    <li><a href="#resource">Resource 体系：工具/数据库/知识/技能</a></li>
+    <li><a href="#react">ReAct 推理循环源码精读</a></li>
+    <li><a href="#team">多 Agent 协作机制</a></li>
+    <li><a href="#memory">Hybrid Memory：短期 + 长期</a></li>
+    <li><a href="#skill">Skill 系统：Agent 的"技能包"</a></li>
+    <li><a href="#middleware">中间件机制</a></li>
+    <li><a href="#quiz">思考题</a></li>
+  </ol>
+</div>
+
+<div class="callout tip">
+  <strong>核心源码位置：</strong>
+  <code>packages/dbgpt-core/src/dbgpt/agent/</code>。本章精读的关键文件包括
+  <code>core/agent.py</code>（Agent 接口）、<code>core/base_agent.py</code>（ConversableAgent 实现）、
+  <code>expand/react_agent.py</code>（ReAct）、<code>resource/</code> 全部资源类、
+  <code>core/memory/hybrid.py</code>（混合记忆）、<code>middleware/base.py</code>（中间件）。
+</div>
+
+<h2 id="what">一、Agent 是什么 · 与 AWEL 的关系</h2>
+<p>在 DB-GPT 中，<strong>Agent</strong> 是一个具有<strong>角色（Role）</strong>、能通过 LLM <strong>思考（Thinking）</strong>、调用<strong>资源（Resource）</strong>执行<strong>动作（Action）</strong>、并基于<strong>记忆（Memory）</strong>自我演化的自治单元。它把"自然语言意图 → 可验证结果"的过程封装为一条标准管线：</p>
+<ul>
+  <li><strong>接收消息</strong>（receive） → <strong>生成回复</strong>（generate_reply）→ <strong>思考</strong>（thinking）→ <strong>审查</strong>（review）→ <strong>行动</strong>（act）→ <strong>校验</strong>（verify）→ 循环直至通过或终止</li>
+  <li>每一轮的中间产物以 <code>AgentMessage</code> 的形式在 Agent 之间、Agent 与 Memory 之间流转</li>
+</ul>
+
+<p><strong>Agent 与 AWEL 的关系</strong>是 DB-GPT 架构中最容易被误解的部分：</p>
+<ul>
+  <li>AWEL（第 03 章）是<strong>横向的 DAG 编排层</strong>，负责把 Operator 串成工作流</li>
+  <li>Agent 是<strong>纵向的自治单元</strong>，内部自带一个 "Thinking → Act → Verify" 循环</li>
+  <li>两者通过 <code>core/plan/awel/agent_operator.py</code> 中的 <code>WrappedAgentOperator</code> / <code>AWELAgentOperator</code> 桥接：<strong>把一个 Agent 包成一个 AWEL MapOperator</strong>，这样 Agent 就能在 DAG 中被串联</li>
+</ul>
+
+<div class="callout">
+  <strong>设计哲学：</strong>AWEL 适合<strong>确定性的数据流编排</strong>（如 RAG → LLM → 后处理），而 Agent 适合<strong>需要 LLM 自主决策的循环任务</strong>（如"先查库，若空则搜索，再综合作答"）。两者在 <code>team_awel_layout.py</code> 中融合为"AWEL Layout Team"，即用 AWEL DAG 描述团队协作拓扑。
+</div>
+
+<h3>1.1 Agent 的本质：一个被 LLM 驱动的状态机</h3>
+<p>从计算机科学的角度看，DB-GPT 的 Agent 本质上是一个<strong>由 LLM 驱动的有限状态机</strong>。每一轮 <code>generate_reply</code> 循环就是一次状态转换：</p>
+<ul>
+  <li><strong>输入状态</strong>：当前轮次的消息历史（AgentMessage 列表）+ 资源 prompt + 记忆</li>
+  <li><strong>转换函数</strong>：LLM 推理（thinking）+ 动作执行（act）</li>
+  <li><strong>输出状态</strong>：新的 AgentMessage（含 action_report 和 observation）</li>
+  <li><strong>终止条件</strong>：verify 通过、terminate 动作、retry 耗尽、超时</li>
+</ul>
+<p>与传统的状态机不同，这里的"转换函数"是不确定性的——同样的输入，LLM 可能给出不同的推理路径。这就是为什么需要 <code>verify</code> 环节和 <code>max_retry_count</code> 保护：它们是在用<strong>确定性框架</strong>约束<strong>非确定性推理</strong>。</p>
+
+<h3>1.2 ConversableAgent：Agent 接口的标准实现</h3>
+<p><code>Agent</code> 只是 ABC 接口，真正的实现是 <code>ConversableAgent</code>（继承 <code>Role</code> + <code>Agent</code>）。<code>Role</code> 来自 <code>core/role.py</code>，提供身份信息（name、role、desc、goal）和运行模式（<code>AgentRunMode</code>）。<code>ConversableAgent</code> 在此基础上添加了 LLM 配置、Action 列表、Resource 引用、Memory 句柄、线程池执行器等运行时状态。</p>
+<p>理解这一点很重要：<strong>Agent 的"身份"和"能力"是分离的</strong>。身份由 <code>ProfileConfig</code> 描述（名字、角色、系统提示词），能力由 <code>actions</code> + <code>resource</code> + <code>llm_config</code> 决定。这意味着同一个 Agent 类（如 ReActAgent），配上不同的 Profile 和 Resource，就能表现为完全不同的角色——这是 DB-GPT Agent 系统灵活性的根源。</p>
+
+<h2 id="abstractions">二、六大核心抽象一览</h2>
+<p>整个 agent 包围绕六个抽象构建：</p>
+
+<table>
+  <thead>
+    <tr><th>抽象</th><th>定义位置</th><th>职责</th><th>关键方法/字段</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>Agent</code></td>
+      <td><code>core/agent.py</code></td>
+      <td>抽象基类，定义 send/receive/generate_reply/thinking/act/verify 接口</td>
+      <td><code>send()</code> <code>receive()</code> <code>generate_reply()</code> <code>thinking()</code> <code>act()</code> <code>verify()</code></td>
+    </tr>
+    <tr>
+      <td><code>AgentContext</code></td>
+      <td><code>core/agent.py</code></td>
+      <td>会话上下文：conv_id、温度、max_chat_round、上下文管理开关</td>
+      <td><code>conv_id</code> <code>temperature</code> <code>max_new_tokens</code> <code>enable_context_management</code></td>
+    </tr>
+    <tr>
+      <td><code>Resource</code></td>
+      <td><code>resource/base.py</code></td>
+      <td>资源抽象：提供 prompt、execute、preload</td>
+      <td><code>type()</code> <code>get_prompt()</code> <code>execute()</code> <code>get_resource_by_type()</code></td>
+    </tr>
+    <tr>
+      <td><code>Action</code></td>
+      <td><code>core/action/base.py</code></td>
+      <td>动作抽象：解析 LLM 输出并执行，产出 ActionOutput</td>
+      <td><code>resource_need</code> <code>run()</code> <code>parse_action()</code></td>
+    </tr>
+    <tr>
+      <td><code>AgentMessage</code></td>
+      <td><code>core/agent.py</code></td>
+      <td>消息载体：content、role、action_report、review_info、resource_info</td>
+      <td><code>content</code> <code>action_report</code> <code>to_llm_message()</code></td>
+    </tr>
+    <tr>
+      <td><code>AgentMemory</code></td>
+      <td><code>core/memory/</code></td>
+      <td>记忆系统：短期、长期、GptsMemory（对话日志）</td>
+      <td><code>read()</code> <code>write()</code> <code>structure_clone()</code></td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>2.1 Agent 接口定义</h3>
+<p>所有 Agent 的契约都在 <code>core/agent.py</code> 里：<code>Agent</code> 是一个纯抽象基类（ABC），只定义行为契约，不持有状态。</p>
+
+<div class="file-block">
+  <div class="file-header">
+    <span>packages/dbgpt-core/src/dbgpt/agent/core/agent.py</span>
+    <span class="lines">L16-L60</span>
+  </div>
+  <div class="file-body">
+<pre><code><span class="k">class</span> <span class="t">Agent</span>(ABC):
+    <span class="s">"""Agent Interface."""</span>
+
+    <span class="k">@abstractmethod</span>
+    <span class="k">async def</span> <span class="f">send</span>(
+        self,
+        message: <span class="t">AgentMessage</span>,
+        recipient: <span class="s">"Agent"</span>,
+        reviewer: <span class="t">Optional</span>[<span class="s">"Agent"</span>] = <span class="k">None</span>,
+        request_reply: <span class="t">Optional</span>[<span class="t">bool</span>] = <span class="k">True</span>,
+        is_recovery: <span class="t">Optional</span>[<span class="t">bool</span>] = <span class="k">False</span>,
+        silent: <span class="t">Optional</span>[<span class="t">bool</span>] = <span class="k">False</span>,
+        is_retry_chat: <span class="t">bool</span> = <span class="k">False</span>,
+        last_speaker_name: <span class="t">Optional</span>[<span class="t">str</span>] = <span class="k">None</span>,
+        rely_messages: <span class="t">Optional</span>[<span class="t">List</span>[<span class="t">AgentMessage</span>]] = <span class="k">None</span>,
+        historical_dialogues: <span class="t">Optional</span>[<span class="t">List</span>[<span class="t">AgentMessage</span>]] = <span class="k">None</span>,
+    ) -&gt; <span class="k">None</span>:
+        <span class="s">"""Send a message to recipient agent."""</span>
+
+    <span class="k">@abstractmethod</span>
+    <span class="k">async def</span> <span class="f">receive</span>(self, message, sender, ...) -&gt; <span class="k">None</span>:
+        <span class="s">"""Receive a message from another agent."""</span>
+
+    <span class="k">@abstractmethod</span>
+    <span class="k">async def</span> <span class="f">generate_reply</span>(self, received_message, sender, ...) -&gt; <span class="t">AgentMessage</span>:
+        <span class="s">"""Generate a reply based on the received messages."""</span>
+
+    <span class="k">@abstractmethod</span>
+    <span class="k">async def</span> <span class="f">thinking</span>(self, messages, sender=<span class="k">None</span>, prompt=<span class="k">None</span>, ...) -&gt; <span class="t">Tuple</span>:
+        <span class="s">"""Think and reason about the current task goal."""</span>
+
+    <span class="k">@abstractmethod</span>
+    <span class="k">async def</span> <span class="f">act</span>(self, message, sender, reviewer=<span class="k">None</span>, ...) -&gt; <span class="s">"ActionOutput"</span>:
+        <span class="s">"""Act based on the LLM inference results."""</span>
+
+    <span class="k">@abstractmethod</span>
+    <span class="k">async def</span> <span class="f">verify</span>(self, message, sender, reviewer=<span class="k">None</span>, ...) -&gt; <span class="t">Tuple</span>[<span class="t">bool</span>, <span class="t">Optional</span>[<span class="t">str</span>]]:
+        <span class="s">"""Verify whether the current execution results meet the target expectations."""</span>
+</code></pre>
+  </div>
+</div>
+
+<p>注意签名中有大量"协作参数"：<code>reviewer</code>（审查者）、<code>rely_messages</code>（依赖的前序消息）、<code>historical_dialogues</code>（历史对话）、<code>is_retry_chat</code>（是否重试）、<code>last_speaker_name</code>（上一个发言者）—— 这些都是为多 Agent 团队协作设计的，单 Agent 场景大部分留空即可。</p>
+
+<h3>2.2 AgentContext：会话级配置</h3>
+<p><code>AgentContext</code> 是一个 dataclass，绑定到 Agent 实例上，描述"这次对话"的运行时环境：</p>
+
+<div class="file-block">
+  <div class="file-header">
+    <span>packages/dbgpt-core/src/dbgpt/agent/core/agent.py</span>
+    <span class="lines">L196-L228</span>
+  </div>
+  <div class="file-body">
+<pre><code><span class="k">@dataclasses.dataclass</span>
+<span class="k">class</span> <span class="t">AgentContext</span>:
+    <span class="s">"""A class to represent the context of an Agent."""</span>
+    conv_id: <span class="t">str</span>
+    gpts_app_code: <span class="t">Optional</span>[<span class="t">str</span>] = <span class="k">None</span>
+    gpts_app_name: <span class="t">Optional</span>[<span class="t">str</span>] = <span class="k">None</span>
+    language: <span class="t">Optional</span>[<span class="t">str</span>] = <span class="k">None</span>
+    max_chat_round: <span class="t">int</span> = <span class="n">100</span>
+    max_retry_round: <span class="t">int</span> = <span class="n">10</span>
+    max_new_tokens: <span class="t">int</span> = <span class="n">4096</span>
+    temperature: <span class="t">float</span> = <span class="n">0.5</span>
+    allow_format_str_template: <span class="t">Optional</span>[<span class="t">bool</span>] = <span class="k">False</span>
+    verbose: <span class="t">bool</span> = <span class="k">False</span>
+
+    app_link_start: <span class="t">bool</span> = <span class="k">False</span>
+    enable_vis_message: <span class="t">bool</span> = <span class="k">True</span>
+
+    <span class="c"># 工作目录，存放快照文件</span>
+    output_dir: <span class="t">Optional</span>[<span class="t">str</span>] = <span class="k">None</span>
+
+    <span class="c"># 多层上下文管理（可选开启）</span>
+    enable_context_management: <span class="t">bool</span> = <span class="k">False</span>
+    max_context_tokens: <span class="t">int</span> = <span class="n">120000</span>
+    context_warning_threshold: <span class="t">float</span> = <span class="n">0.70</span>
+    context_error_threshold: <span class="t">float</span> = <span class="n">0.90</span>
+</code></pre>
+  </div>
+</div>
+
+<div class="callout tip">
+  <strong>多层上下文管理</strong>（<code>enable_context_management</code>）是 v0.7+ 引入的特性，
+  当 thinking 消息接近 LLM 上下文窗口阈值时会触发<strong>主动压缩</strong>（proactive compact），
+  在 LLM 返回 <code>context_too_long</code> 错误时触发<strong>被动压缩</strong>（reactive compact），
+  分层策略由 <code>core/context/manager.py</code> 中的 <code>ContextManager</code> 实现。
+</div>
+
+<h2 id="lifecycle">三、Agent 生命周期与 a_call 主循环</h2>
+<p>真正实现所有逻辑的是 <code>ConversableAgent</code>（<code>core/base_agent.py</code>，约 900+ 行），它同时继承自 <code>Role</code> 和 <code>Agent</code>。其核心方法 <code>generate_reply</code> 被标记为 <code>@final</code>，子类不可覆盖——这是为了强制所有 Agent 走同一条经过精心打磨的主循环。</p>
+
+<h3>3.1 build()：构建阶段</h3>
+<p>Agent 在被使用前必须经过 <code>build()</code> 完成初始化：</p>
+
+<div class="file-block">
+  <div class="file-header">
+    <span>packages/dbgpt-core/src/dbgpt/agent/core/base_agent.py</span>
+    <span class="lines">L190-L224</span>
+  </div>
+  <div class="file-body">
+<pre><code><span class="k">async def</span> <span class="f">build</span>(self, is_retry_chat: <span class="t">bool</span> = <span class="k">False</span>) -&gt; <span class="s">"ConversableAgent"</span>:
+    <span class="c"># 1. 预加载资源（如连接数据库、加载知识库索引）</span>
+    <span class="k">await</span> self.preload_resource()
+    <span class="c"># 2. 检查可用性：identity、context、action、resource、llm 五项检查</span>
+    self.check_available()
+    _language = self.not_null_agent_context.language
+    <span class="k">if</span> _language:
+        self.language = _language
+
+    <span class="c"># 3. 为每个 Action 注入资源引用</span>
+    <span class="k">for</span> action <span class="k">in</span> self.actions:
+        action.init_resource(self.resource)
+
+    <span class="c"># 4. 初始化 LLM 客户端和记忆系统</span>
+    <span class="k">if not</span> self.is_human:
+        <span class="k">if not</span> self.llm_config <span class="k">or not</span> self.llm_config.llm_client:
+            <span class="k">raise</span> <span class="t">ValueError</span>(<span class="s">"LLM client is not initialized！"</span>)
+        self.llm_client = <span class="t">AIWrapper</span>(llm_client=self.llm_config.llm_client)
+        real_conv_id, _ = <span class="f">parse_conv_id</span>(self.not_null_agent_context.conv_id)
+        memory_session = <span class="s">f"{real_conv_id}_{self.role}_{self.name}"</span>
+        self.memory.initialize(
+            self.name,
+            self.llm_config.llm_client,
+            importance_scorer=self.memory_importance_scorer,
+            insight_extractor=self.memory_insight_extractor,
+            session_id=memory_session,
+        )
+        <span class="c"># 克隆一份记忆结构（避免多会话间共享）</span>
+        self.memory = self.memory.structure_clone()
+        action_outputs = <span class="k">await</span> self.memory.gpts_memory.get_agent_history_memory(
+            real_conv_id, self.role
+        )
+        <span class="k">await</span> self.recovering_memory(action_outputs)
+    <span class="k">return</span> self
+</code></pre>
+  </div>
+</div>
+
+<h3>3.2 check_available()：五项安全检查</h3>
+<p>在 <code>build()</code> 阶段，<code>check_available()</code> 会执行五项严格的可用性检查，任何一项不通过都会抛出 <code>ValueError</code>：</p>
+<ul>
+  <li><strong>身份检查</strong>（<code>identity_check</code>）：确保 Agent 有 name 和 role</li>
+  <li><strong>上下文检查</strong>：确保 <code>agent_context</code> 不为 None</li>
+  <li><strong>Action 检查</strong>：确保每个 Action 所需的 Resource 类型都已绑定</li>
+  <li><strong>人类/团队豁免</strong>：如果是 human 或 team 类型，跳过 Action 检查</li>
+  <li><strong>LLM 检查</strong>：确保非人类 Agent 有 <code>llm_config</code> 和 <code>llm_client</code></li>
+</ul>
+<p>这种"构建时检查"的设计避免了运行时才发现缺少关键依赖的问题，是工程化 Agent 系统的重要实践。</p>
+
+<h3>3.3 generate_reply()：不可覆盖的主循环</h3>
+<p>这是整个 Agent 系统的"心脏"，它在 <code>max_retry_count</code> 次循环中反复执行"思考 → 审查 → 行动 → 校验"，直到通过或耗尽重试次数：</p>
+
+<div class="file-block">
+  <div class="file-header">
+    <span>packages/dbgpt-core/src/dbgpt/agent/core/base_agent.py</span>
+    <span class="lines">L502-L726（精简版）</span>
+  </div>
+  <div class="file-body">
+<pre><code><span class="k">while</span> current_retry_counter &lt; self.max_retry_count:
+    <span class="c"># 加载思考所需的消息（含历史记忆、资源 prompt）</span>
+    thinking_messages, resource_info = <span class="k">await</span> self._load_thinking_messages(
+        received_message=received_message,
+        sender=sender,
+        observation=observation,
+        rely_messages=rely_messages,
+        ...
+    )
+
+    <span class="c"># 1. THINKING：让 LLM 推理下一步动作</span>
+    llm_reply, model_name = <span class="k">await</span> self.thinking(
+        thinking_messages, sender, stream_callback=_llm_stream_callback
+    )
+    reply_message.content = llm_reply
+
+    <span class="c"># 2. REVIEW：审查 LLM 输出是否合规</span>
+    approve, comments = <span class="k">await</span> self.review(llm_reply, self)
+    reply_message.review_info = <span class="t">AgentReviewInfo</span>(approve=approve, comments=comments)
+
+    <span class="c"># 3. ACT：解析并执行动作</span>
+    act_out: <span class="t">ActionOutput</span> = <span class="k">await</span> self.act(
+        message=reply_message,
+        sender=sender,
+        reviewer=reviewer,
+        **act_extent_param,
+    )
+    reply_message.action_report = act_out
+
+    <span class="c"># 4. VERIFY：校验执行结果</span>
+    check_pass, reason = <span class="k">await</span> self.verify(reply_message, sender, reviewer)
+
+    <span class="c"># 5. 自我优化：未通过则把 fail_reason 作为新的 observation 进入下一轮</span>
+    <span class="k">if not</span> check_pass:
+        <span class="k">if not</span> act_out.have_retry:
+            <span class="k">break</span>  <span class="c"># 无法重试，放弃</span>
+        fail_reason = reason
+        observation = fail_reason
+        <span class="k">await</span> self.write_memories(...)
+    <span class="k">else</span>:
+        observation = act_out.observations
+        <span class="k">await</span> self.write_memories(...)
+        <span class="c"># 非 LOOP 模式或动作要求终止，则结束</span>
+        <span class="k">if</span> self.run_mode != <span class="t">AgentRunMode</span>.LOOP <span class="k">or</span> act_out.terminate:
+            <span class="k">break</span>
+
+    <span class="c"># 超时保护</span>
+    <span class="k">if</span> time.time() - start_time &gt; self.max_timeout:
+        <span class="k">break</span>
+
+    current_retry_counter += <span class="n">1</span>
+
+<span class="c"># 6. 最终消息调整</span>
+<span class="k">await</span> self.adjust_final_message(is_success, reply_message)
+<span class="k">return</span> reply_message
+</code></pre>
+  </div>
+</div>
+
+<p>这个循环的精妙之处在于<strong>自我修复能力</strong>：当 <code>verify</code> 失败时，失败原因会被注入为新的 <code>observation</code>，LLM 在下一轮会看到"上一步失败了，原因是 XXX"，从而调整策略。这正是 ReAct 模式的核心。</p>
+
+<div class="callout tip">
+  <strong>流式输出集成：</strong>主循环中 <code>_emit_stream</code> 函数会在每个阶段（thinking、act）发射事件（<code>thinking_chunk</code>、<code>thinking</code>、<code>act</code>），前端 SSE 层接收这些事件后可以实时展示推理过程。每个事件都带 <code>round</code> 字段标识当前轮次，方便用户区分"首次推理"和"重试推理"。
+</div>
+
+<h3>3.4 thinking()：LLM 推理的重试策略</h3>
+<p><code>thinking</code> 方法负责调用 LLM 生成回复。它内置了 3 次自动重试机制，以应对速率限制和网络波动：</p>
+<ul>
+  <li>每次重试会切换到不同的 LLM 模型（通过 <code>_a_select_llm_model</code>）</li>
+  <li>两次重试之间有 10 秒的等待</li>
+  <li>当 LLM 返回 <code>context_too_long</code> 错误时，会触发<strong>被动上下文压缩</strong>（Layer 4），由 <code>ContextManager.reactive_compact</code> 处理</li>
+  <li>所有参数（<code>max_new_tokens</code>、<code>temperature</code>、<code>verbose</code>）都从 <code>AgentContext</code> 中读取，保证整个会话的推理参数一致</li>
+</ul>
+
+<h3>3.5 act()：动作执行的流水线</h3>
+<p><code>ConversableAgent.act()</code> 会遍历所有注册的 Action，依次执行。每个 Action 可以通过 <code>parse_action</code> 方法判断是否应该处理当前消息——如果不应该，返回 None 跳过。前一个 Action 的输出（<code>rely_action_out</code>）会作为后一个 Action 的输入，形成一条<strong>动作流水线</strong>：</p>
+<p>这种设计允许把多个 Action 串联使用，例如"先解析 JSON，再执行 SQL，最后渲染图表"。但在 ReActAgent 中，通常只有一个 <code>ReActAction</code> 来处理所有工具调用。</p>
+
+<h2 id="resource">四、Resource 体系：工具/数据库/知识/技能</h2>
+<p>Resource 是 Agent 与外部世界交互的桥梁。所有资源都继承自 <code>resource/base.py</code> 的 <code>Resource</code> 抽象基类：</p>
+
+<div class="file-block">
+  <div class="file-header">
+    <span>packages/dbgpt-core/src/dbgpt/agent/resource/base.py</span>
+    <span class="lines">L40-L59</span>
+  </div>
+  <div class="file-body">
+<pre><code><span class="k">class</span> <span class="t">ResourceType</span>(<span class="t">str</span>, <span class="t">Enum</span>):
+    <span class="s">"""Resource type enumeration."""</span>
+    DB = <span class="s">"database"</span>
+    Knowledge = <span class="s">"knowledge"</span>
+    Internet = <span class="s">"internet"</span>
+    Tool = <span class="s">"tool"</span>
+    Skill = <span class="s">"skill"</span>
+    Plugin = <span class="s">"plugin"</span>
+    TextFile = <span class="s">"text_file"</span>
+    ExcelFile = <span class="s">"excel_file"</span>
+    ImageFile = <span class="s">"image_file"</span>
+    AudioFile = <span class="s">"audio_file"</span>
+    VideoFile = <span class="s">"video_file"</span>
+    AWELFlow = <span class="s">"awel_flow"</span>
+    App = <span class="s">"app"</span>
+    Pack = <span class="s">"pack"</span>          <span class="c"># 资源包</span>
+    Connector = <span class="s">"connector"</span>  <span class="c"># 连接器</span>
+</code></pre>
+  </div>
+</div>
+
+<p>各 Resource 类型对照表：</p>
+
+<table>
+  <thead>
+    <tr><th>类型</th><th>类名</th><th>文件</th><th>典型用途</th></tr>
+  </thead>
+  <tbody>
+    <tr><td><code>DB</code></td><td><code>DBResource</code></td><td><code>resource/database.py</code></td><td>提供表结构 Schema 作为 prompt，执行 SQL 查询</td></tr>
+    <tr><td><code>Knowledge</code></td><td><code>RetrieverResource</code></td><td><code>resource/knowledge.py</code></td><td>从向量库检索 Chunk，支持 Rerank</td></tr>
+    <tr><td><code>Tool</code></td><td><code>BaseTool</code></td><td><code>resource/tool/base.py</code></td><td>把 Python 函数包装成工具，列出参数 Schema</td></tr>
+    <tr><td><code>Skill</code></td><td><code>SkillResource</code></td><td><code>resource/skill_resource.py</code></td><td>把 Skill 包装成只读 Resource，注入 prompt</td></tr>
+    <tr><td><code>App</code></td><td><code>AppResource</code></td><td><code>resource/app.py</code></td><td>嵌套调用另一个 DB-GPT App（Agent）</td></tr>
+    <tr><td><code>AWELFlow</code></td><td>—</td><td>—</td><td>把一个 AWEL DAG 作为资源暴露</td></tr>
+    <tr><td><code>Pack</code></td><td><code>ResourcePack</code> / <code>ToolPack</code></td><td><code>resource/pack.py</code></td><td>聚合多个资源，统一 get_prompt / execute</td></tr>
+  </tbody>
+</table>
+
+<h3>4.1 Resource 核心接口</h3>
+<p><code>Resource</code> 抽象基类定义了以下核心契约：</p>
+
+<div class="file-block">
+  <div class="file-header">
+    <span>packages/dbgpt-core/src/dbgpt/agent/resource/base.py</span>
+    <span class="lines">L90-L151（精简）</span>
+  </div>
+  <div class="file-body">
+<pre><code><span class="k">class</span> <span class="t">Resource</span>(ABC, Generic[P]):
+    <span class="s">"""Resource for the agent."""</span>
+
+    <span class="k">@classmethod</span>
+    <span class="k">@abstractmethod</span>
+    <span class="k">def</span> <span class="f">type</span>(cls) -&gt; <span class="t">ResourceType</span>:
+        <span class="s">"""Return the resource type."""</span>
+
+    <span class="k">@property</span>
+    <span class="k">@abstractmethod</span>
+    <span class="k">def</span> <span class="f">name</span>(self) -&gt; <span class="t">str</span>:
+        <span class="s">"""Return the resource name."""</span>
+
+    <span class="k">async def</span> <span class="f">preload_resource</span>(self):
+        <span class="s">"""预加载（如连接数据库、加载索引）。"""</span>
+        <span class="k">pass</span>
+
+    <span class="k">@abstractmethod</span>
+    <span class="k">async def</span> <span class="f">get_prompt</span>(self, *, lang=<span class="s">"en"</span>, question=<span class="k">None</span>, ...) -&gt; <span class="t">Tuple</span>[<span class="t">str</span>, <span class="t">Optional</span>[<span class="t">Dict</span>]]:
+        <span class="s">"""返回要注入 LLM prompt 的文本和资源引用信息。"""</span>
+
+    <span class="k">def</span> <span class="f">execute</span>(self, *args, resource_name=<span class="k">None</span>, **kwargs) -&gt; <span class="t">Any</span>:
+        <span class="s">"""同步执行资源（如执行 SQL）。"""</span>
+        <span class="k">raise</span> <span class="t">NotImplementedError</span>
+
+    <span class="k">async def</span> <span class="f">async_execute</span>(self, *args, resource_name=<span class="k">None</span>, **kwargs) -&gt; <span class="t">Any</span>:
+        <span class="s">"""异步执行资源。"""</span>
+        <span class="k">raise</span> <span class="t">NotImplementedError</span>
+
+    <span class="k">def</span> <span class="f">get_resource_by_type</span>(self, resource_type: <span class="t">ResourceType</span>) -&gt; <span class="t">List</span>[<span class="s">"Resource"</span>]:
+        <span class="s">"""按类型过滤子资源。"""</span>
+</code></pre>
+  </div>
+</div>
+
+<h3>4.2 DBResource 示例</h3>
+<p>以数据库资源为例，它的 <code>get_prompt</code> 会返回表结构 Schema，<code>execute</code> 会执行 SQL：</p>
+
+<div class="file-block">
+  <div class="file-header">
+    <span>packages/dbgpt-core/src/dbgpt/agent/resource/database.py</span>
+    <span class="lines">L31-L117（精简）</span>
+  </div>
+  <div class="file-body">
+<pre><code><span class="k">class</span> <span class="t">DBResource</span>(<span class="t">Resource</span>[P], Generic[P]):
+    <span class="s">"""Database resource class."""</span>
+
+    <span class="k">def</span> <span class="f">__init__</span>(self, name, db_type=<span class="k">None</span>, db_name=<span class="k">None</span>, dialect=<span class="k">None</span>, ...):
+        self._name = name
+        self._db_type = db_type
+        self._db_name = db_name
+        self._dialect = dialect <span class="k">or</span> db_type
+        self._executor = executor <span class="k">or</span> <span class="t">ThreadPoolExecutor</span>()
+
+    <span class="k">@classmethod</span>
+    <span class="k">def</span> <span class="f">type</span>(cls) -&gt; <span class="t">ResourceType</span>:
+        <span class="k">return</span> <span class="t">ResourceType</span>.DB
+
+    <span class="k">@cached</span>(cachetools.TTLCache(maxsize=<span class="n">100</span>, ttl=<span class="n">10</span>))
+    <span class="k">async def</span> <span class="f">get_prompt</span>(self, *, lang=<span class="s">"en"</span>, question=<span class="k">None</span>, ...) -&gt; <span class="t">Tuple</span>:
+        <span class="k">if not</span> self._db_name:
+            <span class="k">return</span> <span class="s">"No database name provided."</span>, <span class="k">None</span>
+        <span class="c"># 调用 schema_link 获取相关表结构（10 秒缓存）</span>
+        schema_info = <span class="k">await</span> <span class="f">blocking_func_to_async</span>(
+            self._executor, self.get_schema_link, db=self._db_name, question=question
+        )
+        <span class="k">return</span> (
+            self._prompt_template.format(db_type=self._db_type, schemas=schema_info),
+            <span class="k">None</span>,
+        )
+
+    <span class="k">def</span> <span class="f">execute</span>(self, *args, resource_name=<span class="k">None</span>, **kwargs):
+        copy_kwargs = kwargs.copy()
+        <span class="k">if</span> <span class="s">"db"</span> <span class="k">not in</span> copy_kwargs:
+            copy_kwargs[<span class="s">"db"</span>] = self._db_name
+        <span class="k">return</span> self._sync_query(*args, **copy_kwargs)
+
+    <span class="k">@property</span>
+    <span class="k">def</span> <span class="f">is_async</span>(self) -&gt; <span class="t">bool</span>:
+        <span class="k">return</span> <span class="k">True</span>  <span class="c"># DBResource 支持异步执行</span>
+</code></pre>
+  </div>
+</div>
+
+<div class="callout">
+  <strong>缓存策略：</strong><code>@cached(cachetools.TTLCache(maxsize=100, ttl=10))</code>
+  表示 Schema prompt 有 10 秒的 TTL 缓存——因为表结构不会频繁变化，但在开发期可能手动改表，
+  所以不能永久缓存。这是 DB-GPT 在性能与正确性之间的平衡选择。
+</div>
+
+<h3>4.3 ResourcePack：资源聚合</h3>
+<p>当一个 Agent 需要同时使用数据库 + 知识库 + 多个工具时，就用 <code>ResourcePack</code> 把它们打包：</p>
+
+<div class="file-block">
+  <div class="file-header">
+    <span>packages/dbgpt-core/src/dbgpt/agent/resource/pack.py</span>
+    <span class="lines">L21-L80（精简）</span>
+  </div>
+  <div class="file-body">
+<pre><code><span class="k">class</span> <span class="t">ResourcePack</span>(<span class="t">Resource</span>[PackResourceParameters]):
+    <span class="s">"""Resource pack class."""</span>
+
+    <span class="k">def</span> <span class="f">__init__</span>(self, resources: <span class="t">List</span>[<span class="t">Resource</span>], name=<span class="s">"Resource Pack"</span>, ...):
+        self._resources: <span class="t">Dict</span>[<span class="t">str</span>, <span class="t">Resource</span>] = {
+            resource.name: resource <span class="k">for</span> resource <span class="k">in</span> resources
+        }
+
+    <span class="k">@classmethod</span>
+    <span class="k">def</span> <span class="f">type</span>(cls) -&gt; <span class="t">ResourceType</span>:
+        <span class="k">return</span> <span class="t">ResourceType</span>.Pack
+
+    <span class="k">@property</span>
+    <span class="k">def</span> <span class="f">is_pack</span>(self) -&gt; <span class="t">bool</span>:
+        <span class="k">return</span> <span class="k">True</span>
+
+    <span class="k">async def</span> <span class="f">get_prompt</span>(self, *, lang=<span class="s">"en"</span>, question=<span class="k">None</span>, ...):
+        <span class="c"># 遍历所有子资源，拼接 prompt</span>
+        prompt_list = []
+        info_map = {}
+        <span class="k">for</span> name, resource <span class="k">in</span> self._resources.items():
+            prompt, resource_reference = <span class="k">await</span> resource.get_prompt(
+                lang=lang, question=question, ...
+            )
+            prompt_list.append(prompt)
+            <span class="k">if</span> resource_reference <span class="k">is not None</span>:
+                info_map.update(resource_reference)
+        <span class="k">return</span> self._prompt_separator.join(prompt_list), info_map
+</code></pre>
+  </div>
+</div>
+
+<h2 id="react">五、ReAct 推理循环源码精读</h2>
+<p><code>ReActAgent</code>（<code>expand/react_agent.py</code>）是 DB-GPT 中最常用的 Agent 实现，它采用 <strong>Reasoning + Acting</strong> 范式，让 LLM 在"思考"和"行动"之间交替推进。</p>
+
+<h3>5.1 ReAct 循环总览</h3>
+
+<div class="mermaid">stateDiagram-v2
+    direction TB
+    [*] --> Q : 用户提问
+    Q: Question 用户输入
+    THINK: Thought LLM 推理
+    ACT: Action 选择工具
+    OBS: Observation 工具执行结果
+    VERIFY: Verify 校验结果
+    FINAL: Final Answer 终止
+    NEXT: 下一轮 Thought 自我修复
+
+    Q --> THINK
+    THINK --> ACT : 决定下一步
+    ACT --> OBS : 执行工具
+    OBS --> VERIFY
+    VERIFY --> FINAL : 校验通过
+    VERIFY --> NEXT : 校验未通过 fail_reason 作为新 observation
+    NEXT --> THINK : 继续循环
+
+    FINAL --> [*] : Action = terminate
+
+    note right of FINAL
+      终止条件:
+      1. Action = terminate
+      2. verify 通过 且 run_mode != LOOP
+      3. retry 次数耗尽 max_retry_count=30
+      4. 超时 max_timeout=600s
+    end note
+</div>
+
+<h3>5.2 ReAct 系统提示词</h3>
+<p>ReActAgent 的 <code>system_prompt_template</code> 严格规定了 LLM 的输出格式：</p>
+
+<div class="file-block">
+  <div class="file-header">
+    <span>packages/dbgpt-core/src/dbgpt/agent/expand/react_agent.py</span>
+    <span class="lines">L33-L78（精简）</span>
+  </div>
+  <div class="file-body">
+<pre><code>_REACT_SYSTEM_TEMPLATE = <span class="s">"""\
+You are a {{ role }}, {% if name %}named {{ name }}. {% endif %}\
+{{ goal }}
+task. For each step, you must output an Action; it cannot be empty.
+The maximum number of steps you can take is {{ max_steps }}.
+
+{{ action_space }}
+# RESPONSE FORMAT #
+IMPORTANT:
+- You must never answer directly outside the ReAct format.
+- Every response must contain exactly one Action and one Action Input.
+- If the task is complete, use exactly:
+Thought: ...
+Phase: 返回最终结果
+Action: terminate
+Action Input: {"result": "final answer"}
+
+For each task input, your response should contain:
+1. One analysis ... (prefix "Thought: ").
+2. What this step is trying to do (prefix "Action Intention: ").
+3. Why this action is needed now (prefix "Action Reason: ").
+4. One action string in the ACTION SPACE (prefix "Action: ").
+5. One action input (prefix "Action Input: ").
+
+# EXAMPLE INTERACTION #
+Thought: ...(Your analysis of the task and reasoning.)
+Action Intention: ...(What this step will do)
+Action Reason: ...(Why this action is needed now)
+Action: ...
+Action Input: ...
+Observation: ...(output by environment, not generated by you.)
+
+{% if task_progress %}
+{{ task_progress }}
+You MUST NOT repeat any action already listed above as ✅ completed.
+{% endif %}
+Please Solve this task:
+{{ question }}
+"""</span>
+</code></pre>
+  </div>
+</div>
+
+<h3>5.3 ReAct 输出解析器</h3>
+<p>LLM 的文本输出需要被解析成结构化的 <code>ReActStep</code>，这是 <code>ReActOutputParser</code> 的职责：</p>
+
+<div class="file-block">
+  <div class="file-header">
+    <span>packages/dbgpt-core/src/dbgpt/agent/util/react_parser.py</span>
+    <span class="lines">L9-L67</span>
+  </div>
+  <div class="file-body">
+<pre><code><span class="k">@dataclass</span>
+<span class="k">class</span> <span class="t">ReActStep</span>:
+    <span class="s">"""单步 ReAct 数据结构"""</span>
+    thought: <span class="t">Optional</span>[<span class="t">str</span>] = <span class="k">None</span>
+    phase: <span class="t">Optional</span>[<span class="t">str</span>] = <span class="k">None</span>
+    action_intention: <span class="t">Optional</span>[<span class="t">str</span>] = <span class="k">None</span>
+    action_reason: <span class="t">Optional</span>[<span class="t">str</span>] = <span class="k">None</span>
+    action: <span class="t">Optional</span>[<span class="t">str</span>] = <span class="k">None</span>
+    action_input: <span class="t">Optional</span>[<span class="t">Any</span>] = <span class="k">None</span>
+    observation: <span class="t">Optional</span>[<span class="t">Any</span>] = <span class="k">None</span>
+    is_terminal: <span class="t">bool</span> = <span class="k">False</span>
+
+
+<span class="k">class</span> <span class="t">ReActOutputParser</span>:
+    <span class="k">def</span> <span class="f">__init__</span>(self,
+        thought_prefix=<span class="s">"Thought:"</span>,
+        phase_prefix=<span class="s">"Phase:"</span>,
+        action_intention_prefix=<span class="s">"Action Intention:"</span>,
+        action_reason_prefix=<span class="s">"Action Reason:"</span>,
+        action_prefix=<span class="s">"Action:"</span>,
+        action_input_prefix=<span class="s">"Action Input:"</span>,
+        observation_prefix=<span class="s">"Observation:"</span>,
+        terminate_action=<span class="s">"terminate"</span>,
+    ):
+        <span class="c"># 所有前缀都做 regex escape</span>
+        self.thought_prefix_escaped = re.escape(thought_prefix)
+        ...
+</code></pre>
+  </div>
+</div>
+
+<h3>5.4 ReActAction.run()：解析 + 执行</h3>
+<p>当 <code>generate_reply</code> 主循环调用 <code>act()</code> 时，ReActAgent 会先用 parser 解析 LLM 输出，再路由到对应工具执行：</p>
+
+<div class="file-block">
+  <div class="file-header">
+    <span>packages/dbgpt-core/src/dbgpt/agent/expand/actions/react_action.py</span>
+    <span class="lines">L134-L173</span>
+  </div>
+  <div class="file-body">
+<pre><code><span class="k">async def</span> <span class="f">run</span>(self, ai_message, resource=<span class="k">None</span>, rely_action_out=<span class="k">None</span>, ...):
+    <span class="c"># 1. 解析 LLM 输出为 ReActStep</span>
+    steps = parser.parse_current_step(ai_message)
+    <span class="k">if</span> <span class="f">len</span>(steps) == <span class="n">0</span>:
+        <span class="k">raise</span> <span class="t">ValueError</span>(<span class="s">"No valid ReAct step found."</span>)
+    <span class="k">if</span> <span class="f">len</span>(steps) &gt; <span class="n">1</span>:
+        logger.warning(<span class="s">"Multiple steps, only first executed."</span>)
+    step = steps[<span class="n">0</span>]
+
+    <span class="c"># 2. 执行该步骤（_do_run 会调用 run_tool 执行对应工具）</span>
+    act_out = <span class="k">await</span> self._do_run(ai_message, step, need_vis_render=need_vis_render)
+
+    <span class="c"># 3. 把解析结果回填到 ActionOutput</span>
+    <span class="k">if not</span> act_out.action:
+        act_out.action = step.action
+    <span class="k">if</span> step.thought:
+        act_out.thoughts = step.thought
+    <span class="k">if</span> step.phase:
+        act_out.phase = step.phase
+    <span class="k">if</span> step.action_intention:
+        act_out.action_intention = step.action_intention
+    <span class="k">if</span> step.action_reason:
+        act_out.action_reason = step.action_reason
+    <span class="k">if not</span> act_out.action_input <span class="k">and</span> step.action_input:
+        <span class="k">if</span> <span class="f">isinstance</span>(step.action_input, <span class="t">str</span>):
+            act_out.action_input = step.action_input
+        <span class="k">else</span>:
+            act_out.action_input = json.dumps(step.action_input, ensure_ascii=<span class="k">False</span>)
+    <span class="k">return</span> act_out
+</code></pre>
+  </div>
+</div>
+
+<h3>5.5 Terminate：终止动作</h3>
+<p>当 LLM 输出 <code>Action: terminate</code> 时，<code>Terminate</code> 动作会被触发，它会设置 <code>terminate=True</code>，让主循环退出。它同时也是一个 <code>BaseTool</code>：</p>
+
+<div class="file-block">
+  <div class="file-header">
+    <span>packages/dbgpt-core/src/dbgpt/agent/expand/actions/react_action.py</span>
+    <span class="lines">L17-L36</span>
+  </div>
+  <div class="file-body">
+<pre><code><span class="k">class</span> <span class="t">Terminate</span>(<span class="t">Action</span>[<span class="k">None</span>], <span class="t">BaseTool</span>):
+    <span class="s">"""Terminate action.
+    终止对话的特殊动作，同时也可以作为返回最终答案的工具。
+    """</span>
+
+    <span class="k">async def</span> <span class="f">run</span>(self, ai_message, resource=<span class="k">None</span>, ...):
+        <span class="k">return</span> <span class="t">ActionOutput</span>(
+            is_exe_success=<span class="k">True</span>,
+            terminate=<span class="k">True</span>,      <span class="c"># 关键：标记终止</span>
+            content=ai_message,
+        )
+
+    <span class="k">@property</span>
+    <span class="k">def</span> <span class="f">name</span>(self):
+        <span class="k">return</span> <span class="s">"terminate"</span>
+
+    <span class="k">@property</span>
+    <span class="k">def</span> <span class="f">args</span>(self):
+        <span class="k">return</span> {
+            <span class="s">"output"</span>: <span class="t">ToolParameter</span>(
+                type=<span class="s">"string"</span>,
+                name=<span class="s">"output"</span>,
+                description=<span class="s">"Final answer to the task"</span>,
+            ),
+        }
+</code></pre>
+  </div>
+</div>
+
+<div class="callout warn">
+  <strong>run_mode 的关键区别：</strong><code>ReActAgent.run_mode = AgentRunMode.LOOP</code>，
+  意味着即使 <code>verify</code> 通过了，<strong>只要 <code>act_out.terminate</code> 不为 True，循环就不会结束</strong>。
+  这是 ReAct 的核心设计——LLM 必须显式输出 <code>Action: terminate</code> 才会终止。
+  而普通 Agent 的 <code>run_mode</code> 默认为非 LOOP，verify 通过即退出。
+</div>
+
+<h3>5.6 容错与降级解析</h3>
+<p><code>ReActAction</code> 内置了多层容错机制来处理 LLM 输出不规范的情况：</p>
+<ul>
+  <li><strong>JSON 解析失败时</strong>：<code>_fallback_parse_args</code> 方法会根据工具参数定义，用正则表达式提取参数值。对于单参数工具，直接把原始输入作为参数值；对于多参数工具，按参数名在文本中的位置定位并提取值</li>
+  <li><strong>HTML 内容特殊处理</strong>：<code>_extract_html_interpreter_args</code> 方法专门处理 <code>html_interpreter</code> 工具——因为 HTML 内容中大量双引号会破坏 JSON 解析，它采用<strong>反向搜索策略</strong>：先找到最后一个 <code>"title"</code> 键，再向前提取 HTML 内容</li>
+  <li><strong>多步骤容错</strong>：当 LLM 在一次输出中包含多个 ReAct 步骤时，只执行第一步并给出警告</li>
+  <li><strong>空输出保护</strong>：如果解析不到任何步骤，返回 <code>is_exe_success=False</code> 的 ActionOutput，让主循环进入重试</li>
+</ul>
+<p>这些容错机制体现了<strong>防御性编程</strong>的思想：永远不要假设 LLM 的输出是完美的，必须为每种可能的错误模式准备降级方案。</p>
+
+<h2 id="team">六、多 Agent 协作机制</h2>
+<p>DB-GPT 支持多 Agent 协作，核心实现在 <code>core/plan/</code> 和 <code>core/base_team.py</code>。</p>
+
+<h3>6.1 AutoPlanChatManager：自动规划团队</h3>
+<p><code>AutoPlanChatManager</code>（<code>core/plan/team_auto_plan.py</code>）是一个<strong>管理者 Agent</strong>，它管理一个 Agent 团队：</p>
+
+<div class="file-block">
+  <div class="file-header">
+    <span>packages/dbgpt-core/src/dbgpt/agent/core/plan/team_auto_plan.py</span>
+    <span class="lines">L21-L97（精简）</span>
+  </div>
+  <div class="file-body">
+<pre><code><span class="k">class</span> <span class="t">AutoPlanChatManager</span>(<span class="t">ManagerAgent</span>):
+    <span class="s">"""管理多 Agent 团队对话的管理者 Agent。"""</span>
+
+    profile: <span class="t">ProfileConfig</span> = <span class="t">ProfileConfig</span>(
+        name=<span class="t">DynConfig</span>(<span class="s">"AutoPlanChatManager"</span>, ...),
+        role=<span class="t">DynConfig</span>(<span class="s">"PlanManager"</span>, ...),
+        goal=<span class="t">DynConfig</span>(
+            <span class="s">"Advance the task plan generated by the planning agent. "</span>
+            <span class="s">"If the plan does not pre-allocate an agent, "</span>
+            <span class="s">"it needs to be coordinated with the appropriate agent."</span>,
+            ...
+        ),
+    )
+
+    <span class="k">async def</span> <span class="f">process_rely_message</span>(self, conv_id, now_plan, speaker):
+        <span class="s">"""处理步骤间的依赖消息——上一步的输出是下一步的输入。"""</span>
+        <span class="c"># now_plan.rely 是逗号分隔的依赖步骤编号</span>
+        rely_tasks_list = now_plan.rely.split(<span class="s">","</span>)
+        rely_tasks_list_int = [<span class="f">int</span>(i) <span class="k">for</span> i <span class="k">in</span> rely_tasks_list]
+        rely_tasks = self.memory.plans_memory.get_by_conv_id_and_num(
+            conv_id, rely_tasks_list_int
+        )
+        <span class="c"># 把依赖步骤的结果作为 HUMAN 消息注入</span>
+        ...
+
+    <span class="k">def</span> <span class="f">select_speaker_msg</span>(self, agents):
+        <span class="s">"""生成选择下一个发言者的提示。"""</span>
+        <span class="k">return</span> (
+            <span class="s">"You are in a role play game. Roles:\n"</span>
+            <span class="s">f"   {{participant_roles(agents)}}.\n"</span>
+            <span class="s">f"   Select the next role from {{agent_names}}.\n"</span>
+        )
+
+    <span class="k">async def</span> <span class="f">select_speaker</span>(self, last_speaker, selector, ...):
+        <span class="s">"""选择下一个发言的 Agent——如果计划预分配了就直接用，否则让 LLM 选。"""</span>
+        <span class="k">if</span> pre_allocated:
+            name = pre_allocated
+        <span class="k">else</span>:
+            <span class="c"># 让 selector Agent 用 LLM 决定下一个发言者</span>
+            fina_name, model = <span class="k">await</span> selector.thinking(...)
+</code></pre>
+  </div>
+</div>
+
+<h3>6.2 Agent 之间的消息传递</h3>
+<p>Agent 之间的协作通过 <code>send()</code> / <code>receive()</code> 完成。当 Agent A 调用 <code>send(msg, recipient=B)</code> 时，本质上是调用 <code>B.receive(msg, sender=A)</code>，B 的 <code>receive</code> 方法会决定是否 <code>generate_reply</code> 并回送：</p>
+
+<div class="file-block">
+  <div class="file-header">
+    <span>packages/dbgpt-core/src/dbgpt/agent/core/base_agent.py</span>
+    <span class="lines">L330-L423（精简）</span>
+  </div>
+  <div class="file-body">
+<pre><code><span class="k">async def</span> <span class="f">send</span>(self, message, recipient, reviewer=<span class="k">None</span>, request_reply=<span class="k">True</span>, ...):
+    <span class="s">"""发送消息——本质是调用 recipient.receive。"""</span>
+    <span class="k">with</span> root_tracer.start_span(<span class="s">"agent.send"</span>, ...):
+        <span class="k">await</span> recipient.receive(
+            message=message,
+            sender=self,
+            reviewer=reviewer,
+            request_reply=request_reply,
+            ...
+        )
+
+<span class="k">async def</span> <span class="f">receive</span>(self, message, sender, reviewer=<span class="k">None</span>, request_reply=<span class="k">None</span>, ...):
+    <span class="s">"""接收消息——处理消息后决定是否回复。"""</span>
+    <span class="k">await</span> self._a_process_received_message(message, sender)
+    <span class="k">if</span> request_reply <span class="k">is</span> <span class="k">False</span> <span class="k">or</span> request_reply <span class="k">is</span> <span class="k">None</span>:
+        <span class="k">return</span>
+
+    <span class="k">if not</span> self.is_human:
+        <span class="c"># 生成回复</span>
+        reply = <span class="k">await</span> self.generate_reply(
+            received_message=message,
+            sender=sender,
+            reviewer=reviewer,
+            ...
+        )
+        <span class="k">if</span> reply <span class="k">is not None</span>:
+            <span class="k">await</span> self.send(reply, sender)  <span class="c"># 回送给发送者</span>
+</code></pre>
+  </div>
+</div>
+
+<h3>6.3 AWEL DAG 团队布局</h3>
+<p>除了 AutoPlan 模式，DB-GPT 还支持用 AWEL DAG 描述团队拓扑：<code>core/plan/awel/team_awel_layout.py</code> 中的 <code>AWELLayoutTeam</code> 把每个 Agent 包成 <code>WrappedAgentOperator</code>，按 DAG 拓扑串联：</p>
+
+<div class="file-block">
+  <div class="file-header">
+    <span>packages/dbgpt-core/src/dbgpt/agent/core/plan/awel/agent_operator.py</span>
+    <span class="lines">L56-L134（精简）</span>
+  </div>
+  <div class="file-body">
+<pre><code><span class="k">class</span> <span class="t">WrappedAgentOperator</span>(<span class="t">BaseAgentOperator</span>, <span class="t">MapOperator</span>, ABC):
+    <span class="s">"""把 Agent 包装成 AWEL MapOperator。"""</span>
+
+    <span class="k">async def</span> <span class="f">map</span>(self, input_value: <span class="t">AgentGenerateContext</span>):
+        <span class="c"># 1. 构造目标消息</span>
+        _goal = self.agent.name <span class="k">or</span> self.agent.role
+        current_goal = <span class="s">f"[{_goal}]:"</span> + input_message.content
+        input_message.current_goal = current_goal
+
+        <span class="c"># 2. 先发一条不需要回复的消息（传递上下文）</span>
+        <span class="k">await</span> input_value.sender.send(
+            now_message, self.agent, input_value.reviewer, <span class="k">False</span>
+        )
+
+        <span class="c"># 3. 触发 Agent 生成回复</span>
+        agent_reply_message = <span class="k">await</span> self.agent.generate_reply(
+            received_message=input_message,
+            sender=input_value.sender,
+            reviewer=input_value.reviewer,
+            rely_messages=input_value.rely_messages,
+        )
+
+        <span class="k">if not</span> agent_reply_message.success:
+            <span class="k">raise</span> <span class="t">ValueError</span>(<span class="s">f"Task failed at {self.agent.role}"</span>)
+
+        <span class="c"># 4. 把回复作为 AI 消息追加到 rely_messages，传给下一个 Operator</span>
+        ai_message = agent_reply_message.copy()
+        ai_message.role = <span class="t">ModelMessageRoleType</span>.AI
+        now_rely_messages.append(ai_message)
+
+        <span class="k">return</span> <span class="t">AgentGenerateContext</span>(
+            message=input_message,
+            sender=self.agent,
+            rely_messages=now_rely_messages,  <span class="c"># 依赖链向下传递</span>
+            ...
+        )
+</code></pre>
+  </div>
+</div>
+
+<h2 id="memory">七、Hybrid Memory：短期 + 长期</h2>
+<p>DB-GPT 的记忆系统参考了人类认知科学中的<strong>三层记忆模型</strong>：感觉记忆 → 短期记忆 → 长期记忆。</p>
+
+<h3>7.1 三层架构</h3>
+
+<div class="mermaid">flowchart TD
+    IN([外部输入]) --> SENSORY
+
+    SENSORY["SensoryMemory<br/>感觉记忆：瞬时感知<br/>基本不做处理"]
+    SHORT["EnhancedShortTermMemory<br/>短期记忆：<br/>· buffer_size=10 环形缓冲<br/>· 余弦相似度匹配<br/>· enhance_threshold=3 触发洞察"]
+    LONG["LongTermMemory<br/>长期记忆：<br/>· TimeWeightedEmbedding<br/>· 向量数据库持久化<br/>· 重要性评分 + 洞察提取"]
+
+    SENSORY --> SHORT
+    SHORT -->|"transfer_to_long_term"| LONG
+
+    GPTS["GptsMemory (独立)<br/>· 记录完整对话日志 GptsMessage<br/>· 记录计划执行过程 GptsPlan<br/>· 用于会话恢复和历史回放"]
+
+    classDef layer fill:#1a2029,stroke:#4ec9b0,color:#e6e6e6
+    classDef side fill:#232b37,stroke:#569cd6,color:#e6e6e6
+    class SENSORY,SHORT,LONG layer
+    class GPTS side
+</div>
+
+<h3>7.2 HybridMemory 核心代码</h3>
+
+<div class="file-block">
+  <div class="file-header">
+    <span>packages/dbgpt-core/src/dbgpt/agent/core/memory/hybrid.py</span>
+    <span class="lines">L31-L144（精简）</span>
+  </div>
+  <div class="file-body">
+<pre><code><span class="k">class</span> <span class="t">HybridMemory</span>(<span class="t">Memory</span>, Generic[T]):
+    <span class="s">"""Hybrid memory for the agent."""</span>
+
+    importance_weight: <span class="t">float</span> = <span class="n">0.9</span>
+
+    <span class="k">def</span> <span class="f">__init__</span>(self, now, sensory_memory, short_term_memory, long_term_memory,
+                 default_insight_extractor=<span class="k">None</span>, default_importance_scorer=<span class="k">None</span>):
+        self._sensory_memory = sensory_memory
+        self._short_term_memory = short_term_memory
+        self._long_term_memory = long_term_memory
+
+    <span class="k">@classmethod</span>
+    <span class="k">def</span> <span class="f">from_chroma</span>(cls, vstore_name=<span class="s">"agent_memory_long_term"</span>, ...):
+        <span class="s">"""从 Chroma 向量库创建混合记忆。"""</span>
+        <span class="k">from</span> dbgpt_ext.storage.vector_store.chroma_store <span class="k">import</span> ChromaStore
+        vector_store = <span class="t">ChromaStore</span>(...)
+        <span class="k">return</span> cls.from_vstore(vector_store=vector_store, embeddings=embeddings, ...)
+
+    <span class="k">@classmethod</span>
+    <span class="k">def</span> <span class="f">from_vstore</span>(cls, vector_store, embeddings, executor=<span class="k">None</span>, ...):
+        <span class="s">"""从任意向量库创建混合记忆。"""</span>
+        <span class="k">if not</span> sensory_memory:
+            sensory_memory = <span class="t">SensoryMemory</span>()
+        <span class="k">if not</span> short_term_memory:
+            short_term_memory = <span class="t">EnhancedShortTermMemory</span>(embeddings, executor)
+        <span class="k">if not</span> long_term_memory:
+            long_term_memory = <span class="t">LongTermMemory</span>(executor, vector_store, now=now)
+        <span class="k">return</span> cls(now, sensory_memory, short_term_memory, long_term_memory, ...)
+</code></pre>
+  </div>
+</div>
+
+<h3>7.3 EnhancedShortTermMemory：相似度增强</h3>
+<p>短期记忆不只是简单的 FIFO 缓冲——它会计算新记忆与已有记忆的<strong>余弦相似度</strong>，当相似度超过阈值时，触发"增强"机制：</p>
+
+<div class="file-block">
+  <div class="file-header">
+    <span>packages/dbgpt-core/src/dbgpt/agent/core/memory/short_term.py</span>
+    <span class="lines">L22-L101（精简）</span>
+  </div>
+  <div class="file-body">
+<pre><code><span class="k">class</span> <span class="t">EnhancedShortTermMemory</span>(<span class="t">ShortTermMemory</span>[T]):
+    <span class="s">"""Enhanced short term memory."""</span>
+
+    <span class="k">def</span> <span class="f">__init__</span>(self, embeddings, executor, buffer_size=<span class="n">10</span>,
+                 enhance_similarity_threshold=<span class="n">0.7</span>, enhance_threshold=<span class="n">3</span>):
+        self._embeddings = embeddings
+        self.short_embeddings: <span class="t">List</span>[<span class="t">List</span>[<span class="t">float</span>]] = []
+        self.enhance_cnt: <span class="t">List</span>[<span class="t">int</span>] = [<span class="n">0</span> <span class="k">for</span> _ <span class="k">in</span> <span class="f">range</span>(buffer_size)]
+        self.enhance_memories: <span class="t">List</span>[<span class="t">List</span>[T]] = [[] <span class="k">for</span> _ <span class="k">in</span> <span class="f">range</span>(buffer_size)]
+        self.enhance_similarity_threshold = enhance_similarity_threshold
+        self.enhance_threshold = enhance_threshold
+
+    <span class="k">@mutable</span>
+    <span class="k">async def</span> <span class="f">write</span>(self, memory_fragment, now=<span class="k">None</span>, op=WriteOperation.ADD):
+        <span class="c"># 1. 计算新记忆片段的 embedding</span>
+        memory_fragment_embeddings = <span class="k">await</span> blocking_func_to_async(
+            self._executor,
+            memory_fragment.calculate_current_embeddings,
+            self._embeddings.embed_documents,
+        )
+        memory_fragment.update_embeddings(memory_fragment_embeddings)
+
+        <span class="k">async with</span> self._lock:
+            <span class="c"># 2. 与已有记忆计算余弦相似度</span>
+            <span class="k">for</span> idx, memory_embedding <span class="k">in</span> <span class="f">enumerate</span>(self.short_embeddings):
+                similarity = <span class="k">await</span> blocking_func_to_async(
+                    self._executor, cosine_similarity,
+                    memory_embedding, memory_fragment_embeddings,
+                )
+                sigmoid_prob = <span class="k">await</span> blocking_func_to_async(
+                    self._executor, sigmoid_function, similarity
+                )
+                <span class="c"># 3. 高相似度 + 概率命中 → 增强计数 +1</span>
+                <span class="k">if</span> (sigmoid_prob &gt;= self.enhance_similarity_threshold
+                        <span class="k">and</span> random.random() &lt; sigmoid_prob):
+                    self.enhance_cnt[idx] += <span class="n">1</span>
+                    self.enhance_memories[idx].append(memory_fragment)
+
+            <span class="c"># 4. 超过 enhance_threshold 的记忆转移到长期记忆</span>
+            discard_memories = <span class="k">await</span> self.transfer_to_long_term(memory_fragment)
+            <span class="k">if</span> op == WriteOperation.ADD:
+                self._fragments.append(memory_fragment)
+                self.short_embeddings.append(memory_fragment_embeddings)
+                <span class="k">await</span> self.handle_overflow(self._fragments)
+            <span class="k">return</span> discard_memories
+</code></pre>
+  </div>
+</div>
+
+<div class="callout">
+  <strong>关键参数：</strong>
+  <code>buffer_size=10</code>（短期记忆容量）、<code>enhance_similarity_threshold=0.7</code>（相似度阈值）、
+  <code>enhance_threshold=3</code>（增强次数阈值——被相似记忆"命中"3 次就会被转移到长期记忆）。
+  这套机制确保<strong>频繁出现的相似记忆会被自动"固化"为长期记忆</strong>，类似人类的记忆巩固过程。
+</div>
+
+<h3>7.5 AgentMemoryFragment：记忆的最小单元</h3>
+<p><code>AgentMemoryFragment</code> 是记忆的基本单元，每条记忆片段包含以下字段：</p>
+<ul>
+  <li><code>observation</code>：原始观察文本（如"用户问了 XXX，我用了 YYY 工具，结果是 ZZZ"）</li>
+  <li><code>memory_id</code>：雪花算法生成的全局唯一 ID（可从中解析出创建时间戳）</li>
+  <li><code>importance</code>：重要性评分（由 LLM 打分，范围 0-1，影响检索排序）</li>
+  <li><code>embeddings</code>：文本的向量表示（用于相似度计算）</li>
+  <li><code>last_accessed_time</code>：最后访问时间（用于时间衰减加权）</li>
+  <li><code>is_insight</code>：是否为洞察记忆（从多次相似记忆中提取的抽象总结）</li>
+  <li><code>snapshot_path</code>：快照文件路径（大文本记忆的完整内容存放在文件中）</li>
+</ul>
+<p>ReActAgent 使用的是 <code>StructuredAgentMemoryFragment</code>——它把 ReAct 循环的结构化数据（question、thought、action、observation）序列化为 JSON 后存入 observation 字段。读取时再反序列化还原为对话消息格式，这样就能<strong>完整恢复历史推理过程</strong>。</p>
+
+<h3>7.6 GptsMemory：对话日志层</h3>
+<p>除了三层记忆模型，还有一套独立的 <code>GptsMemory</code>（<code>core/memory/gpts/</code>），它记录的是<strong>完整的对话日志</strong>，不做任何压缩或抽象：</p>
+<ul>
+  <li><code>GptsMessageMemory</code>：每条消息的完整记录（发送者、接收者、内容、动作报告）</li>
+  <li><code>GptsPlansMemory</code>：计划执行记录（每个子任务的分配、状态、结果）</li>
+  <li><code>default_gpts_memory.py</code>：默认实现，使用 SQLite 持久化</li>
+</ul>
+<p>GptsMemory 的主要用途是<strong>会话恢复</strong>——当用户中断后重新打开对话时，Agent 可以从 GptsMemory 中恢复完整的上下文。这与 HybridMemory 的"语义记忆"不同，GptsMemory 是"事件日志"。</p>
+
+<h3>7.4 LongTermRetriever：时间加权检索</h3>
+<p>长期记忆的检索基于 <code>TimeWeightedEmbeddingRetriever</code>，它同时考虑<strong>语义相关性</strong>和<strong>时间衰减</strong>：</p>
+
+<div class="file-block">
+  <div class="file-header">
+    <span>packages/dbgpt-core/src/dbgpt/agent/core/memory/long_term.py</span>
+    <span class="lines">L24-L111（精简）</span>
+  </div>
+  <div class="file-body">
+<pre><code><span class="k">class</span> <span class="t">LongTermRetriever</span>(<span class="t">TimeWeightedEmbeddingRetriever</span>):
+    <span class="s">"""长期记忆检索器，支持持久化。"""</span>
+
+    <span class="k">@mutable</span>
+    <span class="k">def</span> <span class="f">_retrieve</span>(self, query, filters=<span class="k">None</span>) -&gt; <span class="t">List</span>[<span class="t">Chunk</span>]:
+        current_time = self.now
+
+        <span class="c"># 1. 遍历 memory_stream，赋予默认显著性</span>
+        docs_and_scores = {}
+        <span class="k">for</span> doc <span class="k">in</span> self.memory_stream:
+            <span class="k">if</span> _METADATA_BUFFER_IDX <span class="k">in</span> doc.metadata:
+                buffer_idx = doc.metadata[_METADATA_BUFFER_IDX]
+                docs_and_scores[buffer_idx] = (doc, self.default_salience)
+
+        <span class="c"># 2. 对语义相关的文档，更新显著性分数</span>
+        docs_and_scores.update(self.get_salient_docs(query, filters))
+
+        <span class="c"># 3. 计算组合分数 = 语义相关性 × 时间衰减因子</span>
+        rescored_docs = [
+            (doc, self._get_combined_score(doc, relevance, current_time))
+            <span class="k">for</span> doc, relevance <span class="k">in</span> docs_and_scores.values()
+        ]
+        rescored_docs.sort(key=<span class="k">lambda</span> x: x[<span class="n">1</span>], reverse=<span class="k">True</span>)
+
+        <span class="c"># 4. 跳过被标记为 FORGET 或 MERGE 的记忆</span>
+        result = []
+        <span class="k">for</span> doc, _ <span class="k">in</span> rescored_docs:
+            <span class="k">if</span> (retrieved_num &lt; self._k
+                    <span class="k">and</span> doc.content.find(_FORGET_PLACEHOLDER) == -<span class="n">1</span>
+                    <span class="k">and</span> doc.content.find(_MERGE_PLACEHOLDER) == -<span class="n">1</span>):
+                retrieved_num += <span class="n">1</span>
+                <span class="c"># 更新最后访问时间（用于后续时间衰减计算）</span>
+                buffered_doc.metadata[_METADATA_LAST_ACCESSED_AT] = current_time
+                result.append(buffered_doc)
+
+        <span class="c"># 5. 持久化 memory_stream</span>
+        self._save_memory_stream()
+        <span class="k">return</span> result
+</code></pre>
+  </div>
+</div>
+
+<h2 id="skill">八、Skill 系统：Agent 的"技能包"</h2>
+<p>Skill 是 DB-GPT v0.7+ 引入的高阶抽象，它把"prompt 模板 + 所需工具 + 所需知识 + 动作"打包成一个可复用的"技能包"。</p>
+
+<h3>8.1 Skill 基类</h3>
+
+<div class="file-block">
+  <div class="file-header">
+    <span>packages/dbgpt-core/src/dbgpt/agent/skill/base.py</span>
+    <span class="lines">L11-L150（精简）</span>
+  </div>
+  <div class="file-body">
+<pre><code><span class="k">class</span> <span class="t">SkillType</span>(<span class="t">str</span>, <span class="t">Enum</span>):
+    Coding = <span class="s">"coding"</span>
+    DataAnalysis = <span class="s">"data_analysis"</span>
+    WebSearch = <span class="s">"web_search"</span>
+    KnowledgeQA = <span class="s">"knowledge_qa"</span>
+    Chat = <span class="s">"chat"</span>
+    Custom = <span class="s">"custom"</span>
+
+
+<span class="k">@dataclasses.dataclass</span>
+<span class="k">class</span> <span class="t">SkillMetadata</span>:
+    name: <span class="t">str</span>
+    description: <span class="t">str</span>
+    version: <span class="t">str</span> = <span class="s">"1.0.0"</span>
+    author: <span class="t">Optional</span>[<span class="t">str</span>] = <span class="k">None</span>
+    skill_type: <span class="t">SkillType</span> = SkillType.Custom
+    tags: <span class="t">List</span>[<span class="t">str</span>] = dataclasses.field(default_factory=list)
+
+
+<span class="k">class</span> <span class="t">SkillBase</span>(ABC):
+    <span class="s">"""Skill 的抽象基类。"""</span>
+    <span class="k">@classmethod</span>
+    <span class="k">@abstractmethod</span>
+    <span class="k">def</span> <span class="f">type</span>(cls) -&gt; <span class="t">SkillType</span>: ...
+    <span class="k">@property</span>
+    <span class="k">@abstractmethod</span>
+    <span class="k">def</span> <span class="f">metadata</span>(self) -&gt; <span class="t">SkillMetadata</span>: ...
+    <span class="k">@property</span>
+    <span class="k">@abstractmethod</span>
+    <span class="k">def</span> <span class="f">prompt_template</span>(self) -&gt; <span class="t">Optional</span>[<span class="t">PromptTemplate</span>]: ...
+    <span class="k">@property</span>
+    <span class="k">@abstractmethod</span>
+    <span class="k">def</span> <span class="f">required_tools</span>(self) -&gt; <span class="t">List</span>[<span class="t">str</span>]: ...
+    <span class="k">@property</span>
+    <span class="k">@abstractmethod</span>
+    <span class="k">def</span> <span class="f">required_knowledge</span>(self) -&gt; <span class="t">List</span>[<span class="t">str</span>]: ...
+    <span class="k">@property</span>
+    <span class="k">@abstractmethod</span>
+    <span class="k">def</span> <span class="f">actions</span>(self) -&gt; <span class="t">List</span>: ...
+
+
+<span class="k">class</span> <span class="t">Skill</span>(<span class="t">SkillBase</span>):
+    <span class="s">"""Skill 的具体实现。"""</span>
+    <span class="k">def</span> <span class="f">__init__</span>(self, metadata, prompt_template=<span class="k">None</span>,
+                 required_tools=<span class="k">None</span>, required_knowledge=<span class="k">None</span>,
+                 actions=<span class="k">None</span>, config=<span class="k">None</span>):
+        self._metadata = metadata
+        self._prompt_template = prompt_template
+        self._required_tools = required_tools <span class="k">or</span> []
+        self._required_knowledge = required_knowledge <span class="k">or</span> []
+        self._actions = actions <span class="k">or</span> []
+        self._config = config <span class="k">or</span> {}
+</code></pre>
+  </div>
+</div>
+
+<h3>8.2 Skill 与 Agent 的绑定</h3>
+<p>在 <code>ConversableAgent.bind()</code> 方法中，如果传入的是 <code>SkillBase</code> 实例，Agent 会把 Skill 的 prompt_template 设为自己的 <code>bind_prompt</code>（系统提示词）：</p>
+
+<div class="file-block">
+  <div class="file-header">
+    <span>packages/dbgpt-core/src/dbgpt/agent/core/base_agent.py</span>
+    <span class="lines">L283-L328（精简）</span>
+  </div>
+  <div class="file-body">
+<pre><code><span class="k">try</span>:
+    <span class="k">from</span> dbgpt.agent.skill.base <span class="k">import</span> SkillBase
+    is_skill = <span class="f">isinstance</span>(target, <span class="t">SkillBase</span>)
+<span class="k">except</span> <span class="t">Exception</span>:
+    is_skill = <span class="k">False</span>
+
+<span class="k">if</span> <span class="f">isinstance</span>(target, <span class="t">LLMConfig</span>):
+    self.llm_config = target
+<span class="k">elif</span> <span class="f">isinstance</span>(target, <span class="t">AgentContext</span>):
+    self.agent_context = target
+<span class="k">elif</span> <span class="f">isinstance</span>(target, <span class="t">Resource</span>):
+    self.resource = target
+<span class="k">elif</span> <span class="f">isinstance</span>(target, <span class="t">AgentMemory</span>):
+    self.memory = target
+<span class="k">elif</span> <span class="f">isinstance</span>(target, <span class="t">ProfileConfig</span>):
+    self.profile = target
+<span class="k">elif</span> is_skill:
+    <span class="c"># 绑定 Skill：把 skill 的 prompt_template 作为 agent 的系统提示词</span>
+    self._skill = target
+    prompt_template = <span class="f">getattr</span>(target, <span class="s">"prompt_template"</span>, <span class="k">None</span>)
+    <span class="k">if</span> prompt_template <span class="k">is not None</span>:
+        self.bind_prompt = prompt_template
+<span class="k">elif</span> <span class="f">isinstance</span>(target, <span class="t">Action</span>):
+    self.actions.append(target)
+<span class="k">elif</span> <span class="f">isinstance</span>(target, <span class="t">PromptTemplate</span>):
+    self.bind_prompt = target
+</code></pre>
+  </div>
+</div>
+
+<p>此外，<code>SkillResource</code>（<code>resource/skill_resource.py</code>）把 Skill 包装成一个 <strong>只读 Resource</strong>（<code>ResourceType.Skill</code>），这样 Skill 也可以像数据库/知识库一样被注入 prompt：</p>
+
+<div class="file-block">
+  <div class="file-header">
+    <span>packages/dbgpt-core/src/dbgpt/agent/resource/skill_resource.py</span>
+    <span class="lines">L15-L74</span>
+  </div>
+  <div class="file-body">
+<pre><code><span class="k">class</span> <span class="t">SkillResource</span>(<span class="t">Resource</span>[SkillParameters]):
+    <span class="k">@classmethod</span>
+    <span class="k">def</span> <span class="f">type</span>(cls) -&gt; <span class="t">ResourceType</span>:
+        <span class="k">return</span> <span class="t">ResourceType</span>.Skill
+
+    <span class="k">def</span> <span class="f">__init__</span>(self, name, skill=<span class="k">None</span>, skill_name=<span class="k">None</span>, system_app=<span class="k">None</span>, **kwargs):
+        self._name = name
+        <span class="k">if</span> skill:
+            self._skill = skill
+        <span class="k">elif</span> skill_name:
+            <span class="k">from</span> dbgpt.agent.skill.manage <span class="k">import</span> get_skill_manager
+            skill_manager = <span class="f">get_skill_manager</span>(system_app)
+            self._skill = skill_manager.get_skill(name=skill_name)
+
+    <span class="k">async def</span> <span class="f">get_prompt</span>(self, *, lang=<span class="s">"en"</span>, question=<span class="k">None</span>, ...):
+        <span class="s">"""返回 skill 的 prompt template 作为 resource prompt"""</span>
+        <span class="k">if not</span> self._skill <span class="k">or not</span> self._skill.prompt_template:
+            <span class="k">return</span> <span class="s">""</span>, <span class="k">None</span>
+        prompt = self._skill.prompt_template.format(question=question <span class="k">or</span> <span class="s">""</span>)
+        <span class="k">return</span> prompt, <span class="k">None</span>
+
+    <span class="k">async def</span> <span class="f">async_execute</span>(self, *args, **kwargs):
+        <span class="c"># Skill 本身不执行，具体行为由 actions/tools 实现</span>
+        <span class="k">raise</span> <span class="t">NotImplementedError</span>(<span class="s">"SkillResource is readonly wrapper"</span>)
+</code></pre>
+  </div>
+</div>
+
+<div class="callout tip">
+  <strong>Skill vs Action 的关系：</strong>Skill 是<strong>更高层级的抽象</strong>——一个 Skill 可以包含多个 Action、多个 Tool、多个 Knowledge Source 以及一个完整的 prompt 模板。Skill 像是一个"Agent 模板"或"角色定义"，而 Action 是 Agent 在单步中执行的具体动作。
+</div>
+
+<h2 id="middleware">九、中间件机制</h2>
+<p>中间件系统（<code>middleware/base.py</code>）允许插件在 Agent 生命周期的各个阶段插入逻辑，而不需要修改 Agent 本身的代码——这是典型的 AOP（面向切面编程）思想。</p>
+
+<h3>9.1 AgentMiddleware 基类</h3>
+
+<div class="file-block">
+  <div class="file-header">
+    <span>packages/dbgpt-core/src/dbgpt/agent/middleware/base.py</span>
+    <span class="lines">L18-L208（精简）</span>
+  </div>
+  <div class="file-body">
+<pre><code><span class="k">class</span> <span class="t">AgentMiddleware</span>(ABC):
+    <span class="s">"""Agent 中间件基类。
+
+    可以挂钩的 Agent 生命周期事件：
+    - before_init / after_init              初始化前后
+    - before_generate_reply / after_generate_reply  生成回复前后
+    - before_thinking / after_thinking      思考前后
+    - before_act / after_act                行动前后
+    - modify_system_prompt                  修改系统提示词
+    """</span>
+
+    <span class="k">def</span> <span class="f">__init__</span>(self):
+        self._enabled: <span class="t">bool</span> = <span class="k">True</span>
+
+    <span class="k">@property</span>
+    <span class="k">def</span> <span class="f">enabled</span>(self) -&gt; <span class="t">bool</span>:
+        <span class="k">return</span> self._enabled
+
+    <span class="k">def</span> <span class="f">enable</span>(self):  self._enabled = <span class="k">True</span>
+    <span class="k">def</span> <span class="f">disable</span>(self): self._enabled = <span class="k">False</span>
+
+    <span class="k">async def</span> <span class="f">before_init</span>(self, agent, **kwargs) -&gt; <span class="t">Optional</span>[<span class="t">Dict</span>]:
+        <span class="k">return None</span>
+
+    <span class="k">async def</span> <span class="f">after_init</span>(self, agent, **kwargs) -&gt; <span class="t">Optional</span>[<span class="t">Dict</span>]:
+        <span class="k">return None</span>
+
+    <span class="k">async def</span> <span class="f">before_generate_reply</span>(self, agent, context, **kwargs):
+        <span class="k">return None</span>
+
+    <span class="k">async def</span> <span class="f">after_generate_reply</span>(self, agent, context, reply_message, **kwargs):
+        <span class="k">return None</span>
+
+    <span class="k">async def</span> <span class="f">before_thinking</span>(self, agent, context, **kwargs):
+        <span class="k">return None</span>
+
+    <span class="k">async def</span> <span class="f">after_thinking</span>(self, agent, context, llm_reply, model_name, **kwargs):
+        <span class="k">return None</span>
+
+    <span class="k">async def</span> <span class="f">before_act</span>(self, agent, context, message, **kwargs):
+        <span class="k">return None</span>
+
+    <span class="k">async def</span> <span class="f">after_act</span>(self, agent, context, action_output, **kwargs):
+        <span class="k">return None</span>
+
+    <span class="k">async def</span> <span class="f">modify_system_prompt</span>(self, agent, original_prompt, context=<span class="k">None</span>):
+        <span class="k">return</span> original_prompt  <span class="c"># 默认不修改</span>
+</code></pre>
+  </div>
+</div>
+
+<h3>9.2 MiddlewareManager：注册与执行</h3>
+<p><code>MiddlewareManager</code> 负责中间件的注册、排序和批量执行。它对每个生命周期事件都有对应的 <code>execute_*</code> 方法，会遍历所有已注册且 enabled 的中间件：</p>
+
+<div class="file-block">
+  <div class="file-header">
+    <span>packages/dbgpt-core/src/dbgpt/agent/middleware/base.py</span>
+    <span class="lines">L211-L482（精简）</span>
+  </div>
+  <div class="file-body">
+<pre><code><span class="k">class</span> <span class="t">MiddlewareManager</span>:
+    <span class="s">"""中间件管理器：注册、排序、批量执行。"""</span>
+
+    <span class="k">def</span> <span class="f">__init__</span>(self):
+        self._middlewares: <span class="t">List</span>[<span class="t">AgentMiddleware</span>] = []
+        self._state: <span class="t">Dict</span>[<span class="t">str</span>, <span class="t">Any</span>] = {}
+
+    <span class="k">def</span> <span class="f">register</span>(self, middleware) -&gt; <span class="s">"MiddlewareManager"</span>:
+        <span class="k">if</span> middleware <span class="k">not in</span> self._middlewares:
+            self._middlewares.append(middleware)
+        <span class="k">return</span> self  <span class="c"># 链式调用</span>
+
+    <span class="k">def</span> <span class="f">unregister</span>(self, middleware) -&gt; <span class="s">"MiddlewareManager"</span>:
+        <span class="k">if</span> middleware <span class="k">in</span> self._middlewares:
+            self._middlewares.remove(middleware)
+        <span class="k">return</span> self
+
+    <span class="k">async def</span> <span class="f">execute_before_thinking</span>(self, agent, context, **kwargs) -&gt; <span class="t">Dict</span>:
+        combined_state = {}
+        <span class="k">for</span> middleware <span class="k">in</span> self._middlewares:
+            <span class="k">if</span> middleware.enabled:
+                state = <span class="k">await</span> middleware.before_thinking(agent, context, **kwargs)
+                <span class="k">if</span> state:
+                    combined_state.update(state)
+        <span class="k">return</span> combined_state
+
+    <span class="k">async def</span> <span class="f">execute_modify_system_prompt</span>(self, agent, original_prompt, context=<span class="k">None</span>):
+        <span class="c"># 链式修改：每个中间件看到的是上一个中间件的输出</span>
+        prompt = original_prompt
+        <span class="k">for</span> middleware <span class="k">in</span> self._middlewares:
+            <span class="k">if</span> middleware.enabled:
+                prompt = <span class="k">await</span> middleware.modify_system_prompt(agent, prompt, context)
+        <span class="k">return</span> prompt
+</code></pre>
+  </div>
+</div>
+
+<div class="callout tip">
+  <strong>典型用途：</strong>
+  <ul>
+    <li><strong>安全审计中间件</strong>：在 <code>before_act</code> 中检查 LLM 输出是否包含危险操作（如 <code>DROP TABLE</code>）</li>
+    <li><strong>日志中间件</strong>：在 <code>after_thinking</code> 中记录 LLM 调用耗时和 token 消耗</li>
+    <li><strong>多语言中间件</strong>：在 <code>modify_system_prompt</code> 中注入语言偏好</li>
+    <li><strong>Skill 集成中间件</strong>：在 <code>before_generate_reply</code> 中加载 Skill 所需的工具和知识</li>
+  </ul>
+</div>
+
+<h2 id="quiz">十、思考题</h2>
+
+<div class="quiz">
+  <h4>思考题 04-1：Agent 与 AWEL 的边界</h4>
+  <p>给定一个"用户提问 → 查数据库 → 如果查不到就搜索网页 → 生成图表 → 返回"的任务，你会用 AWEL DAG 还是 Agent 来实现？为什么？如果两者混用，边界在哪里？提示：考虑"分支决策是否需要 LLM 推理"。</p>
+</div>
+
+<div class="quiz">
+  <h4>思考题 04-2：generate_reply 为什么是 @final</h4>
+  <p><code>ConversableAgent.generate_reply</code> 被标记为 <code>@final</code>，子类不能覆盖。但 ReActAgent 的行为明显和普通 Agent 不同，它是如何实现差异化逻辑的？提示：看 <code>_a_init_reply_message</code>、<code>act</code>、<code>prepare_act_param</code> 这些可覆盖的钩子方法。</p>
+</div>
+
+<div class="quiz">
+  <h4>思考题 04-3：ReAct 循环的终止条件</h4>
+  <p>ReActAgent 的 <code>run_mode = AgentRunMode.LOOP</code>。如果 LLM 永远不输出 <code>Action: terminate</code>，循环会怎样结束？有哪几道保护机制？提示：看 <code>max_retry_count</code>、<code>max_timeout</code>、<code>have_retry</code>。</p>
+</div>
+
+<div class="quiz">
+  <h4>思考题 04-4：短期记忆的 enhance_threshold</h4>
+  <p><code>EnhancedShortTermMemory</code> 中 <code>enhance_threshold=3</code> 表示一条记忆被相似记忆"命中" 3 次后会被转移到长期记忆。如果把这个值设为 1，会发生什么？设为 100 呢？提示：考虑"记忆固化速度"与"噪声记忆"之间的权衡。</p>
+</div>
+
+<div class="quiz">
+  <h4>思考题 04-5：ResourcePack 的 prompt 拼接顺序</h4>
+  <p><code>ResourcePack.get_prompt</code> 遍历 <code>self._resources</code>（一个 dict）拼接 prompt。在 Python 3.7+ 中 dict 保持插入顺序，但如果资源列表很长，这个顺序是否可预测？如何确保数据库 Schema 总是在知识库 chunk 前面？提示：考虑 <code>Resource.apply</code> 方法。</p>
+</div>
+
+<div class="quiz">
+  <h4>思考题 04-6：中间件的执行顺序</h4>
+  <p><code>MiddlewareManager.execute_modify_system_prompt</code> 是链式修改——中间件 A 改完传给 B，B 改完传给 C。如果 A 和 B 都在 <code>modify_system_prompt</code> 中注入安全规则，最终 prompt 中的顺序由什么决定？如何控制中间件的执行优先级？提示：看 <code>_middlewares</code> 的注册顺序。</p>
+</div>
+
+<div class="pager">
+  <a href="03-awel.html">← 03 · AWEL 工作流</a>
+  <a href="05-rag.html">05 · RAG 检索 →</a>
+</div>
+
+</main>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: 'base',
+    themeVariables: {
+      primaryColor: '#1a2029',
+      primaryTextColor: '#e6e6e6',
+      primaryBorderColor: '#4ec9b0',
+      lineColor: '#569cd6',
+      secondaryColor: '#232b37',
+      tertiaryColor: '#0f1419',
+      textColor: '#e6e6e6',
+      fontFamily: 'JetBrains Mono, Consolas, monospace',
+      fontSize: '16px'
+    },
+    flowchart: { curve: 'basis', padding: 20, useMaxWidth: true }
+  });
+</script>
+</body>
+</html>

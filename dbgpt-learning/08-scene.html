@@ -1,0 +1,1083 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>08 · Scene 场景封装 · DB-GPT 源码精读</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="layout">
+
+<aside class="sidebar">
+  <h2>DBGPT 精读</h2>
+  <ul><li><a href="index.html">总览</a></li></ul>
+  <div class="group-title">入门</div>
+  <ul>
+    <li><a href="01-architecture.html">01 · 整体架构</a></li>
+    <li><a href="02-startup.html">02 · 启动流程</a></li>
+  </ul>
+  <div class="group-title">核心子系统</div>
+  <ul>
+    <li><a href="03-awel.html">03 · AWEL 工作流</a></li>
+    <li><a href="04-agent.html">04 · Agent 系统</a></li>
+    <li><a href="05-rag.html">05 · RAG 检索</a></li>
+    <li><a href="06-model.html">06 · 模型层</a></li>
+    <li><a href="07-datasource.html">07 · 数据源</a></li>
+  </ul>
+  <div class="group-title">应用层</div>
+  <ul>
+    <li><a href="08-scene.html" class="active">08 · Scene 场景</a></li>
+    <li><a href="09-serve.html">09 · Serve 服务</a></li>
+    <li><a href="10-ext.html">10 · Ext 扩展</a></li>
+  </ul>
+  <div class="group-title">实战</div>
+  <ul><li><a href="11-trace.html">11 · 链路追踪</a></li></ul>
+</aside>
+
+<main class="main">
+  <h1>08 · Scene 业务场景封装 <span class="tag">App</span></h1>
+  <p class="subtitle">一个 ChatScene 枚举，一个 BaseChat 抽象，五个内置场景 —— DB-GPT 如何把"业务模板"做成可热插拔的积木</p>
+
+  <div class="toc">
+    <div class="toc-title">本章导览</div>
+    <ol>
+      <li><a href="#overview">Scene 是什么：把业务封装成场景模板</a></li>
+      <li><a href="#abstraction">Scene 抽象：ChatScene 与 AppScenePromptTemplateAdapter</a></li>
+      <li><a href="#lifecycle">ChatScene 生命周期：从请求到响应</a></li>
+      <li><a href="#factory">ChatFactory：Scene 的工厂模式实例化</a></li>
+      <li><a href="#compare">五大内置 Scene 对比一览</a></li>
+      <li><a href="#chat_normal">chat_normal：普通聊天（骨架详解）</a></li>
+      <li><a href="#chat_data">chat_data：Excel/CSV 数据问答</a></li>
+      <li><a href="#chat_db">chat_db：NL2SQL 经典场景</a></li>
+      <li><a href="#chat_dashboard">chat_dashboard：图表看板生成</a></li>
+      <li><a href="#chat_knowledge">chat_knowledge：RAG 知识库问答</a></li>
+      <li><a href="#output_parser">输出解析器：out_parser.py</a></li>
+      <li><a href="#awel">Scene 与 AWEL 的衔接：operators/app_operator.py</a></li>
+      <li><a href="#extend">实战指南：怎么扩展一个新 Scene</a></li>
+      <li><a href="#quiz">本章测验</a></li>
+    </ol>
+  </div>
+
+  <div class="callout tip">
+    <strong>一句话定位：</strong>Scene 是 DB-GPT 应用层最重要的"业务封装单元"。
+    它把 <em>prompt 模板 + 输入预处理 + 模型调用 + 输出解析 + 副作用执行</em> 五件套
+    封装成一个可插拔的类。每新增一种对话能力（如 NL2SQL、Excel 分析、Dashboard 报表），
+    只需要新建一个 Scene 子包，而不是改动核心框架代码。
+  </div>
+
+  <!-- ===================== 1. Scene 是什么 ===================== -->
+  <h2 id="overview">一、Scene 是什么：把业务封装成场景模板</h2>
+
+  <p>如果你用过 DB-GPT 的 Web 界面，你会看到聊天框旁边有一个"对话模式"下拉框，
+    里面有 <code>Chat Normal</code>、<code>Chat Data</code>、<code>Chat DB</code>、
+    <code>Dashboard</code>、<code>Chat Knowledge</code> 等选项。
+    每选一种模式，整个后端的 prompt、数据注入方式、输出渲染逻辑都会完全不同。
+    这背后就是 <strong>Scene</strong> 在起作用。</p>
+
+  <p>本质上，一个 Scene 回答这样一个工程问题：</p>
+  <div class="callout">
+    <strong>"怎么把一类业务（比如 NL2SQL）封装成可复用、可切换的模块？"</strong>
+  </div>
+
+  <p>DB-GPT 的答案是把业务沉淀成 <strong>场景模板</strong>。每个模板由四个要素组成：</p>
+  <ol>
+    <li><strong>Prompt 模板</strong>：System 指令 + 占位符变量（如 <code>{table_info}</code>、<code>{context}</code>）</li>
+    <li><strong>输入预处理逻辑</strong>：把 select_param（数据库、文件、知识库）转换成 prompt 变量字典</li>
+    <li><strong>输出解析器</strong>：把 LLM 返回的文本解析成结构化结果（如 SqlAction、ChartItem）</li>
+    <li><strong>副作用执行器</strong>：在 <code>do_action()</code> 中执行 SQL、渲染图表、拼装引用</li>
+  </ol>
+
+  <p>这四个要素在源码中对应四组文件，每个 Scene 子包的目录结构高度一致：</p>
+  <pre><code>scene/chat_db/auto_execute/
+  ├── __init__.py
+  ├── chat.py          # BaseChat 子类（业务逻辑）
+  ├── prompt.py        # prompt 模板 + 注册
+  ├── out_parser.py    # 输出解析器
+  ├── config.py        # Scene 专属配置
+  └── example.py       # few-shot 示例（可选）</code></pre>
+
+  <p>这种"约定大于配置"的目录布局让新 Scene 的接入成本极低，也使得
+    <code>ChatFactory</code> 可以用 <code>BaseChat.__subclasses__()</code>
+    自动发现所有已注册 Scene，无需维护一堆 if-else 分支。</p>
+
+  <!-- ===================== 2. Scene 抽象 ===================== -->
+  <h2 id="abstraction">二、Scene 抽象：ChatScene 与 AppScenePromptTemplateAdapter</h2>
+
+  <p>整个 Scene 体系的"入口"是 <code>base.py</code> 中的两个核心类。
+    第一个是 <code>ChatScene</code> 枚举，它定义了所有支持的对话模式；
+    第二个是 <code>AppScenePromptTemplateAdapter</code>，它是每个 Scene 的"配置容器"。</p>
+
+  <h3>2.1 ChatScene 枚举：对话模式的"户籍簿"</h3>
+
+  <p><code>ChatScene</code> 是一个 <code>Enum</code>，每个成员封装了一个 <code>Scene</code> 值对象。
+    <code>Scene</code> 类的字段包括 code（模式标识）、name（显示名）、describe（描述）、
+    param_types（前端要选择什么参数）、is_inner（是否内部 Scene）、prepare_scene_code（前置 Scene）等。</p>
+
+  <pre><code><span class="k">class</span> <span class="t">Scene</span>:
+    <span class="k">def</span> __init__(self, code, name, describe,
+                 param_types=[], is_inner=<span class="k">False</span>,
+                 show_disable=<span class="k">False</span>, prepare_scene_code=<span class="k">None</span>):
+        self.code = code
+        self.name = name
+        self.describe = describe
+        self.param_types = param_types
+        self.is_inner = is_inner
+        self.prepare_scene_code = prepare_scene_code
+
+<span class="k">class</span> <span class="t">ChatScene</span>(Enum):
+    ChatWithDbExecute = Scene(
+        code=<span class="s">"chat_with_db_execute"</span>,
+        name=<span class="s">"Chat Data"</span>,
+        describe=<span class="s">"Dialogue with your private data..."</span>,
+        param_types=[<span class="s">"DB Select"</span>],
+    )
+    ChatExcel = Scene(
+        code=<span class="s">"chat_excel"</span>,
+        name=<span class="s">"Chat Excel"</span>,
+        param_types=[<span class="s">"File Select"</span>],
+        prepare_scene_code=<span class="s">"excel_learning"</span>,  <span class="c"># 前置场景</span>
+    )
+    ChatDashboard = Scene(
+        code=<span class="s">"chat_dashboard"</span>,
+        name=<span class="s">"Dashboard"</span>,
+        param_types=[<span class="s">"DB Select"</span>],
+    )
+    ChatKnowledge = Scene(
+        code=<span class="s">"chat_knowledge"</span>,
+        param_types=[<span class="s">"Knowledge Space Select"</span>],
+    )
+    <span class="c"># ... 还有 ChatNormal / ChatAgent / ChatFlow / Extract* / QueryRewrite 等</span>
+
+    <span class="k">def</span> value(self):       <span class="k">return</span> self._value_.code
+    <span class="k">def</span> scene_name(self): <span class="k">return</span> self._value_.name
+    <span class="k">def</span> param_types(self): <span class="k">return</span> self._value_.param_types
+    <span class="k">def</span> is_inner(self):  <span class="k">return</span> self._value_.is_inner</code></pre>
+
+  <div class="callout tip">
+    <strong>关键设计：</strong><code>ChatScene.ChatExcel</code> 的 <code>prepare_scene_code="excel_learning"</code>
+    是一个非常重要的字段。它表示 <strong>ChatExcel 在正式对话前会先跑一个前置 Scene</strong>，
+    让 LLM 先学习 Excel 的列结构、做列名标准化。这种"Scene 串接"机制是 DB-GPT 独有的设计。
+  </div>
+
+  <h3>2.2 AppScenePromptTemplateAdapter：Scene 的"配置容器"</h3>
+
+  <p>每个 Scene 不只是 prompt，还需要声明温度、max_new_tokens、是否流式、
+    用哪个输出解析器等。<code>AppScenePromptTemplateAdapter</code> 就是把这些"非业务逻辑"
+    的配置打包在一起。它在 <code>prompt.py</code> 中实例化，然后注册到
+    <code>CFG.prompt_template_registry</code>，供 <code>BaseChat.__init__</code> 时按
+    <code>chat_mode.value()</code> 取出。</p>
+
+  <pre><code><span class="k">class</span> <span class="t">AppScenePromptTemplateAdapter</span>(BaseModel):
+    prompt: ChatPromptTemplate              <span class="c"># 模板本体（System + History + Human）</span>
+    template_scene: Optional[<span class="t">str</span>]            <span class="c"># 场景 code（如 "chat_normal"）</span>
+    template_is_strict: Optional[<span class="t">bool</span>] = <span class="k">True</span>  <span class="c"># 模板渲染是否严格模式</span>
+    output_parser: Optional[BaseOutputParser]  <span class="c"># 输出解析器</span>
+    stream_out: Optional[<span class="t">bool</span>] = <span class="k">True</span>          <span class="c"># 是否流式输出</span>
+    example_selector: Optional[ExampleSelector] <span class="c"># few-shot 示例选择器</span>
+    temperature: Optional[<span class="t">float</span>] = <span class="fl">0.6</span>       <span class="c"># 默认温度</span>
+    max_new_tokens: Optional[<span class="t">int</span>] = <span class="num">1024</span>     <span class="c"># 默认最大新 token</span>
+    str_history: Optional[<span class="t">bool</span>] = <span class="k">False</span>       <span class="c"># 历史是否拍成字符串</span></code></pre>
+
+  <p>注意 <strong>temperature / max_new_tokens 的三层覆盖优先级</strong>：
+    API 请求 &gt; app 配置文件 &gt; prompt 模板默认值。这由 <code>BaseChat.llm_temperature()</code>
+    和 <code>BaseChat.llm_max_new_tokens()</code> 实现，保证运维侧和应用侧都能调参。</p>
+
+  <!-- ===================== 3. 生命周期 ===================== -->
+  <h2 id="lifecycle">三、ChatScene 生命周期：从请求到响应</h2>
+
+  <p>一次典型的 Scene 调用，从 HTTP 请求进入 <code>v1/chat/completions</code> 路由开始，
+    到最终流式输出，经历以下阶段。下图是核心 ASCII 流程：</p>
+
+  <div class="mermaid">
+flowchart TD
+    HTTP(["HTTP /chat/completions  (chat_mode = chat_with_db_execute)"])
+
+    Step1["1. 构造 ChatParam<br/>chat_session_id, current_user_input, model_name,<br/>select_param(db_name), chat_mode(ChatScene.XXX), ..."]
+
+    Step2["2. ChatFactory.get_implementation(chat_mode, ...)<br/>- 遍历 BaseChat.__subclasses__()<br/>- 匹配 cls.chat_scene == chat_mode<br/>- parse_config(scene_code) 加载 app 配置<br/>- 实例化 cls(chat_param, system_app)<br/>  __init__ 中：取 prompt_template / 建 StorageConversation / 加载历史"]
+
+    Step3["3. (可选) prepare() —— 前置 Scene 执行<br/>ChatExcel 会先跑 ExcelLearning Scene 让 LLM 学习列结构"]
+
+    Step4["4. stream_call() / nostream_call()"]
+
+    Step4a["a. generate_input_values() ← 子类重写<br/>查表结构 / 读 Excel / 检索知识库 / 调 DBSummary<br/>返回 table_info, context, user_input, ..."]
+    Step4b["b. AppChatComposerOperator<br/>- 历史消息裁剪（BufferWindow / TokenBuffer）<br/>- 拼装 prompt（System + History + Human） → ModelRequest"]
+    Step4c["c. build_cached_chat_operator (AWEL DAG)<br/>- ModelCacheBranchOperator（缓存分支）<br/>- LLMOperator / StreamingLLMOperator<br/>- ModelSaveCacheOperator → ModelOutput"]
+    Step4d["d. output_parser.parse_model_stream_resp_ex()<br/>把流式文本解析成结构化结果"]
+    Step4e["e. do_action() ← 子类重写（可选）<br/>执行 SQL / 渲染图表 / 返回引用"]
+    Step4f["f. parse_view_response() → 最终 view_message"]
+
+    Step4g["g. current_message.end_current_round()  持久化会话"]
+
+    HTTP --> Step1
+    Step1 --> Step2
+    Step2 --> Step3
+    Step3 --> Step4
+    Step4 --> Step4a
+    Step4a --> Step4b
+    Step4b --> Step4c
+    Step4c --> Step4d
+    Step4d --> Step4e
+    Step4e --> Step4f
+    Step4f --> Step4g
+  </div>
+
+  <p>这个生命周期揭示了 Scene 的核心抽象边界：<strong>BaseChat 负责框架性的
+    请求编排（会话管理、历史裁剪、缓存分支、流式输出），子类只负责业务差异点</strong>：
+    重写 <code>generate_input_values()</code> 来注入业务数据，
+    重写 <code>do_action()</code> 来执行副作用，
+    重写 <code>stream_plugin_call()</code> 来做流式过程中的实时渲染。</p>
+
+  <!-- ===================== 4. ChatFactory ===================== -->
+  <h2 id="factory">四、ChatFactory：Scene 的工厂模式实例化</h2>
+
+  <p><code>ChatFactory</code> 是一个单例（<code>metaclass=Singleton</code>），
+    提供唯一入口 <code>get_implementation(chat_mode, system_app, chat_param)</code>。
+    它的策略非常巧妙：<strong>不做 if-else 分发，而是遍历
+    <code>BaseChat.__subclasses__()</code> 自动匹配</strong>。</p>
+
+  <pre><code><span class="k">class</span> <span class="t">ChatFactory</span>(metaclass=Singleton):
+    <span class="k">@staticmethod</span>
+    <span class="k">def</span> get_implementation(chat_mode, system_app, chat_param, **kwargs):
+        <span class="c"># 懒加载：先 import 所有 Scene 子模块（让 __subclasses__ 生效）</span>
+        <span class="k">from</span> dbgpt_app.scene.chat_normal.chat <span class="k">import</span> ChatNormal
+        <span class="k">from</span> dbgpt_app.scene.chat_db.auto_execute.chat <span class="k">import</span> ChatWithDbAutoExecute
+        <span class="k">from</span> dbgpt_app.scene.chat_dashboard.chat <span class="k">import</span> ChatDashboard
+        <span class="k">from</span> dbgpt_app.scene.chat_data.chat_excel.excel_analyze.chat <span class="k">import</span> ChatExcel
+        <span class="k">from</span> dbgpt_app.scene.chat_knowledge.v1.chat <span class="k">import</span> ChatKnowledge
+        <span class="c"># ... 其他 Scene import</span>
+
+        chat_classes = BaseChat.__subclasses__()
+        implementation = <span class="k">None</span>
+        <span class="k">for</span> cls <span class="k">in</span> chat_classes:
+            <span class="k">if</span> cls.chat_scene == chat_mode:
+                config = parse_config(system_app, chat_mode, type_class=cls.param_class())
+                chat_param.app_config = config
+                implementation = cls(**kwargs, chat_param=chat_param, system_app=system_app)
+        <span class="k">if</span> implementation <span class="k">is</span> <span class="k">None</span>:
+            <span class="k">raise</span> Exception(<span class="s">f"Invalid implementation name:{chat_mode}"</span>)
+        <span class="k">return</span> implementation</code></pre>
+
+  <div class="callout">
+    <strong>懒加载的意义：</strong>所有 Scene 的 import 都放在方法内部而非模块顶部，
+    是为了 <strong>避免循环依赖</strong>。Scene 子类依赖 BaseChat，而 BaseChat 又依赖
+    operators/app_operator，如果都顶部 import，初始化链会非常复杂。懒加载让
+    "第一次调用 get_implementation 时"才真正建立依赖图。
+  </div>
+
+  <!-- ===================== 5. 五大 Scene 对比表 ===================== -->
+  <h2 id="compare">五、五大内置 Scene 对比一览</h2>
+
+  <p>下表是五个最常用 Scene 的横向对比。每个 Scene 的差异本质上是
+    <strong>"输入预处理 + prompt 模板 + 输出解析 + 副作用"</strong> 四个维度的差异。</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>维度</th>
+        <th>chat_normal</th>
+        <th>chat_data (Excel)</th>
+        <th>chat_db (NL2SQL)</th>
+        <th>chat_dashboard</th>
+        <th>chat_knowledge</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>code</strong></td>
+        <td><code>chat_normal</code></td>
+        <td><code>chat_excel</code></td>
+        <td><code>chat_with_db_execute</code></td>
+        <td><code>chat_dashboard</code></td>
+        <td><code>chat_knowledge</code></td>
+      </tr>
+      <tr>
+        <td><strong>前端参数类型</strong></td>
+        <td>无</td>
+        <td>File Select</td>
+        <td>DB Select</td>
+        <td>DB Select</td>
+        <td>Knowledge Space Select</td>
+      </tr>
+      <tr>
+        <td><strong>核心模块</strong></td>
+        <td>纯 LLM 对话</td>
+        <td>ExcelReader + DuckDB</td>
+        <td>ConnectorManager + DBSummaryClient</td>
+        <td>DashboardDataLoader + 报表模板</td>
+        <td>KnowledgeSpaceRetriever + Rerank</td>
+      </tr>
+      <tr>
+        <td><strong>输入预处理</strong></td>
+        <td>直接取用户输入</td>
+        <td>读 Excel schema + 样例数据 + 前置 Learning Scene</td>
+        <td>DBSummary 检索 TOP-K 表结构</td>
+        <td>DBSummary 检索 + 加载图表类型清单</td>
+        <td>向量检索 + 可选 QueryRewrite + Rerank</td>
+      </tr>
+      <tr>
+        <td><strong>prompt 关键变量</strong></td>
+        <td><code>{input}</code></td>
+        <td><code>{table_schema}</code> <code>{data_example}</code> <code>{table_name}</code></td>
+        <td><code>{db_name}</code> <code>{table_info}</code> <code>{dialect}</code> <code>{top_k}</code></td>
+        <td><code>{table_info}</code> <code>{input}</code> <code>{supported_chat_type}</code></td>
+        <td><code>{context}</code> <code>{question}</code></td>
+      </tr>
+      <tr>
+        <td><strong>输出格式</strong></td>
+        <td>纯文本</td>
+        <td><code>&lt;api-call&gt;</code> 含 SQL 块</td>
+        <td>JSON（thoughts/sql/display_type）</td>
+        <td>JSON 数组（多图表）</td>
+        <td>文本 + 引用 references</td>
+      </tr>
+      <tr>
+        <td><strong>输出解析器</strong></td>
+        <td>NormalChatOutputParser</td>
+        <td>ChatExcelOutputParser</td>
+        <td>DbChatOutputParser</td>
+        <td>ChatDashboardOutputParser</td>
+        <td>NormalChatOutputParser</td>
+      </tr>
+      <tr>
+        <td><strong>副作用 do_action</strong></td>
+        <td>无</td>
+        <td>stream_plugin_call 执行 SQL 渲染</td>
+        <td>返回 database.run_to_df 闭包</td>
+        <td>批量执行 SQL + 组装 ReportData</td>
+        <td>拼接 references 引用</td>
+      </tr>
+      <tr>
+        <td><strong>默认温度</strong></td>
+        <td>0.6</td>
+        <td>0.3</td>
+        <td>0.5</td>
+        <td>0.6</td>
+        <td>0.6</td>
+      </tr>
+      <tr>
+        <td><strong>是否流式</strong></td>
+        <td>是</td>
+        <td>是</td>
+        <td>是</td>
+        <td>是</td>
+        <td>是</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>可以看到 <strong>温度参数</strong> 已经体现了业务特性：NL2SQL 场景（chat_db）温度最低（0.5），
+    因为 SQL 需要精确；Excel 分析（chat_data）更严格（0.3）；
+    而普通聊天和 RAG 问答保持默认（0.6）允许一定创造性。</p>
+
+  <!-- ===================== 6. chat_normal ===================== -->
+  <h2 id="chat_normal">六、chat_normal：普通聊天（骨架详解）</h2>
+
+  <p><code>chat_normal</code> 是最简单的 Scene，几乎只做"用户输入 → LLM → 输出"。
+    理解它等于理解所有 Scene 的骨架。整个子包只有 4 个文件，加起来不到 50 行核心代码。</p>
+
+  <h3>6.1 chat.py —— 极简的 BaseChat 子类</h3>
+
+  <pre><code><span class="k">class</span> <span class="t">ChatNormal</span>(BaseChat):
+    chat_scene: <span class="t">str</span> = ChatScene.ChatNormal.value()
+
+    <span class="k">@classmethod</span>
+    <span class="k">def</span> param_class(cls) -> Type[ChatNormalConfig]:
+        <span class="k">return</span> ChatNormalConfig
+
+    <span class="k">def</span> __init__(self, chat_param: ChatParam, system_app: SystemApp):
+        <span class="k">super</span>().__init__(chat_param=chat_param, system_app=system_app)</code></pre>
+
+  <p>注意 <strong>每个 BaseChat 子类必须声明类属性 <code>chat_scene</code></strong>，
+    这是 ChatFactory 匹配的"身份证"。还要实现 <code>param_class()</code> 返回该 Scene 的配置类，
+    供 <code>parse_config</code> 从 app 配置文件反序列化。</p>
+
+  <h3>6.2 prompt.py —— 模板与注册</h3>
+
+  <pre><code>PROMPT_SCENE_DEFINE_EN = <span class="s">"You are a helpful AI assistant."</span>
+PROMPT_SCENE_DEFINE_ZH = <span class="s">"你是一个有用的 AI 助手。"</span>
+PROMPT_SCENE_DEFINE = PROMPT_SCENE_DEFINE_ZH <span class="k">if</span> CFG.LANGUAGE == <span class="s">"zh"</span> <span class="k">else</span> PROMPT_SCENE_DEFINE_EN
+
+prompt = ChatPromptTemplate(
+    messages=[
+        SystemPromptTemplate.from_template(PROMPT_SCENE_DEFINE),
+        MessagesPlaceholder(variable_name=<span class="s">"chat_history"</span>),
+        MessagesPlaceholder(variable_name=<span class="s">"media_input"</span>),
+        HumanPromptTemplate.from_template(<span class="s">"{input}"</span>),
+    ]
+)
+
+prompt_adapter = AppScenePromptTemplateAdapter(
+    prompt=prompt,
+    template_scene=ChatScene.ChatNormal.value(),
+    stream_out=<span class="k">True</span>,
+    output_parser=NormalChatOutputParser(),
+)
+
+CFG.prompt_template_registry.register(prompt_adapter, language=CFG.LANGUAGE, is_default=<span class="k">True</span>)</code></pre>
+
+  <p>这里有几个关键点：</p>
+  <ul>
+    <li><strong>ChatPromptTemplate</strong> 由四条消息组成：System 指令、历史消息占位符、媒体输入占位符、用户输入模板</li>
+    <li><strong>MessagesPlaceholder</strong> 是一种特殊的模板变量，运行时会被替换成一组 Message 对象（而非字符串）</li>
+    <li><strong>注册到 registry</strong> 时要传 <code>language</code> 和 <code>is_default</code>，registry 会按 (scene_code, language) 建索引</li>
+  </ul>
+
+  <h3>6.3 out_parser.py —— 最朴素的解析器</h3>
+
+  <pre><code><span class="k">class</span> <span class="t">NormalChatOutputParser</span>(BaseOutputParser):
+    <span class="k">def</span> parse_prompt_response(self, model_out_text) -> T:
+        <span class="k">return</span> model_out_text  <span class="c"># 直接返回原文，不做结构化解析</span>
+
+    <span class="k">def</span> get_format_instructions(self) -> <span class="t">str</span>:
+        <span class="k">pass</span></code></pre>
+
+  <p>普通聊天不需要结构化输出，所以解析器只是"原样返回"。对比之下，
+    NL2SQL 的解析器要做 JSON 解析 + SQL 提取，Dashboard 解析器要解析 JSON 数组，
+    复杂度差异巨大。这是 Scene 设计的精髓：<strong>解析器的复杂度 = 业务的复杂度</strong>。</p>
+
+  <!-- ===================== 7. chat_data ===================== -->
+  <h2 id="chat_data">七、chat_data：Excel/CSV 数据问答</h2>
+
+  <p><code>chat_data</code> 场景让用户上传 Excel/CSV 文件后，用自然语言提问，
+    系统自动生成 DuckDB SQL 并执行，返回表格或图表。它是最复杂的 Scene 之一，
+    因为涉及 <strong>Excel 解析 → 列名标准化 → DuckDB 建表 → SQL 生成 → 执行 → 渲染</strong> 全链路。</p>
+
+  <h3>7.1 ChatExcel 的初始化与 ExcelReader</h3>
+
+  <pre><code><span class="k">class</span> <span class="t">ChatExcel</span>(BaseChat):
+    chat_scene: <span class="t">str</span> = ChatScene.ChatExcel.value()
+
+    <span class="k">def</span> __init__(self, chat_param: ChatParam, system_app: SystemApp):
+        self.fs_client = FileStorageClient.get_instance(system_app)
+        self.select_param = chat_param.select_param
+        <span class="c"># 解析文件路径（支持绝对路径 / dict / JSON / file:// URI）</span>
+        file_path, file_name, database_file_path, database_file_id = self._resolve_path(...)
+        self._curr_table = <span class="s">"data_analysis_table"</span>
+        self.excel_reader = ExcelReader(
+            chat_param.chat_session_id, file_path, file_name,
+            read_type=<span class="s">"direct"</span>,
+            database_name=database_file_path,  <span class="c"># DuckDB 文件路径</span>
+            table_name=self._curr_table,
+        )
+        self.api_call = ApiCall()
+        <span class="k">super</span>().__init__(chat_param=chat_param, system_app=system_app)</code></pre>
+
+  <p><code>ExcelReader</code> 是这个 Scene 的核心模块。它用 DuckDB 作为内存分析引擎，
+    把 Excel/CSV 数据导入到一张名为 <code>data_analysis_table</code> 的 DuckDB 表中，
+    后续所有 SQL 都跑在这张表上。DuckDB 的列式存储和向量化执行让单机分析百万行数据也能秒级响应。</p>
+
+  <h3>7.2 前置 Scene：ExcelLearning</h3>
+
+  <p>ChatExcel 重写了 <code>prepare()</code>，在正式对话前先跑一个内部的 ExcelLearning Scene。
+    ExcelLearning 让 LLM 分析 Excel 的每一列，做列名标准化（中文 → 英文小写下划线），
+    生成数据分析建议。这样后续对话时，prompt 里就能提供更规范的表结构。</p>
+
+  <pre><code><span class="k">async def</span> prepare(self):
+    <span class="k">if</span> self.has_history_messages():
+        <span class="k">return None</span>  <span class="c"># 只在首轮学习</span>
+    chat_param = ChatParam(
+        chat_session_id=self.chat_session_id,
+        current_user_input=<span class="s">"["</span> + self.excel_reader.excel_file_name + <span class="s">"] Analyze！"</span>,
+        select_param=self.select_param,
+        chat_mode=ChatScene.ExcelLearning,  <span class="c"># 切换到学习模式</span>
+        model_name=self.model_name,
+    )
+    learn_chat = ExcelLearning(chat_param, system_app=self.system_app,
+                               parent_mode=self.chat_mode, excel_reader=self.excel_reader)
+    result = <span class="k">await</span> learn_chat.nostream_call()
+    <span class="k">return</span> result</code></pre>
+
+  <h3>7.3 Excel 分析的 prompt 模板</h3>
+
+  <p>ChatExcel 的 prompt 是所有 Scene 中最长的之一。它注入了 DuckDB 表结构、
+    采样数据、显示类型列表，并给出两个 few-shot 示例。关键片段：</p>
+
+  <pre><code>_PROMPT_SCENE_DEFINE_ZH = <span class="s">"""你是一个数据分析专家！"""</span>
+
+_DEFAULT_TEMPLATE_ZH = <span class="s">"""
+用户有一份待分析表格文件数据，目前已经导入到 DuckDB 表中，
+一部分采样数据如下:
+```json
+{data_example}
+```
+
+DuckDB 表结构信息如下：
+{table_schema}
+
+请基于给你的数据结构信息，在满足下面约束条件下通过 DuckDB SQL 数据分析回答用户的问题。
+约束条件:
+    1. 请充分理解用户的问题，使用 DuckDB SQL 的方式进行分析
+    2. 请从如下给出的展示方式中选择最优的一种用以进行数据渲染
+       可用数据展示方式如下: {display_type}
+    3. SQL 中需要使用的表名是: {table_name}
+    4. 优先使用数据分析的方式回答
+    5. DuckDB 处理时间戳需通过专用函数（如 to_timestamp()）而非直接 CAST
+
+请一步一步思考，给出回答，并确保你的回答内容格式如下:
+    [对用户说的想法摘要]<api-call><name>[数据展示方式]</name><args>
+    <sql>[正确的duckdb数据分析sql]</sql></args></api-call>
+
+你可以参考下面的样例:
+例子1：
+user: 分析各地区的销售额和利润...
+assistant: [分析思路]
+1. 需要识别查询核心维度(地区)和指标(销售额、利润、利润率)
+2. 利润率计算需在聚合后计算，避免分母错误
+...
+<api-call><name>response_table</name><args><sql>
+SELECT region AS 地区, SUM(sales) AS 总销售额, ...
+</sql></args></api-call>
+
+注意，回答一定要符合 <api-call> 的格式! 请使用和用户问题相同的语言回答！
+用户问题：{user_input}
+"""</span>
+
+PROMPT_TEMPERATURE = <span class="fl">0.3</span>  <span class="c"># 低温度保证 SQL 准确性</span></code></pre>
+
+  <div class="callout tip">
+    <strong>prompt 设计亮点：</strong>
+    1) 注入采样数据让 LLM"看到"真实数据样式；
+    2) 列出 DuckDB 语法陷阱（GROUP BY、时间函数）；
+    3) 用 <code>&lt;api-call&gt;</code> 自定义标签包裹 SQL，方便前端解析；
+    4) 提供两个跨语言的 few-shot 示例（中文+英文）。
+  </div>
+
+  <!-- ===================== 8. chat_db ===================== -->
+  <h2 id="chat_db">八、chat_db：NL2SQL 经典场景</h2>
+
+  <p><code>chat_db</code> 是 DB-GPT 最经典的场景：用户选择数据库后用自然语言提问，
+    LLM 生成 SQL，系统自动执行并返回结果。这个场景分为两个子模式：</p>
+  <ul>
+    <li><strong>auto_execute</strong>（<code>chat_with_db_execute</code>）：生成 SQL 后自动执行</li>
+    <li><strong>professional_qa</strong>（<code>chat_with_db_qa</code>）：只生成 SQL 不执行，纯问答</li>
+  </ul>
+
+  <h3>8.1 表结构检索：DBSummaryClient</h3>
+
+  <p>一个数据库可能有几百张表，全部塞进 prompt 会爆 token。
+    ChatWithDbAutoExecute 的 <code>generate_input_values()</code> 通过
+    <code>DBSummaryClient.get_db_summary()</code> 做语义检索，只返回 TOP-K 张最相关的表结构。
+    如果检索失败，降级到 <code>database.table_simple_info()</code> 并按 token 截断。</p>
+
+  <pre><code><span class="k">async def</span> generate_input_values(self) -> Dict:
+    client = DBSummaryClient(system_app=self.system_app)
+    <span class="k">try</span>:
+        table_infos = <span class="k">await</span> blocking_func_to_async(
+            self._executor, client.get_db_summary,
+            self.db_name, user_input, self.curr_config.schema_retrieve_top_k,
+        )
+    <span class="k">except</span> Exception:
+        table_infos = <span class="k">await</span> blocking_func_to_async(
+            self._executor, self.database.table_simple_info
+        )
+        <span class="k">if</span> len(table_infos) > self.curr_config.schema_max_tokens:
+            table_infos = table_infos[:self.curr_config.schema_max_tokens]
+
+    input_values = {
+        <span class="s">"db_name"</span>: self.db_name,
+        <span class="s">"user_input"</span>: user_input,
+        <span class="s">"top_k"</span>: self.curr_config.max_num_results,  <span class="c"># 默认 50</span>
+        <span class="s">"dialect"</span>: self.database.dialect,           <span class="c"># mysql/postgresql/...</span>
+        <span class="s">"table_info"</span>: table_infos,
+        <span class="s">"display_type"</span>: self._generate_numbered_list(),
+    }
+    <span class="k">return</span> input_values</code></pre>
+
+  <h3>8.2 NL2SQL 的 prompt 模板与 response 格式</h3>
+
+  <p>chat_db 的 prompt 要求 LLM 返回严格 JSON，包含 thoughts、sql、display_type、direct_response 四个字段。
+    模板里通过 <code>response_format</code> 注入 JSON schema 示例：</p>
+
+  <pre><code>_DEFAULT_TEMPLATE_ZH = <span class="s">"""
+请根据用户选择的数据库和该库的部分可用表结构定义来回答用户问题.
+数据库名: {db_name}
+表结构定义: {table_info}
+
+约束:
+    1. 请根据用户问题理解用户意图，使用给出表结构定义
+       创建一个语法正确的 {dialect} sql，如果不需要 sql，则直接回答用户问题。
+    2. 除非用户指定了具体行数，否则始终将查询限制为最多 {top_k} 个结果。
+    3. 只能使用表结构信息中提供的表来生成 sql，禁止随意捏造信息。
+    4. 请注意生成 SQL 时不要弄错表和列的关系
+    5. 请检查 SQL 的正确性，并保证正确情况下优化查询性能
+    6. 请从展示方式中选择最优的一种用以进行数据渲染: {display_type}
+
+用户问题: {user_input}
+请一步步思考并按照以下 JSON 格式回复：
+    {response}
+确保返回正确的 json 并且可以被 Python json.loads 方法解析.
+"""</span>
+
+RESPONSE_FORMAT_SIMPLE = {
+    <span class="s">"thoughts"</span>: <span class="s">"thoughts summary to say to user"</span>,
+    <span class="s">"direct_response"</span>: <span class="s">"If context is sufficient, reply directly without sql"</span>,
+    <span class="s">"sql"</span>: <span class="s">"SQL Query to run"</span>,
+    <span class="s">"display_type"</span>: <span class="s">"Data display method"</span>,
+}
+
+PROMPT_TEMPERATURE = <span class="fl">0.5</span>  <span class="c"># 比 Excel 更宽松一点</span></code></pre>
+
+  <h3>8.3 do_action：返回 SQL 执行闭包</h3>
+
+  <p>注意 <code>do_action</code> 不是直接执行 SQL，而是<strong>返回一个闭包</strong>
+    <code>self.database.run_to_df</code>。这个闭包会在 <code>parse_view_response</code>
+    中被调用，传入 LLM 生成的 SQL 来执行并获取 DataFrame。</p>
+
+  <pre><code><span class="k">def</span> do_action(self, prompt_response):
+    print(<span class="s">f"do_action:{prompt_response}"</span>)
+    <span class="k">return</span> self.database.run_to_df  <span class="c"># 返回的是函数，不是结果</span></code></pre>
+
+  <p><code>DbChatOutputParser.parse_view_response</code> 中调用这个闭包执行 SQL，
+    把结果 DataFrame 转 JSON，组装成 <code>&lt;chart-view&gt;</code> XML 标签返回给前端。
+    如果 SQL 执行失败，会返回错误信息的红色标签。</p>
+
+  <!-- ===================== 9. chat_dashboard ===================== -->
+  <h2 id="chat_dashboard">九、chat_dashboard：图表看板生成</h2>
+
+  <p><code>chat_dashboard</code> 是 chat_db 的"升级版"：不是只生成一条 SQL，
+    而是<strong>一次生成 4-8 条 SQL</strong>，每条对应一个图表，组成一个完整的看板（Dashboard）。
+    这个场景的 <code>do_action</code> 会批量执行 SQL 并组装 <code>ReportData</code> 对象。</p>
+
+  <h3>9.1 prompt 要求批量输出</h3>
+
+  <pre><code>_DEFAULT_TEMPLATE = <span class="s">"""
+According to the following table structure definition:
+{table_info}
+Provide professional data analysis to support users' goals: {input}
+
+Provide at least 4 and at most 8 dimensions of analysis according to user goals.
+The output data of the analysis cannot exceed 4 columns, and do not use columns such
+as pay_status in the SQL where condition for data filtering.
+According to the characteristics of the analyzed data, choose the most suitable one
+from the charts provided below for data display, chart type: {supported_chat_type}
+
+Pay attention to the length of the output content, do not exceed 4000 tokens
+
+Give the correct {dialect} analysis SQL
+1. Do not use unprovided values such as 'paid'
+2. All queried values must have aliases, such as select count(*) as count from table
+3. If the table structure uses keywords of {dialect} as field names, use escape chars
+4. Carefully check the correctness of the SQL
+5. Please use the same language as the "user"
+"""</span>
+
+RESPONSE_FORMAT = [
+    {
+        <span class="s">"thoughts"</span>: <span class="s">"Current thinking and value of data analysis"</span>,
+        <span class="s">"showcase"</span>: <span class="s">"What type of charts to show"</span>,
+        <span class="s">"sql"</span>: <span class="s">"data analysis SQL"</span>,
+        <span class="s">"title"</span>: <span class="s">"Data Analysis Title"</span>,
+    }
+]</code></pre>
+
+  <div class="callout">
+    <strong>关键约束：</strong>"至少 4 条、至多 8 条"、"输出列不超过 4 列"、
+    "所有值必须有别名"、"不要在 WHERE 里用业务状态字段过滤"。
+    这些约束都是为了<em>保证看板的可视化效果</em>：列太多图表会拥挤，
+    WHERE 里用业务状态会让数据被过度过滤。
+  </div>
+
+  <h3>9.2 do_action：批量执行 + ReportData 组装</h3>
+
+  <pre><code><span class="k">def</span> do_action(self, prompt_response):
+    chart_datas: List[ChartData] = []
+    dashboard_data_loader = DashboardDataLoader()
+    <span class="k">for</span> chart_item <span class="k">in</span> prompt_response:  <span class="c"># 遍历每个图表项</span>
+        <span class="k">try</span>:
+            field_names, values = dashboard_data_loader.get_chart_values_by_conn(
+                self.database, chart_item.sql
+            )
+            chart_datas.append(ChartData(
+                chart_uid=str(uuid.uuid1()),
+                chart_name=chart_item.title,
+                chart_type=chart_item.showcase,    <span class="c"># 如 response_pie_chart</span>
+                chart_desc=chart_item.thoughts,
+                chart_sql=chart_item.sql,
+                column_name=field_names,
+                values=values,
+            ))
+        <span class="k">except</span> Exception <span class="k">as</span> e:
+            logger.warning(<span class="s">f"Failed to get chart data: {str(e)}"</span>)
+    <span class="k">return</span> ReportData(
+        conv_uid=self.chat_session_id,
+        template_name=self.report_name,
+        charts=chart_datas,
+    )</code></pre>
+
+  <p>注意 <strong>单条 SQL 失败不会中断整个看板生成</strong>，
+    失败的图表会被跳过，成功的图表正常展示。这种容错策略保证了即使 LLM 生成了一条错误 SQL，
+    用户也能看到部分结果。Dashboard 的输出解析器
+    <code>ChatDashboardOutputParser</code> 还实现了 JSON 清洗和正则兜底提取，
+    应对 LLM 输出格式不规范的情况。</p>
+
+  <!-- ===================== 10. chat_knowledge ===================== -->
+  <h2 id="chat_knowledge">十、chat_knowledge：RAG 知识库问答</h2>
+
+  <p><code>chat_knowledge</code> 是 RAG 在应用层的落地。用户选择知识库后提问，
+    系统先做向量检索（可选 QueryRewrite 和 Rerank），再把检索到的 chunk 作为 context
+    拼入 prompt，最后让 LLM 基于上下文回答，并附带引用来源。</p>
+
+  <h3>10.1 KnowledgeSpaceRetriever 的初始化</h3>
+
+  <pre><code>self._space_retriever = KnowledgeSpaceRetriever(
+    space_id=space.id,
+    embedding_model=self.model_config.default_embedding,
+    top_k=retriever_top_k,       <span class="c"># 检索数量（开启 rerank 时会放大）</span>
+    query_rewrite=query_rewrite, <span class="c"># 可选的 QueryRewrite</span>
+    rerank=reranker,             <span class="c"># 可选的 RerankEmbeddingsRanker</span>
+    llm_model=self.llm_model,
+    system_app=self.system_app,
+)</code></pre>
+
+  <div class="callout tip">
+    <strong>Rerank 时的 top_k 放大策略：</strong>如果开启了 reranker，
+    且检索 top_k 小于 rerank_top_k 或小于 20，会把检索 top_k 提升到
+    <code>max(rerank_top_k, 20)</code>。这是因为 rerank 需要更大的候选集才能有效排序。
+  </div>
+
+  <h3>10.2 generate_input_values：检索 + 拼接 context</h3>
+
+  <pre><code><span class="k">async def</span> generate_input_values(self) -> Dict:
+    <span class="c"># 如果知识库有自定义 prompt，替换默认模板</span>
+    <span class="k">if</span> self.space_context <span class="k">and</span> self.space_context.get(<span class="s">"prompt"</span>):
+        self.prompt_template.prompt = ChatPromptTemplate(
+            messages=[
+                SystemPromptTemplate.from_template(self.space_context[<span class="s">"prompt"</span>][<span class="s">"template"</span>]),
+                MessagesPlaceholder(variable_name=<span class="s">"chat_history"</span>),
+                HumanPromptTemplate.from_template(<span class="s">"{question}"</span>),
+            ]
+        )
+
+    user_input = self.current_user_input.last_text
+    tasks = [self.execute_similar_search(user_input)]
+    candidates_with_scores = <span class="k">await</span> run_async_tasks(tasks=tasks, concurrency_limit=<span class="num">1</span>)
+    candidates_with_scores = reduce(<span class="k">lambda</span> x, y: x + y, candidates_with_scores)
+
+    context = <span class="s">"\n"</span>.join([doc.content <span class="k">for</span> doc <span class="k">in</span> candidates_with_scores])
+    relations = <span class="k">list</span>(<span class="k">set</span>([os.path.basename(<span class="k">str</span>(d.metadata.get(<span class="s">"source"</span>, <span class="s">""</span>)))
+                         <span class="k">for</span> d <span class="k">in</span> candidates_with_scores]))
+    input_values = {
+        <span class="s">"context"</span>: context,
+        <span class="s">"question"</span>: user_input,
+        <span class="s">"relations"</span>: relations,
+    }
+    <span class="k">return</span> input_values</code></pre>
+
+  <h3>10.3 知识库 prompt 模板</h3>
+
+  <pre><code>_DEFAULT_TEMPLATE_ZH = <span class="s">"""
+基于以下给出的已知信息, 准守规范约束，专业、简要回答用户的问题.
+规范约束:
+     1. 如果已知信息包含的图片、链接、表格、代码块等特殊 markdown 标签格式的信息，
+        确保在答案中包含原文这些图片、链接、表格和代码标签，不要丢弃不要修改
+        如:图片格式：![image.png](xxx), 链接格式:[xxx](xxx),
+        表格格式:|xxx|xxx|xxx|, 代码格式:```xxx```.
+     2. 如果无法从提供的内容中获取答案, 请说: "知识库中提供的内容不足以回答此问题"
+        禁止胡乱编造.
+     3. 回答的时候最好按照 1.2.3. 点进行总结, 并以 markdown 格式显示.
+            已知内容:
+            {context}
+            问题:
+            {question}, 请使用和用户相同的语言进行回答.
+"""</span></code></pre>
+
+  <p>这个 prompt 的核心约束是 <strong>"不要编造"</strong> 和 <strong>"保留原始 markdown 标签"</strong>。
+    前者是 RAG 的基本要求（防止幻觉），后者是为了保留知识库中的格式化内容（表格、图片、代码块），
+    让回答更专业。此外 ChatKnowledge 还在 <code>_handle_final_output</code> 和
+    <code>stream_call_reinforce_fn</code> 中拼接了 <code>&lt;references&gt;</code> 标签，
+    让前端能展示引用来源和召回分数。</p>
+
+  <!-- ===================== 11. 输出解析器 ===================== -->
+  <h2 id="output_parser">十一、输出解析器：out_parser.py</h2>
+
+  <p>输出解析器是 Scene 设计的"第三条腿"。BaseChat 的 <code>stream_call</code> 和
+    <code>nostream_call</code> 在拿到 LLM 输出后，会依次调用解析器的三个方法：</p>
+  <ol>
+    <li><code>parse_model_stream_resp_ex(output)</code> —— 流式解析（逐 token）</li>
+    <li><code>parse_model_nostream_resp(model_output)</code> —— 非流式解析（一次性）</li>
+    <li><code>parse_prompt_response(ai_response_text)</code> —— 把纯文本解析成结构化对象</li>
+    <li><code>parse_view_response(speak, data, prompt_response)</code> —— 把结构化对象转成前端可渲染的 view</li>
+  </ol>
+
+  <p>不同 Scene 的解析器复杂度差异巨大。下面是三个典型例子：</p>
+
+  <table>
+    <thead>
+      <tr><th>Scene</th><th>解析器</th><th>解析策略</th><th>结构化结果</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>chat_normal</td>
+        <td>NormalChatOutputParser</td>
+        <td>直接返回原文</td>
+        <td>纯字符串</td>
+      </tr>
+      <tr>
+        <td>chat_db</td>
+        <td>DbChatOutputParser</td>
+        <td>JSON 解析 + SQL 语法兜底检测</td>
+        <td>SqlAction(sql, thoughts, display, direct_response)</td>
+      </tr>
+      <tr>
+        <td>chat_dashboard</td>
+        <td>ChatDashboardOutputParser</td>
+        <td>JSON 数组解析 + 清洗 + 正则兜底</td>
+        <td>List[ChartItem(sql, title, thoughts, showcase)]</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>DbChatOutputParser 中有一个巧妙的兜底逻辑：如果 LLM 返回的不是 JSON 而是纯 SQL
+    （社区模型常见行为），<code>is_sql_statement()</code> 会用 <code>sqlparse</code> 检测，
+    如果是合法 SQL 语句就直接包装成 SqlAction：</p>
+
+  <pre><code><span class="k">def</span> parse_prompt_response(self, model_out_text):
+    clean_str = <span class="k">super</span>().parse_prompt_response(model_out_text)
+    <span class="c"># 兼容社区纯 SQL 输出模型</span>
+    <span class="k">if</span> self.is_sql_statement(clean_str):
+        <span class="k">return</span> SqlAction(clean_str, <span class="s">""</span>, <span class="s">""</span>, <span class="s">""</span>)
+    <span class="k">else</span>:
+        response = json.loads(clean_str, strict=<span class="k">False</span>)
+        <span class="c"># 提取 sql / thoughts / display_type / direct_response</span>
+        <span class="k">return</span> SqlAction(sql=sql, thoughts=thoughts, display=display, direct_response=resp)</code></pre>
+
+  <p>ChatDashboardOutputParser 则更进一步，实现了三级降级策略：
+    先尝试 <code>json.loads</code>，失败后调用 <code>_clean_json_string</code>
+    （去除 markdown 代码块、修复转义），再失败用 <code>_extract_json_fallback</code>
+    正则提取。这种"防御性编程"反映了 LLM 输出的不确定性 —— 即使 prompt 要求严格 JSON，
+    模型也可能输出带 markdown 包裹或格式错误的内容。</p>
+
+  <!-- ===================== 12. Scene 与 AWEL 衔接 ===================== -->
+  <h2 id="awel">十二、Scene 与 AWEL 的衔接：operators/app_operator.py</h2>
+
+  <p>Scene 不是孤立的体系，它通过 <code>operators/app_operator.py</code> 中的两个核心 Operator
+    与 AWEL 工作流无缝衔接。这两个 Operator 是 <strong>AppChatComposerOperator</strong>
+    和 <strong>build_cached_chat_operator</strong>。</p>
+
+  <h3>12.1 AppChatComposerOperator：消息编排器</h3>
+
+  <p><code>AppChatComposerOperator</code> 是一个 <code>MapOperator[ChatComposerInput, ModelRequest]</code>，
+    它的职责是把 <strong>(历史消息 + prompt 变量字典) 编排成最终发给 LLM 的 ModelRequest</strong>。
+    它内部会构建一个子 DAG：</p>
+
+  <div class="mermaid">
+flowchart TD
+    Input(["ChatComposerInput (messages, prompt_dict)"])
+    MsgMap["MapOperator(λ x → x.messages)"]
+    HistoryTransform["HistoryTransformTask<br/>(BufferWindow 或 TokenBuffer 裁剪历史)"]
+    PromptBuilder["HistoryPromptBuilderOperator<br/>(拼装 System + History + Human)"]
+    DictMap["MapOperator(λ x → x.prompt_dict)"]
+    Output(["ModelRequest"])
+
+    Input --> MsgMap
+    MsgMap --> HistoryTransform
+    HistoryTransform --> PromptBuilder
+    Input --> DictMap
+    DictMap --> PromptBuilder
+    PromptBuilder --> Output
+  </div>
+
+  <p>历史消息的裁剪策略由 <code>memory</code> 配置决定：</p>
+  <ul>
+    <li><strong>BufferWindowGPTsAppMemoryConfig</strong>：按轮次裁剪（保留前 N 轮 + 后 M 轮）</li>
+    <li><strong>TokenBufferGPTsAppMemoryConfig</strong>：按 token 数裁剪（超过限制就裁掉最旧消息）</li>
+  </ul>
+
+  <p>裁剪后的历史消息和 prompt 变量一起喂给 <code>HistoryPromptBuilderOperator</code>，
+    它会用 <code>ChatPromptTemplate</code> 把变量填入模板，生成最终的 Message 列表。
+    最终输出是一个完整的 <code>ModelRequest</code>，包含模型名、温度、max_new_tokens、消息列表等。</p>
+
+  <h3>12.2 build_cached_chat_operator：带缓存的 LLM 调用</h3>
+
+  <p><code>build_cached_chat_operator</code> 构建了一个<strong>带缓存分支的 DAG</strong>，
+    在调用 LLM 前先查缓存，命中则直接返回，未命中则调用 LLM 并写回缓存。
+    支持流式和非流式两种模式：</p>
+
+  <div class="mermaid">
+flowchart TD
+    Input(["Input"])
+    CacheBranch{"CacheBranch"}
+    LLMOperator["LLMOperator"]
+    SaveCacheOperator["SaveCacheOperator"]
+    CachedModelOperator["CachedModelOperator<br/>(命中缓存直接返回)"]
+    Join(["Join"])
+
+    Input --> CacheBranch
+    CacheBranch -- "未命中" --> LLMOperator
+    LLMOperator --> SaveCacheOperator
+    SaveCacheOperator --> Join
+    CacheBranch -- "命中" --> CachedModelOperator
+    CachedModelOperator --> Join
+  </div>
+
+  <pre><code><span class="k">with</span> DAG(<span class="s">"dbgpt_awel_app_model_infer_with_cached"</span>):
+    input_task = InputOperator(SimpleCallDataInputSource())
+
+    <span class="k">if</span> is_streaming:
+        llm_task = StreamingLLMOperator(llm_client, task_name=<span class="s">"llm_model_node"</span>)
+        cache_task = CachedModelStreamOperator(cache_manager, ...)
+        save_cache_task = ModelStreamSaveCacheOperator(cache_manager)
+    <span class="k">else</span>:
+        llm_task = LLMOperator(llm_client, task_name=<span class="s">"llm_model_node"</span>)
+        cache_task = CachedModelOperator(cache_manager, ...)
+        save_cache_task = ModelSaveCacheOperator(cache_manager)
+
+    cache_check_branch_task = ModelCacheBranchOperator(
+        cache_manager,
+        model_task_name=<span class="s">"llm_model_node"</span>,
+        cache_task_name=<span class="s">"llm_model_cache_node"</span>,
+    )
+    join_task = BranchJoinOperator()
+
+    input_task >> cache_check_branch_task
+    cache_check_branch_task >> llm_task >> save_cache_task >> join_task
+    cache_check_branch_task >> cache_task >> join_task
+    <span class="k">return</span> join_task</code></pre>
+
+  <div class="callout tip">
+    <strong>Scene 与 AWEL 的分层关系：</strong>Scene 在上层负责业务编排
+    （选择 prompt、注入数据、解析输出），AWEL 在下层负责通用编排
+    （缓存分支、历史裁剪、模型调用）。<code>BaseChat</code> 是两层之间的桥梁，
+    它在 <code>_build_model_request</code> 中实例化 <code>AppChatComposerOperator</code>，
+    在 <code>call_llm_operator</code> / <code>call_streaming_operator</code> 中调用
+    <code>build_cached_chat_operator</code>。
+  </div>
+
+  <!-- ===================== 13. 实战：扩展新 Scene ===================== -->
+  <h2 id="extend">十三、实战指南：怎么扩展一个新 Scene</h2>
+
+  <p>假设你要新增一个 <strong>"chat_api" Scene</strong> —— 用户提问后，
+    LLM 判断是否需要调用外部 API（如天气、汇率），如果需要就生成 API 调用指令并执行。
+    按照 DB-GPT 的 Scene 约定，你需要做以下几步：</p>
+
+  <h3>步骤 1：在 ChatScene 枚举中注册新模式</h3>
+  <pre><code><span class="c"># scene/base.py</span>
+ChatApi = Scene(
+    code=<span class="s">"chat_api"</span>,
+    name=<span class="s">"Chat API"</span>,
+    describe=<span class="s">"Call external APIs through natural language."</span>,
+    param_types=[<span class="s">"API Select"</span>],
+)</code></pre>
+
+  <h3>步骤 2：创建子包目录</h3>
+  <pre><code>scene/chat_api/
+  ├── __init__.py
+  ├── chat.py        # ChatApi(BaseChat)
+  ├── prompt.py      # prompt 模板 + 注册
+  ├── out_parser.py  # ApiCallOutputParser
+  └── config.py      # ChatApiConfig(GPTsAppCommonConfig)</code></pre>
+
+  <h3>步骤 3：编写 ChatApi 子类</h3>
+  <pre><code><span class="c"># scene/chat_api/chat.py</span>
+<span class="k">class</span> <span class="t">ChatApi</span>(BaseChat):
+    chat_scene: <span class="t">str</span> = ChatScene.ChatApi.value()
+
+    <span class="k">@classmethod</span>
+    <span class="k">def</span> param_class(cls):
+        <span class="k">return</span> ChatApiConfig
+
+    <span class="k">def</span> __init__(self, chat_param, system_app):
+        self.api_config = chat_param.select_param  <span class="c"># 用户选择的 API</span>
+        <span class="k">super</span>().__init__(chat_param=chat_param, system_app=system_app)
+
+    <span class="k">async def</span> generate_input_values(self) -> Dict:
+        <span class="k">return</span> {
+            <span class="s">"api_list"</span>: self.api_config.to_dict(),
+            <span class="s">"user_input"</span>: self.current_user_input.last_text,
+        }
+
+    <span class="k">def</span> do_action(self, prompt_response):
+        <span class="c"># prompt_response 是解析后的 ApiAction 对象</span>
+        <span class="k">return</span> <span class="k">lambda</span> api_name, params: self._call_api(api_name, params)</code></pre>
+
+  <h3>步骤 4：编写 prompt 和注册</h3>
+  <pre><code><span class="c"># scene/chat_api/prompt.py</span>
+prompt = ChatPromptTemplate(messages=[
+    SystemPromptTemplate.from_template(<span class="s">"""
+你是一个 API 调用专家。以下是可用的 API 列表：
+{api_list}
+
+请根据用户问题判断是否需要调用 API，如果需要，按照以下 JSON 格式回复：
+{{ "api_name": "...", "params": {{...}}, "thoughts": "..." }}
+如果不需要调用 API，直接回答用户问题。
+用户问题：{user_input}
+"""</span>),
+    MessagesPlaceholder(variable_name=<span class="s">"chat_history"</span>),
+    HumanPromptTemplate.from_template(<span class="s">"{user_input}"</span>),
+])
+
+prompt_adapter = AppScenePromptTemplateAdapter(
+    prompt=prompt,
+    template_scene=ChatScene.ChatApi.value(),
+    stream_out=<span class="k">True</span>,
+    output_parser=ApiCallOutputParser(),
+    temperature=<span class="fl">0.3</span>,  <span class="c"># API 调用需要精确</span>
+)
+CFG.prompt_template_registry.register(prompt_adapter, is_default=<span class="k">True</span>)</code></pre>
+
+  <h3>步骤 5：在 ChatFactory 中添加 import</h3>
+  <pre><code><span class="c"># scene/chat_factory.py</span>
+<span class="k">from</span> dbgpt_app.scene.chat_api.chat <span class="k">import</span> ChatApi  <span class="c"># 加一行</span></code></pre>
+
+  <p>完成后，前端只要在"对话模式"下拉框里加上 <code>chat_api</code> 选项，
+    后端就能自动路由到你的新 Scene。整个过程<strong>不需要修改 BaseChat 或任何核心代码</strong>，
+    只是在子包里新增文件。这就是 Scene 设计的核心价值 —— <strong>开闭原则</strong>。</p>
+
+  <div class="callout tip">
+    <strong>扩展检查清单：</strong>
+    1. ChatScene 枚举里注册 code 和 param_types；
+    2. chat.py 里 chat_scene 类属性 == ChatScene.XXX.value()；
+    3. prompt.py 里注册到 CFG.prompt_template_registry；
+    4. out_parser.py 里实现 parse_prompt_response 和 parse_view_response；
+    5. config.py 里定义 GPTsAppCommonConfig 子类（即使是空的也要有）；
+    6. chat_factory.py 里加一行 import 让 __subclasses__ 能发现你的类。
+  </div>
+
+  <!-- ===================== 14. 本章测验 ===================== -->
+  <h2 id="quiz">十四、本章测验</h2>
+
+  <div class="quiz">
+    <h4>本章测验（5 题）</h4>
+    <p><strong>Q1：</strong><code>ChatFactory.get_implementation</code> 用什么机制发现所有 Scene 子类？
+      为什么不做 if-else 分发？</p>
+    <p><strong>Q2：</strong><code>AppScenePromptTemplateAdapter</code> 中 temperature 的三层覆盖优先级是什么？
+      为什么 prompt 模板里设定的 temperature 优先级最低？</p>
+    <p><strong>Q3：</strong><code>ChatExcel</code> 的 <code>prepare_scene_code="excel_learning"</code> 是什么含义？
+      前置 Scene 在什么条件下会执行？它解决了什么问题？</p>
+    <p><strong>Q4：</strong><code>DbChatOutputParser.parse_prompt_response</code> 中为什么要检测
+      <code>is_sql_statement</code>？这反映了 LLM 输出的什么现实问题？</p>
+    <p><strong>Q5：</strong><code>build_cached_chat_operator</code> 构建的 DAG 有两个分支（cache 和 llm），
+      <code>ModelCacheBranchOperator</code> 是如何决定走哪个分支的？
+      <code>BranchJoinOperator</code> 又是如何合并两个分支的输出的？</p>
+  </div>
+
+  <div class="pager">
+    <a href="07-datasource.html">← 07 · 数据源</a>
+    <a href="09-serve.html">09 · Serve 服务 →</a>
+  </div>
+
+</main>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: 'base',
+    themeVariables: {
+      primaryColor: '#1a2029',
+      primaryTextColor: '#e6e6e6',
+      primaryBorderColor: '#4ec9b0',
+      lineColor: '#569cd6',
+      secondaryColor: '#232b37',
+      tertiaryColor: '#0f1419',
+      textColor: '#e6e6e6',
+      fontFamily: 'JetBrains Mono, Consolas, monospace',
+      fontSize: '16px'
+    },
+    flowchart: { curve: 'basis', padding: 20, useMaxWidth: true }
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,1018 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>07 · 数据源子系统 · DB-GPT 源码精读</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="layout">
+
+<aside class="sidebar">
+  <h2>DBGPT 精读</h2>
+  <ul><li><a href="index.html">总览</a></li></ul>
+  <div class="group-title">入门</div>
+  <ul>
+    <li><a href="01-architecture.html">01 · 整体架构</a></li>
+    <li><a href="02-startup.html">02 · 启动流程</a></li>
+  </ul>
+  <div class="group-title">核心子系统</div>
+  <ul>
+    <li><a href="03-awel.html">03 · AWEL 工作流</a></li>
+    <li><a href="04-agent.html">04 · Agent 系统</a></li>
+    <li><a href="05-rag.html">05 · RAG 检索</a></li>
+    <li><a href="06-model.html">06 · 模型层</a></li>
+    <li><a href="07-datasource.html" class="active">07 · 数据源</a></li>
+  </ul>
+  <div class="group-title">应用层</div>
+  <ul>
+    <li><a href="08-scene.html">08 · Scene 场景</a></li>
+    <li><a href="09-serve.html">09 · Serve 服务</a></li>
+    <li><a href="10-ext.html">10 · Ext 扩展</a></li>
+  </ul>
+  <div class="group-title">实战</div>
+  <ul><li><a href="11-trace.html">11 · 链路追踪</a></li></ul>
+</aside>
+
+<main class="main">
+  <h1>07 · 数据源子系统 <span class="tag">Core</span></h1>
+  <p class="subtitle">BaseConnector → RDBMSConnector → 廿种方言实现 —— DB-GPT 如何用 SQLAlchemy 一统关系型/文件型/图数据库，并为 LLM 提供 schema 注入</p>
+
+  <div class="toc">
+    <div class="toc-title">本章导览</div>
+    <ol>
+      <li><a href="#overview">数据源体系总览</a></li>
+      <li><a href="#base">BaseConnector：所有连接器的抽象基类</a></li>
+      <li><a href="#rdbms">RDBMSConnector：基于 SQLAlchemy 的关系型基类</a></li>
+      <li><a href="#dialect">用 SQLAlchemy 统一不同方言的设计</a></li>
+      <li><a href="#impl">ext 层数据源实现概览</a></li>
+      <li><a href="#awel">AWEL Operator 化：SqlExecOperator / DatasourceOperator</a></li>
+      <li><a href="#schema">给 LLM 提供 schema 的机制</a></li>
+      <li><a href="#scene">联动：Scene（chat_db）与 Agent（DBResource）</a></li>
+      <li><a href="#quiz">本章测验</a></li>
+    </ol>
+  </div>
+
+  <div class="callout tip">
+    <strong>一句话定位：</strong>DB-GPT 的数据源子系统用 <code>BaseConnector</code> 这一层抽象，
+    把 <em>MySQL / PostgreSQL / SQLite / DuckDB / Spark / OceanBase / Neo4j / Redis</em> 等异构数据源，
+    全部归一成"列出一堆表 → 拿到建表语句 → 跑一段 SQL → 返回 DataFrame"的统一接口。
+    上层的 chat_db 场景、Agent 的 DBResource、AWEL 的 SqlExecOperator 都只面对这套接口，
+    不知道底下跑的是哪种方言——这是 DB-GPT 跨库能力的基石。
+  </div>
+
+  <!-- ===================== 1. 总览 ===================== -->
+  <h2 id="overview">一、数据源体系总览</h2>
+  <p>DB-GPT 的数据源源码横跨两个包：<code>dbgpt-core</code> 提供抽象与基础实现，
+    <code>dbgpt-ext</code> 提供各厂商方言的具体连接器。整体分三大家族：</p>
+
+  <table>
+    <thead>
+      <tr><th>家族</th><th>基类</th><th>统一抽象</th><th>典型成员</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>RDBMS（关系型）</strong></td>
+        <td><code>RDBMSConnector</code></td>
+        <td>SQLAlchemy Engine + Inspector</td>
+        <td>MySQL、PostgreSQL、SQLite、DuckDB、Oracle、MSSQL、OceanBase、ClickHouse、StarRocks、Doris、Vertica、GaussDB、openGauss、Hive</td>
+      </tr>
+      <tr>
+        <td><strong>文件型 / 大数据</strong></td>
+        <td><code>BaseConnector</code>（直接继承）</td>
+        <td>自建 DataFrame / Session</td>
+        <td>Spark（parquet/csv/json/orc/text）、DuckDB（也是文件型）</td>
+      </tr>
+      <tr>
+        <td><strong>NoSQL / 图数据库</strong></td>
+        <td><code>BaseConnector</code>（直接继承）</td>
+        <td>原生驱动 + 方言查询</td>
+        <td>Neo4j（bolt + Cypher）、TuGraph、Redis（占位）</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>所有连接器最终都汇聚到 <code>dbgpt_ext/datasource/schema.py</code> 的 <code>DBType</code> 枚举里登记。
+    这个枚举是整个系统的"数据库名册"，<code>RDBMSConnector._sync_tables_from_db</code> 会用它判断 SQLite / DuckDB 这种文件库的特殊处理分支：</p>
+
+  <div class="file-block">
+    <div class="file-header">
+      <span>dbgpt_ext/datasource/schema.py</span>
+      <span class="lines">DBType 枚举</span>
+    </div>
+    <div class="file-body">
+<pre><code><span class="k">class</span> <span class="t">DBType</span>(<span class="t">Enum</span>):
+    <span class="c">"""Database type enumeration."""</span>
+    MySQL      = <span class="t">DbInfo</span>(<span class="s">"mysql"</span>)
+    OceanBase  = <span class="t">DbInfo</span>(<span class="s">"oceanbase"</span>)
+    DuckDb     = <span class="t">DbInfo</span>(<span class="s">"duckdb"</span>, <span class="k">True</span>)    <span class="c"># 文件型</span>
+    SQLite     = <span class="t">DbInfo</span>(<span class="s">"sqlite"</span>, <span class="k">True</span>)    <span class="c"># 文件型</span>
+    Oracle     = <span class="t">DbInfo</span>(<span class="s">"oracle"</span>)
+    MSSQL      = <span class="t">DbInfo</span>(<span class="s">"mssql"</span>)
+    Postgresql = <span class="t">DbInfo</span>(<span class="s">"postgresql"</span>)
+    GaussDB    = <span class="t">DbInfo</span>(<span class="s">"gaussdb"</span>)
+    openGauss  = <span class="t">DbInfo</span>(<span class="s">"openGauss"</span>)
+    Vertica    = <span class="t">DbInfo</span>(<span class="s">"vertica"</span>)
+    Clickhouse = <span class="t">DbInfo</span>(<span class="s">"clickhouse"</span>)
+    StarRocks  = <span class="t">DbInfo</span>(<span class="s">"starrocks"</span>)
+    Spark      = <span class="t">DbInfo</span>(<span class="s">"spark"</span>, <span class="k">True</span>)        <span class="c"># 文件型</span>
+    Doris      = <span class="t">DbInfo</span>(<span class="s">"doris"</span>)
+    Hive       = <span class="t">DbInfo</span>(<span class="s">"hive"</span>)
+    TuGraph    = <span class="t">DbInfo</span>(<span class="s">"tugraph"</span>)
+    Neo4j      = <span class="t">DbInfo</span>(<span class="s">"neo4j"</span>)
+
+    <span class="k">def</span> <span class="f">value</span>(self) -> <span class="t">str</span>:
+        <span class="k">return</span> self._value_.name
+
+    <span class="k">def</span> <span class="f">is_file_db</span>(self) -> <span class="t">bool</span>:
+        <span class="k">return</span> self._value_.is_file_db</code></pre>
+    </div>
+  </div>
+
+  <div class="callout">
+    <strong>设计要点：</strong><code>DbInfo</code> 第二个参数 <code>is_file_db</code> 标记"嵌入式文件数据库"——
+    SQLite、DuckDB、Spark 三者没有独立服务进程，连接串是文件路径。这个标记会影响
+    <code>_sync_tables_from_db</code> 里 schema 的传参方式（文件库传 <code>None</code>，C/S 库传数据库名）。
+  </div>
+
+  <!-- ===================== 2. BaseConnector ===================== -->
+  <h2 id="base">二、BaseConnector：所有连接器的抽象基类</h2>
+  <p><code>dbgpt/datasource/base.py</code> 定义了所有数据源的最顶层抽象。
+    它通过一系列 <code>raise NotImplementedError</code> 的方法约定了"一个数据源必须能做什么"，
+    只有 <code>run</code> 是 <code>@abstractmethod</code>——也就是说，
+    <strong>只要你能跑一段查询并返回 List，你就合格了</strong>，其他元数据接口都是可选的。</p>
+
+  <p>这是典型的"宽接口 + 鸭子默认实现"风格：让 Spark、Neo4j 这种没法走 SQLAlchemy 的异构源也能低成本接入。</p>
+
+  <div class="file-block">
+    <div class="file-header">
+      <span>dbgpt/datasource/base.py</span>
+      <span class="lines">L12-L15</span>
+    </div>
+    <div class="file-body">
+<pre><code><span class="k">class</span> <span class="t">BaseConnector</span>(<span class="t">ABC</span>):
+    <span class="c">"""Base class for all connectors."""</span>
+    db_type: <span class="t">str</span> = <span class="s">"__abstract__db_type__"</span>
+    driver: <span class="t">str</span> = <span class="s">""</span></code></pre>
+    </div>
+  </div>
+
+  <p>下面这张表梳理 <code>BaseConnector</code> 的核心方法（按职责分组）。
+    注意几乎所有方法的默认实现都是 <code>raise NotImplementedError</code>，
+    这意味着子类按需覆盖，不必全实现：</p>
+
+  <table>
+    <thead>
+      <tr><th>分组</th><th>方法</th><th>作用</th><th>返回类型</th></tr>
+    </thead>
+    <tbody>
+      <tr><td rowspan="3"><strong>元数据</strong></td>
+        <td><code>get_table_names()</code></td>
+        <td>列出所有可用表</td>
+        <td><code>Iterable[str]</code></td>
+      </tr>
+      <tr><td><code>get_columns(table_name)</code></td>
+        <td>取某表的列定义（含类型/主键/注释）</td>
+        <td><code>List[Dict]</code></td>
+      </tr>
+      <tr><td><code>get_table_info(table_names?)</code></td>
+        <td>取建表语句拼成的 schema 文本（喂 LLM 的核心）</td>
+        <td><code>str</code></td>
+      </tr>
+      <tr><td rowspan="4"><strong>查询执行</strong></td>
+        <td><code>run(command, fetch=)</code> <span class="badge core">abstractmethod</span></td>
+        <td>执行任意 SQL，返回 List（首行是列名）</td>
+        <td><code>List</code></td>
+      </tr>
+      <tr><td><code>run_to_df(command, fetch=)</code></td>
+        <td>执行 SQL 并转 pandas DataFrame</td>
+        <td><code>DataFrame</code></td>
+      </tr>
+      <tr><td><code>query_to_df / query_to_json</code></td>
+        <td>（上层包装）转 DataFrame / JSON</td>
+        <td>—</td>
+      </tr>
+      <tr><td><code>run_no_throw(command)</code></td>
+        <td>出错返回 <code>[]</code> 而不抛异常</td>
+        <td><code>List</code></td>
+      </tr>
+      <tr><td rowspan="3"><strong>注释 / 索引</strong></td>
+        <td><code>get_table_comment(name)</code></td>
+        <td>取表注释</td>
+        <td><code>Dict</code></td>
+      </tr>
+      <tr><td><code>get_column_comments(db, table)</code></td>
+        <td>取列注释</td>
+        <td><code>List[Tuple]</code></td>
+      </tr>
+      <tr><td><code>get_indexes(table_name)</code></td>
+        <td>取索引信息</td>
+        <td><code>List[Dict]</code></td>
+      </tr>
+      <tr><td rowspan="3"><strong>生命周期</strong></td>
+        <td><code>from_parameters(params)</code></td>
+        <td>从参数对象构造连接器（工厂方法）</td>
+        <td><code>Connector</code></td>
+      </tr>
+      <tr><td><code>close()</code></td>
+        <td>关闭连接（要求可多次调用）</td>
+        <td>—</td>
+      </tr>
+      <tr><td><code>__enter__ / __exit__ / __del__</code></td>
+        <td>支持 <code>with</code> 上下文与析构自动关连接</td>
+        <td>—</td>
+      </tr>
+      <tr><td><strong>类型标记</strong></td>
+        <td><code>is_normal_type / is_graph_type</code></td>
+        <td>区分普通库 vs 图数据库（Neo4j 覆盖 <code>is_graph_type=True</code>）</td>
+        <td><code>bool</code></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn">
+    <strong>易错点：</strong><code>run</code> 返回的 List 第一行是<strong>列名元组</strong>，
+    后续行才是数据。看 <code>RDBMSConnector.run_to_df</code>：
+    <code>result_lst[0]</code> 当列、<code>result_lst[1:]</code> 当值——
+    写新连接器时务必遵守这个约定，否则 DataFrame 列会错位。
+  </div>
+
+  <!-- ===================== 3. RDBMSConnector ===================== -->
+  <h2 id="rdbms">三、RDBMSConnector：基于 SQLAlchemy 的关系型基类</h2>
+  <p><code>dbgpt/datasource/rdbms/base.py</code> 是整个数据源子系统的"重头戏"。
+    它继承 <code>BaseConnector</code>，内部用 SQLAlchemy 的 <code>Engine</code> +
+    <code>Inspector</code> + <code>MetaData</code> 三件套，把所有"标准关系型库该有的能力"一次性实现好。
+    MySQL/PostgreSQL/OceanBase 这些具体实现<strong>几乎不用写代码</strong>——只需声明 driver 和 db_type。</p>
+
+  <h3>3.1 构造：从 URI 到 Engine</h3>
+  <p><code>RDBMSConnector</code> 提供三条构造路径，都最终落到 <code>create_engine</code>：</p>
+
+  <div class="file-block">
+    <div class="file-header">
+      <span>dbgpt/datasource/rdbms/base.py</span>
+      <span class="lines">from_uri / from_uri_db / from_parameters</span>
+    </div>
+    <div class="file-body">
+<pre><code><span class="k">@classmethod</span>
+<span class="k">def</span> <span class="f">from_uri</span>(cls, database_uri: <span class="t">str</span>, engine_args: <span class="t">Optional</span>[<span class="t">dict</span>] = <span class="k">None</span>, **kwargs):
+    <span class="c">"""Construct a SQLAlchemy engine from URI."""</span>
+    _engine_args = engine_args <span class="k">or</span> {}
+    <span class="k">return</span> cls(<span class="f">create_engine</span>(database_uri, **_engine_args), **kwargs)
+
+<span class="k">@classmethod</span>
+<span class="k">def</span> <span class="f">from_uri_db</span>(cls, host, port, user, pwd, db_name, engine_args=<span class="k">None</span>, **kwargs):
+    db_url = <span class="s">f"{cls.driver}://{quote(user)}:{urlquote(pwd)}@{host}:{str(port)}/{db_name}"</span>
+    <span class="k">return</span> cls.<span class="f">from_uri</span>(db_url, engine_args, **kwargs)
+
+<span class="k">@classmethod</span>
+<span class="k">def</span> <span class="f">from_parameters</span>(cls, parameters: RDBMSDatasourceParameters) -> <span class="s">"RDBMSConnector"</span>:
+    db_url = parameters.<span class="f">db_url</span>()
+    <span class="k">return</span> cls.<span class="f">from_uri</span>(db_url, engine_args=parameters.<span class="f">engine_args</span>())</code></pre>
+    </div>
+  </div>
+
+  <p>构造函数里做了一件关键的事——<strong>反射整个库的元数据</strong>：</p>
+
+  <div class="file-block">
+    <div class="file-header">
+      <span>dbgpt/datasource/rdbms/base.py · __init__</span>
+      <span class="lines">L142-L168 节选</span>
+    </div>
+    <div class="file-body">
+<pre><code>self._is_closed = <span class="k">False</span>
+self._engine = engine
+self._inspector = <span class="f">inspect</span>(engine)
+session_factory = <span class="f">sessionmaker</span>(bind=engine)
+self._db_sessions = <span class="f">scoped_session</span>(session_factory)
+self._sessions = weakref.<span class="t">WeakSet</span>()          <span class="c"># 跟踪所有 session 便于关闭</span>
+
+self._metadata = metadata <span class="k">or</span> <span class="t">MetaData</span>()
+self._metadata.<span class="f">reflect</span>(bind=self._engine)      <span class="c"># 反射全库 schema</span>
+
+self._all_tables = <span class="k">cast</span>(<span class="t">Set</span>[<span class="t">str</span>], self.<span class="f">_sync_tables_from_db</span>())</code></pre>
+    </div>
+    <div class="line-explain">
+      <span class="ln">关键</span>
+      <code>_metadata.reflect</code> 会把整库所有表的列、类型、主键、外键全部读进内存，
+      后续 <code>get_table_info</code> 直接用 <code>CreateTable(table).compile(engine)</code> 拼 DDL——
+      这是"零代码生成建表语句"的魔法所在。
+    </div>
+  </div>
+
+  <h3>3.2 get_table_info：生成给 LLM 看的 schema 文本</h3>
+  <p>这是数据源子系统对接 LLM 的核心方法。它遵循 Rajkumar et al, 2022 论文的最佳实践
+    （论文里证明了：在 prompt 里给建表语句 + 少量样本行，能显著提升 Text-to-SQL 准确率）。</p>
+
+  <div class="file-block">
+    <div class="file-header">
+      <span>dbgpt/datasource/rdbms/base.py · get_table_info</span>
+      <span class="lines">L324-L370 节选</span>
+    </div>
+    <div class="file-body">
+<pre><code><span class="k">def</span> <span class="f">get_table_info</span>(self, table_names: <span class="t">Optional</span>[<span class="t">List</span>[<span class="t">str</span>]] = <span class="k">None</span>) -> <span class="t">str</span>:
+    <span class="s">"""Get information about specified tables.
+
+    Follows best practices as specified in: Rajkumar et al, 2022
+    (https://arxiv.org/abs/2204.00498)
+    """</span>
+    all_table_names = self.<span class="f">get_usable_table_names</span>()
+    <span class="k">if</span> table_names <span class="k">is not</span> <span class="k">None</span>:
+        <span class="c"># 校验传入的表名必须存在</span>
+        missing_tables = <span class="f">set</span>(table_names).difference(all_table_names)
+        <span class="k">if</span> missing_tables:
+            <span class="k">raise</span> <span class="t">ValueError</span>(<span class="s">f"table_names {missing_tables} not found"</span>)
+        all_table_names = table_names
+
+    meta_tables = [tbl <span class="k">for</span> tbl <span class="k">in</span> self._metadata.sorted_tables
+                   <span class="k">if</span> tbl.name <span class="k">in</span> <span class="f">set</span>(all_table_names)
+                   <span class="k">and not</span> (self.dialect == <span class="s">"sqlite"</span> <span class="k">and</span> tbl.name.<span class="f">startswith</span>(<span class="s">"sqlite_"</span>))]
+
+    tables = []
+    <span class="k">for</span> table <span class="k">in</span> meta_tables:
+        <span class="c"># 优先用自定义表信息</span>
+        <span class="k">if</span> self._custom_table_info <span class="k">and</span> table.name <span class="k">in</span> self._custom_table_info:
+            tables.<span class="f">append</span>(self._custom_table_info[table.name])
+            <span class="k">continue</span>
+        <span class="c"># 用 SQLAlchemy 编译 CREATE TABLE 语句</span>
+        create_table = <span class="f">str</span>(<span class="t">CreateTable</span>(table).<span class="f">compile</span>(self._engine))
+        table_info = <span class="s">f"{create_table.rstrip()}"</span>
+        <span class="k">if</span> self._indexes_in_table_info:
+            table_info += <span class="s">f"\n\n{self._get_table_indexes(table)}"</span>
+        <span class="k">if</span> self._sample_rows_in_table_info:
+            table_info += <span class="s">f"\n{self._get_sample_rows(table)}"</span>
+        tables.<span class="f">append</span>(table_info)
+    <span class="k">return</span> <span class="s">"\n\n"</span>.<span class="f">join</span>(tables)</code></pre>
+    </div>
+  </div>
+
+  <p>三个开关控制输出丰富度（都在构造函数里设）：</p>
+  <ul>
+    <li><code>sample_rows_in_table_info</code>（默认 3）：附加 N 行样本数据，让 LLM 看到真实值。</li>
+    <li><code>indexes_in_table_info</code>（默认 False）：附加索引信息，帮 LLM 写出能命中索引的 SQL。</li>
+    <li><code>custom_table_info</code>（Dict）：手工覆盖某张表的描述，用于纠偏或补充业务语义。</li>
+  </ul>
+
+  <h3>3.3 run：SQL 分流执行</h3>
+  <p><code>run</code> 是真正"跑 SQL"的入口。它用 <code>sqlparse</code> 解析 SQL 类型，
+    分流到 <code>_query</code>（SELECT）或 <code>_write</code>（INSERT/UPDATE/DELETE），
+    DDL 则走第三条路。一个巧思：写操作执行完后，
+    会用 <code>convert_sql_write_to_select</code> 反推一个 SELECT 回查结果。</p>
+
+  <div class="file-block">
+    <div class="file-header">
+      <span>dbgpt/datasource/rdbms/base.py · run</span>
+      <span class="lines">L620-L654 节选</span>
+    </div>
+    <div class="file-body">
+<pre><code><span class="k">def</span> <span class="f">run</span>(self, command: <span class="t">str</span>, fetch: <span class="t">str</span> = <span class="s">"all"</span>) -> <span class="t">List</span>:
+    <span class="k">if</span> <span class="k">not</span> command:
+        <span class="k">return</span> []
+    parsed, ttype, sql_type, table_name = self.<span class="f">__sql_parse</span>(command)
+    command = self.<span class="f">_format_sql</span>(command)
+    <span class="k">if</span> ttype == sqlparse.tokens.DML:
+        <span class="k">if</span> sql_type == <span class="s">"SELECT"</span>:
+            <span class="k">return</span> self.<span class="f">_query</span>(command, fetch)
+        <span class="k">else</span>:                                       <span class="c"># INSERT/UPDATE/DELETE</span>
+            self.<span class="f">_write</span>(command)
+            select_sql = self.<span class="f">convert_sql_write_to_select</span>(command)
+            <span class="k">return</span> self.<span class="f">_query</span>(select_sql)          <span class="c"># 回查结果</span>
+    <span class="k">else</span>:                                           <span class="c"># DDL</span>
+        <span class="k">with</span> self.<span class="f">session_scope</span>(commit=<span class="k">False</span>) <span class="k">as</span> session:
+            cursor = session.<span class="f">execute</span>(<span class="f">text</span>(command))
+            <span class="k">if</span> cursor.returns_rows:
+                <span class="k">return</span> <span class="f">list</span>(cursor.<span class="f">fetchall</span>())
+            <span class="k">return</span> self.<span class="f">get_simple_fields</span>(table_name)</code></pre>
+    </div>
+  </div>
+
+  <h3>3.4 query_ex：带超时的查询</h3>
+  <p>不同方言的"查询超时"机制完全不同。<code>query_ex</code> 把这个差异收敛到一处——
+    这是非常值得学习的"方言适配层"写法：</p>
+
+  <div class="file-block">
+    <div class="file-header">
+      <span>dbgpt/datasource/rdbms/base.py · query_ex 超时分支</span>
+      <span class="lines">L536-L584 节选</span>
+    </div>
+    <div class="file-body">
+<pre><code><span class="k">if</span> timeout <span class="k">is not</span> <span class="k">None</span>:
+    <span class="k">if</span> self.dialect == <span class="s">"mysql"</span>:
+        <span class="c"># MySQL: 毫秒级 MAX_EXECUTION_TIME</span>
+        session.<span class="f">execute</span>(<span class="f">text</span>(<span class="s">f"SET SESSION MAX_EXECUTION_TIME = {int(timeout*1000)}"</span>))
+        <span class="k">return</span> <span class="f">_execute_query</span>(session, sql, params)
+    <span class="k">elif</span> self.dialect == <span class="s">"postgresql"</span>:
+        <span class="c"># PG: statement_timeout 毫秒</span>
+        session.<span class="f">execute</span>(<span class="f">text</span>(<span class="s">f"SET statement_timeout = {int(timeout*1000)}"</span>))
+        <span class="k">return</span> <span class="f">_execute_query</span>(session, sql, params)
+    <span class="k">elif</span> self.dialect == <span class="s">"oceanbase"</span>:
+        <span class="c"># OceanBase: ob_query_timeout 微秒</span>
+        ob_timeout = <span class="f">int</span>(timeout * <span class="n">1000000</span>)
+        session.<span class="f">execute</span>(<span class="f">text</span>(<span class="s">f"SET SESSION ob_query_timeout = {ob_timeout}"</span>))
+        <span class="k">return</span> <span class="f">_execute_query</span>(session, sql, params)
+    <span class="k">elif</span> self.dialect == <span class="s">"duckdb"</span>:
+        <span class="c"># DuckDB 不支持原生超时，用线程池兜底</span>
+        <span class="k">with</span> <span class="t">ThreadPoolExecutor</span>(max_workers=<span class="n">1</span>) <span class="k">as</span> executor:
+            future = executor.<span class="f">submit</span>(_execute_query, session, sql, params)
+            <span class="k">return</span> future.<span class="f">result</span>(timeout=timeout)</code></pre>
+    </div>
+  </div>
+
+  <!-- ===================== 4. SQLAlchemy 统一方言 ===================== -->
+  <h2 id="dialect">四、用 SQLAlchemy 统一不同方言的设计</h2>
+  <p>DB-GPT 选择 SQLAlchemy 而非各家原生驱动，是一次关键的"工程决策"。
+    收益是用一套 Engine/Session/MetaData 抹平了 MySQL/PG/SQLite/Oracle 的差异，
+    代价是引入了对 SQLAlchemy 的强依赖。具体体现在：</p>
+
+  <ul>
+    <li><strong>Engine</strong>：所有连接池、驱动、方言差异隐藏在 <code>create_engine(url)</code> 一行里。
+      <code>url</code> 的前缀（<code>mysql+pymysql</code> / <code>postgresql+psycopg2</code> / <code>duckdb</code>）决定一切。</li>
+    <li><strong>Inspector</strong>：<code>inspect(engine)</code> 提供方言无关的 <code>get_columns</code> /
+      <code>get_indexes</code> / <code>get_table_comment</code>——不用为每家库写 INFORMATION_SCHEMA 查询。</li>
+    <li><strong>MetaData + CreateTable</strong>：<code>MetaData.reflect(engine)</code> 一次性把全库 schema 读进内存，
+      再用 <code>CreateTable(table).compile(engine)</code> 按目标方言反编译 DDL。</li>
+    <li><strong>Session + scoped_session</strong>：线程安全的会话管理，
+      配合 <code>session_scope</code> 上下文管理器自动提交/回滚。</li>
+  </ul>
+
+  <p>但也因此带来副作用：像 SQLite 的 <code>PRAGMA</code>、PostgreSQL 的 <code>pg_catalog</code>、
+    Neo4j 的 Cypher 这种<strong>方言特有</strong>能力，必须靠覆盖方法来补充。
+    下一节会看到，<code>SQLiteConnector.get_indexes</code> 就是直接调 <code>PRAGMA index_list</code>，
+    绕过了 Inspector——因为 SQLite 的索引在 SQLAlchemy Inspector 里不全。</p>
+
+  <!-- ===================== 5. ext 层实现概览 ===================== -->
+  <h2 id="impl">五、ext 层数据源实现概览</h2>
+  <p><code>dbgpt_ext/datasource/rdbms/</code> 下每个 <code>conn_*.py</code> 就是一家数据库。
+    大部分实现极其精简——只声明 <code>db_type / db_dialect / driver</code> 三个类属性，
+    其他全部继承自 <code>RDBMSConnector</code>。下面看几个典型。</p>
+
+  <h3>5.1 MySQL：极简实现（继承即用）</h3>
+  <p>MySQL 连接器是"零代码"实现的典范——只声明 driver 和类型，剩下全靠父类：</p>
+
+  <div class="file-block">
+    <div class="file-header">
+      <span>dbgpt_ext/datasource/rdbms/conn_mysql.py</span>
+      <span class="lines">完整实现仅 53 行</span>
+    </div>
+    <div class="file-body">
+<pre><code><span class="n">@auto_register_resource</span>(
+    label=<span class="f">_</span>(<span class="s">"MySQL datasource"</span>),
+    category=ResourceCategory.DATABASE,
+    tags={<span class="s">"order"</span>: TAGS_ORDER_HIGH},
+)
+<span class="n">@dataclass</span>
+<span class="k">class</span> <span class="t">MySQLParameters</span>(RDBMSDatasourceParameters):
+    <span class="s">"""MySQL connection parameters."""</span>
+    __type__ = <span class="s">"mysql"</span>
+    driver: <span class="t">str</span> = <span class="f">field</span>(default=<span class="s">"mysql+pymysql"</span>, ...)
+    <span class="k">def</span> <span class="f">create_connector</span>(self) -> <span class="s">"MySQLConnector"</span>:
+        <span class="k">return</span> MySQLConnector.<span class="f">from_parameters</span>(self)
+
+<span class="k">class</span> <span class="t">MySQLConnector</span>(RDBMSConnector):
+    db_type: <span class="t">str</span> = <span class="s">"mysql"</span>
+    db_dialect: <span class="t">str</span> = <span class="s">"mysql"</span>
+    driver: <span class="t">str</span> = <span class="s">"mysql+pymysql"</span>
+    default_db = [<span class="s">"information_schema"</span>, <span class="s">"performance_schema"</span>, <span class="s">"sys"</span>, <span class="s">"mysql"</span>]</code></pre>
+    </div>
+    <div class="line-explain">
+      <span class="ln">关键</span>
+      <code>@auto_register_resource</code> 装饰器把这个数据源自动注册到 AWEL 资源池，
+      前端拖拽编排时就能在 DATABASE 分类下看到"MySQL datasource"。
+    </div>
+  </div>
+
+  <h3>5.2 SQLite：覆盖方言特有方法</h3>
+  <p>SQLite 因为没有 <code>SHOW COLUMNS</code>、没有 information_schema，
+    所以要覆盖一批方法用 <code>PRAGMA</code> 替代：</p>
+
+  <div class="file-block">
+    <div class="file-header">
+      <span>dbgpt_ext/datasource/rdbms/conn_sqlite.py · 方言特有方法</span>
+      <span class="lines">L106-L144 节选</span>
+    </div>
+    <div class="file-body">
+<pre><code><span class="k">def</span> <span class="f">get_indexes</span>(self, table_name):
+    <span class="k">with</span> self.<span class="f">session_scope</span>() <span class="k">as</span> session:
+        cursor = session.<span class="f">execute</span>(<span class="f">text</span>(<span class="s">f"PRAGMA index_list({table_name})"</span>))
+        indexes = cursor.<span class="f">fetchall</span>()
+        result = []
+        <span class="k">for</span> idx <span class="k">in</span> indexes:
+            index_name = idx[<span class="n">1</span>]
+            cursor = session.<span class="f">execute</span>(<span class="f">text</span>(<span class="s">f"PRAGMA index_info({index_name})"</span>))
+            column_names = [info[<span class="n">2</span>] <span class="k">for</span> info <span class="k">in</span> cursor.<span class="f">fetchall</span>()]
+            result.<span class="f">append</span>({<span class="s">"name"</span>: index_name, <span class="s">"column_names"</span>: column_names})
+        <span class="k">return</span> result
+
+<span class="k">def</span> <span class="f">get_show_create_table</span>(self, table_name):
+    <span class="k">with</span> self.<span class="f">session_scope</span>() <span class="k">as</span> session:
+        cursor = session.<span class="f">execute</span>(<span class="f">text</span>(
+            <span class="s">"SELECT sql FROM sqlite_master WHERE type='table' AND name='{table_name}'"</span>
+        ))
+        <span class="k">return</span> cursor.<span class="f">fetchall</span>()[<span class="n">0</span>][<span class="n">0</span>]
+
+<span class="k">def</span> <span class="f">get_fields</span>(self, table_name, db_name=<span class="k">None</span>):
+    <span class="c"># PRAGMA table_info 取代 information_schema.COLUMNS</span>
+    <span class="k">with</span> self.<span class="f">session_scope</span>() <span class="k">as</span> session:
+        cursor = session.<span class="f">execute</span>(<span class="f">text</span>(<span class="s">f"PRAGMA table_info('{table_name}')"</span>))
+        <span class="k">return</span> [(f[<span class="n">1</span>], f[<span class="n">2</span>], f[<span class="n">3</span>], f[<span class="n">4</span>], f[<span class="n">5</span>]) <span class="k">for</span> f <span class="k">in</span> cursor.<span class="f">fetchall</span>()]</code></pre>
+    </div>
+  </div>
+
+  <p>SQLite 还提供了 <code>SQLiteTempConnector</code> 子类——
+    一个会"自动销毁临时文件"的连接器，专为 AWEL 示例和单元测试设计：</p>
+
+  <div class="file-block">
+    <div class="file-header">
+      <span>dbgpt_ext/datasource/rdbms/conn_sqlite.py · SQLiteTempConnector</span>
+      <span class="lines">L242-L360 节选</span>
+    </div>
+    <div class="file-body">
+<pre><code><span class="k">class</span> <span class="t">SQLiteTempConnector</span>(SQLiteConnector):
+    <span class="s">"""A temporary SQLite database connection.
+
+    The database file will be deleted when the connection is closed.
+    """</span>
+    <span class="n">@classmethod</span>
+    <span class="k">def</span> <span class="f">create_temporary_db</span>(cls, engine_args=<span class="k">None</span>, **kwargs):
+        <span class="c"># 用 NamedTemporaryFile 创建临时文件</span>
+        temp_file = tempfile.<span class="f">NamedTemporaryFile</span>(delete=<span class="k">False</span>)
+        temp_file_path = temp_file.name
+        temp_file.<span class="f">close</span>()
+        engine = <span class="f">create_engine</span>(<span class="s">f"sqlite:///{temp_file_path}"</span>, ...)
+        <span class="k">return</span> <span class="f">cls</span>(engine, temp_file_path, **kwargs)
+
+    <span class="k">def</span> <span class="f">close</span>(self):
+        <span class="c"># 关闭时删除临时文件 + 调父类 close</span>
+        <span class="k">if</span> os.path.<span class="f">exists</span>(self.temp_file_path):
+            os.<span class="f">remove</span>(self.temp_file_path)
+        <span class="f">super</span>().<span class="f">close</span>()
+
+    <span class="k">def</span> <span class="f">create_temp_tables</span>(self, tables_info):
+        <span class="c"># 从字典批量建表 + 插数据，配合 with 使用一行起测</span>
+        <span class="k">with</span> self.<span class="f">session_scope</span>() <span class="k">as</span> session:
+            <span class="k">for</span> table_name, table_data <span class="k">in</span> tables_info.<span class="f">items</span>():
+                ...</code></pre>
+    </div>
+  </div>
+
+  <h3>5.3 PostgreSQL：schema 感知</h3>
+  <p>PG 的特色是 <code>schema</code>（命名空间）概念。默认 <code>public</code>，
+    <code>PostgreSQLConnector._sync_tables_from_db</code> 会按 schema 过滤表：</p>
+
+  <div class="file-block">
+    <div class="file-header">
+      <span>dbgpt_ext/datasource/rdbms/conn_postgresql.py</span>
+      <span class="lines">L95-L130 节选</span>
+    </div>
+    <div class="file-body">
+<pre><code><span class="k">def</span> <span class="f">_sync_tables_from_db</span>(self) -> <span class="t">Iterable</span>[<span class="t">str</span>]:
+    schema = self._schema <span class="k">or</span> <span class="s">"public"</span>
+    <span class="k">with</span> self.<span class="f">session_scope</span>() <span class="k">as</span> session:
+        table_results = session.<span class="f">execute</span>(<span class="f">text</span>(
+            <span class="s">"SELECT tablename FROM pg_catalog.pg_tables WHERE schemaname = :schema"</span>
+        ), {<span class="s">"schema"</span>: schema})
+        view_results = session.<span class="f">execute</span>(<span class="f">text</span>(
+            <span class="s">"SELECT viewname FROM pg_catalog.pg_views WHERE schemaname = :schema"</span>
+        ), {<span class="s">"schema"</span>: schema})
+        self._all_tables = <span class="f">set</span>(r[<span class="n">0</span>] <span class="k">for</span> r <span class="k">in</span> table_results).<span class="f">union</span>(
+            <span class="f">set</span>(r[<span class="n">0</span>] <span class="k">for</span> r <span class="k">in</span> view_results))
+        self._metadata.<span class="f">reflect</span>(bind=self._engine, schema=schema)
+        <span class="k">return</span> self._all_tables</code></pre>
+    </div>
+  </div>
+
+  <h3>5.4 DuckDB / Spark / OceanBase / Neo4j 概览</h3>
+  <table>
+    <thead>
+      <tr><th>连接器</th><th>基类</th><th>driver</th><th>特色</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>DuckDbConnector</code></td>
+        <td><code>RDBMSConnector</code></td>
+        <td><code>duckdb</code></td>
+        <td>文件型分析库；URL 是 <code>duckdb:///path</code>；用 <code>sqlite_master</code> 兼容视图查询</td>
+      </tr>
+      <tr>
+        <td><code>SparkConnector</code></td>
+        <td><code>BaseConnector</code>（不走 SQLAlchemy）</td>
+        <td><code>spark</code></td>
+        <td>用 <code>SparkSession</code> 加载 parquet/csv/json 为 DataFrame，注册临时视图后跑 Spark SQL</td>
+      </tr>
+      <tr>
+        <td><code>OceanBaseConnector</code></td>
+        <td><code>RDBMSConnector</code></td>
+        <td><code>mysql+ob</code></td>
+        <td>兼容 MySQL 协议的分布式库；dialect 是 mysql；超时用 <code>ob_query_timeout</code>（微秒）</td>
+      </tr>
+      <tr>
+        <td><code>Neo4jConnector</code></td>
+        <td><code>BaseConnector</code></td>
+        <td><code>bolt</code></td>
+        <td>图数据库；<code>get_table_names</code> 把 node label 与 relationship type 当"表"；<code>is_graph_type=True</code></td>
+      </tr>
+      <tr>
+        <td><code>RedisConnector</code></td>
+        <td>—</td>
+        <td>—</td>
+        <td>占位实现（<code>TODO: Implement RedisConnector</code>），目前是空类</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout">
+    <strong>Neo4j 的特别之处：</strong>图数据库没有"表"的概念，
+    <code>Neo4jConnector.get_table_names</code> 把 <strong>node label 加 <code>_node</code> 后缀</strong>、
+    <strong>relationship type 加 <code>_relationship</code> 后缀</strong>，伪装成表名给上层用。
+    <code>get_columns</code> 则用 <code>MATCH (n:Label) WITH n LIMIT 100 UNWIND keys(n)</code>
+    从前 100 个节点里推断属性——因为图库是 schema-less 的。
+  </div>
+
+  <!-- ===================== 6. AWEL Operator ===================== -->
+  <h2 id="awel">六、AWEL Operator 化：SqlExecOperator / DatasourceOperator</h2>
+  <p>数据源要进 AWEL DAG，需要被包装成 <code>MapOperator</code>。
+    DB-GPT 提供两层封装：</p>
+
+  <h3>6.1 核心层的 DatasourceOperator（通用）</h3>
+  <div class="file-block">
+    <div class="file-header">
+      <span>dbgpt/datasource/operators/datasource_operator.py · 完整实现</span>
+      <span class="lines">L13-L28 全文</span>
+    </div>
+    <div class="file-body">
+<pre><code><span class="k">class</span> <span class="t">DatasourceOperator</span>(<span class="t">MapOperator</span>[<span class="t">str</span>, <span class="t">Any</span>]):
+    <span class="s">"""The Datasource Operator."""</span>
+
+    <span class="k">def</span> <span class="f">__init__</span>(self, connector: BaseConnector, **kwargs):
+        <span class="f">super</span>().<span class="f">__init__</span>(**kwargs)
+        self._connector = connector
+
+    <span class="k">async def</span> <span class="f">map</span>(self, input_value: <span class="t">str</span>) -> <span class="t">Any</span>:
+        <span class="s">"""Execute the query."""</span>
+        <span class="k">return await</span> self.<span class="f">blocking_func_to_async</span>(self.query, input_value)
+
+    <span class="k">def</span> <span class="f">query</span>(self, input_value: <span class="t">str</span>) -> <span class="t">Any</span>:
+        <span class="k">return</span> self._connector.<span class="f">run_to_df</span>(input_value)</code></pre>
+    </div>
+    <div class="line-explain">
+      <span class="ln">关键</span>
+      <code>blocking_func_to_async</code> 把同步的 <code>run_to_df</code> 包成异步——
+      因为 SQLAlchemy 是阻塞 API，而 AWEL 是 asyncio 事件循环。
+      这是 DB-GPT 跨"同步/异步"的通用桥。
+    </div>
+  </div>
+
+  <h3>6.2 examples 里的 SqlExecOperator（端到端示例）</h3>
+  <p>在 <code>examples/awel/simple_nl_schema_sql_chart_example.py</code> 里，
+    <code>SqlExecOperator</code> 是用户自己写的一个更具体的 Operator，
+    它接收上游生成的 SQL，调 <code>connector.run_to_df</code> 返回 DataFrame，
+    再喂给下游 <code>ChartDrawOperator</code> 画图：</p>
+
+  <div class="file-block">
+    <div class="file-header">
+      <span>examples/awel/simple_nl_schema_sql_chart_example.py</span>
+      <span class="lines">L179-L199</span>
+    </div>
+    <div class="file-body">
+<pre><code><span class="k">class</span> <span class="t">SqlExecOperator</span>(<span class="t">MapOperator</span>[<span class="t">Any</span>, <span class="t">Any</span>]):
+    <span class="s">"""The Sql Execution Operator."""</span>
+
+    <span class="k">def</span> <span class="f">__init__</span>(self, connector: <span class="t">Optional</span>[RDBMSConnector] = <span class="k">None</span>, **kwargs):
+        <span class="f">super</span>().<span class="f">__init__</span>(**kwargs)
+        self._connector = connector
+
+    <span class="k">def</span> <span class="f">map</span>(self, sql: <span class="t">str</span>) -> DataFrame:
+        <span class="s">"""retrieve table schemas."""</span>
+        dataframe = self._connector.<span class="f">run_to_df</span>(command=sql, fetch=<span class="s">"all"</span>)
+        <span class="f">print</span>(<span class="s">f"sql data is \n{dataframe}"</span>)
+        <span class="k">return</span> dataframe</code></pre>
+    </div>
+  </div>
+
+  <p>整个示例的 DAG 拓扑展示了数据源在 AWEL 里的典型用法——
+    schema linking（取 schema）→ 拼 prompt → LLM 生成 SQL → <strong>SqlExecOperator 执行</strong> → 画图：</p>
+
+  <div class="mermaid">
+flowchart TD
+    HttpTrigger(["HttpTrigger"])
+    RequestHandleOperator["RequestHandleOperator"]
+    SchemaLinkingOperator["SchemaLinkingOperator(connector)"]
+    JoinOperator["JoinOperator(prompt_join_fn)"]
+    SqlGenOperator["SqlGenOperator(LLM)"]
+    SqlExecOperator["SqlExecOperator(connector)"]
+    ChartDrawOperator["ChartDrawOperator"]
+    DataFrame[("DataFrame")]
+
+    HttpTrigger --> RequestHandleOperator
+    RequestHandleOperator -- "query" --> SchemaLinkingOperator
+    RequestHandleOperator -- "query" --> JoinOperator
+    SchemaLinkingOperator --> JoinOperator
+    JoinOperator --> SqlGenOperator
+    SqlGenOperator -- "产出 SQL 字符串" --> SqlExecOperator
+    SqlExecOperator --> DataFrame
+    SqlExecOperator --> ChartDrawOperator
+  </div>
+
+  <!-- ===================== 7. 给 LLM 提供 schema ===================== -->
+  <h2 id="schema">七、给 LLM 提供 schema 的机制</h2>
+  <p>Text-to-SQL 要 work，LLM 必须知道"有哪些表、字段长什么样"。
+    DB-GPT 提供三条注入路径：</p>
+
+  <h3>7.1 路径 A：get_table_info 直接拼 prompt</h3>
+  <p>最朴素的方式——调 <code>connector.get_table_info()</code> 拿到全部建表语句，
+    塞到 prompt 模板的 <code>{table_info}</code> 占位符里（见第八节 chat_db 的模板）。</p>
+
+  <h3>7.2 路径 B：DBSummary + 向量检索（schema linking）</h3>
+  <p>表太多时全塞 prompt 会超 token。DB-GPT 的做法是：
+    用 <code>RdbmsSummary</code> 把每张表压成一行摘要（表名+列名+注释+索引），
+    向量化后存到 ChromaVectorStore；用户提问时只召回 top-k 相关表的 DDL。
+    这套机制在 <code>dbgpt_ext/rag/summary/rdbms_db_summary.py</code>：</p>
+
+  <div class="file-block">
+    <div class="file-header">
+      <span>dbgpt_ext/rag/summary/rdbms_db_summary.py · _parse_table_summary</span>
+      <span class="lines">L261-L307 节选</span>
+    </div>
+    <div class="file-body">
+<pre><code><span class="k">def</span> <span class="f">_parse_table_summary</span>(conn: BaseConnector, summary_template, table_name) -> <span class="t">str</span>:
+    <span class="s">"""生成单表摘要，用于向量化。"""</span>
+    columns = []
+    <span class="k">for</span> column <span class="k">in</span> conn.<span class="f">get_columns</span>(table_name):
+        <span class="k">if</span> column.<span class="f">get</span>(<span class="s">"comment"</span>):
+            columns.<span class="f">append</span>(<span class="s">f"{column['name']} ({column.get('comment')})"</span>)
+        <span class="k">else</span>:
+            columns.<span class="f">append</span>(<span class="s">f"{column['name']}"</span>)
+    column_str = <span class="s">", "</span>.<span class="f">join</span>(columns)
+
+    <span class="c"># 索引信息</span>
+    index_keys = []
+    <span class="k">for</span> index <span class="k">in</span> conn.<span class="f">get_indexes</span>(table_name):
+        key_str = <span class="s">", "</span>.<span class="f">join</span>(index[<span class="s">"column_names"</span>])
+        index_keys.<span class="f">append</span>(<span class="s">f"{index['name']}(`{key_str}`) "</span>)
+
+    table_str = summary_template.<span class="f">format</span>(table_name=table_name, columns=column_str)
+    <span class="k">if</span> index_keys:
+        table_str += <span class="s">f", and index keys: {', '.join(index_keys)}"</span>
+    <span class="c"># 表注释</span>
+    comment = conn.<span class="f">get_table_comment</span>(table_name)
+    <span class="k">if</span> comment.<span class="f">get</span>(<span class="s">"text"</span>):
+        table_str += <span class="s">f", and table comment: {comment.get('text')}"</span>
+    <span class="k">return</span> table_str</code></pre>
+    </div>
+  </div>
+
+  <p>摘要进向量库 → 用户提问召回 → 命中的表才调 <code>get_table_info(hit_tables)</code> 取完整 DDL → 拼 prompt。
+    这是把 RAG 思路用在"schema 检索"上的精巧设计。</p>
+
+  <h3>7.3 路径 C：Agent 的 DBResource.get_prompt</h3>
+  <p>Agent 路径走 <code>DBResource.get_prompt</code>，
+    内部带 10 秒 TTL 缓存（避免每次问都重算 schema）：</p>
+
+  <div class="file-block">
+    <div class="file-header">
+      <span>dbgpt/agent/resource/database.py · DBResource.get_prompt</span>
+      <span class="lines">L77-L96 节选</span>
+    </div>
+    <div class="file-body">
+<pre><code><span class="n">@cached</span>(cachetools.<span class="t">TTLCache</span>(maxsize=<span class="n">100</span>, ttl=<span class="n">10</span>))
+<span class="k">async def</span> <span class="f">get_prompt</span>(self, *, lang=<span class="s">"en"</span>, prompt_type=<span class="s">"default"</span>,
+                   question=<span class="k">None</span>, resource_name=<span class="k">None</span>, **kwargs):
+    <span class="k">if not</span> self._db_name:
+        <span class="k">return</span> <span class="s">"No database name provided."</span>, <span class="k">None</span>
+    schema_info = <span class="k">await</span> <span class="f">blocking_func_to_async</span>(
+        self._executor, self.<span class="f">get_schema_link</span>, db=self._db_name, question=question
+    )
+    <span class="k">return</span> (
+        self._prompt_template.<span class="f">format</span>(db_type=self._db_type, schemas=schema_info),
+        <span class="k">None</span>,
+    )</code></pre>
+    </div>
+    <div class="line-explain">
+      <span class="ln">缓存</span>
+      <code>@cached(TTLCache(maxsize=100, ttl=10))</code>——同一个 DB 10 秒内的多次 prompt 复用同一份 schema。
+      这对多轮对话很关键：用户连续追问"再按年龄分组"，不用每次都全表反射。
+    </div>
+  </div>
+
+  <!-- ===================== 8. 联动 ===================== -->
+  <h2 id="scene">八、联动：Scene（chat_db）与 Agent（DBResource）</h2>
+
+  <h3>8.1 chat_db 场景：模板 + 表结构注入</h3>
+  <p><code>dbgpt_app/scene/chat_db/auto_execute/prompt.py</code> 是
+    "ChatWithDbExecute"场景的 prompt 模板。它把 <code>{db_name}</code>、
+    <code>{table_info}</code>、<code>{dialect}</code> 三个变量直接写进 system prompt，
+    要求模型按 JSON 格式返回 thoughts + sql + display_type：</p>
+
+  <div class="file-block">
+    <div class="file-header">
+      <span>dbgpt_app/scene/chat_db/auto_execute/prompt.py</span>
+      <span class="lines">_DEFAULT_TEMPLATE_ZH 节选</span>
+    </div>
+    <div class="file-body">
+<pre><code>_DEFAULT_TEMPLATE_ZH = <span class="s">"""
+请根据用户选择的数据库和该库的部分可用表结构定义来回答用户问题.
+数据库名:
+    {db_name}
+表结构定义:
+    {table_info}
+
+约束:
+    1. 请根据用户问题理解用户意图，使用给出表结构定义
+       创建一个语法正确的{dialect} sql，如果不需要sql，则直接回答用户问题。
+    2. 除非用户在问题中指定了他希望获得的具体数据行数，否则始终将查询限制为最多
+     {top_k} 个结果。
+    3. 只能使用表结构信息中提供的表来生成 sql，如果无法根据提供的表结构中生成 sql ，
+       请说："提供的表结构信息不足以生成 sql 查询。" 禁止随意捏造信息。
+    ...
+"""</span></code></pre>
+    </div>
+  </div>
+
+  <p>注意三个占位符的来源：</p>
+  <ul>
+    <li><code>{db_name}</code> ← 用户在前端选的数据库</li>
+    <li><code>{table_info}</code> ← <code>connector.get_table_info()</code> 或 schema linking 召回的子集</li>
+    <li><code>{dialect}</code> ← <code>connector.dialect</code>（mysql / postgresql / sqlite...）</li>
+  </ul>
+
+  <h3>8.2 Agent 路径：DBResource 与 RDBMSConnectorResource</h3>
+  <p>Agent 系统里数据源被封装成 <code>Resource</code>。<code>DBResource</code> 是抽象，
+    <code>RDBMSConnectorResource</code> 是把 <code>RDBMSConnector</code> 包装成 Resource 的具体类，
+    <code>SQLiteDBResource</code> 是它的特化（自动用 SQLiteConnector 建连）：</p>
+
+  <div class="file-block">
+    <div class="file-header">
+      <span>dbgpt/agent/resource/database.py · 类层次</span>
+      <span class="lines">L144-L208 节选</span>
+    </div>
+    <div class="file-body">
+<pre><code><span class="k">class</span> <span class="t">RDBMSConnectorResource</span>(<span class="t">DBResource</span>[DBParameters]):
+    <span class="k">def</span> <span class="f">__init__</span>(self, name, connector=<span class="k">None</span>, db_name=<span class="k">None</span>,
+                 db_type=<span class="k">None</span>, dialect=<span class="k">None</span>, executor=<span class="k">None</span>, **kwargs):
+        <span class="c"># 自动从 connector 反推 db_type / dialect / db_name</span>
+        <span class="k">if not</span> db_type <span class="k">and</span> connector:
+            db_type = connector.db_type
+        <span class="k">if not</span> dialect <span class="k">and</span> connector:
+            dialect = connector.dialect
+        <span class="k">if not</span> db_name <span class="k">and</span> connector:
+            db_name = connector.<span class="f">get_current_db_name</span>()
+        self._connector = connector
+        <span class="f">super</span>().<span class="f">__init__</span>(name, db_type=db_type, db_name=db_name, ...)
+
+    <span class="k">def</span> <span class="f">get_schema_link</span>(self, db, question=<span class="k">None</span>):
+        <span class="c"># 直接复用 _parse_db_summary</span>
+        <span class="k">from</span> dbgpt_ext.rag.summary.rdbms_db_summary <span class="k">import</span> _parse_db_summary
+        <span class="k">return</span> <span class="f">_parse_db_summary</span>(self.connector)
+
+    <span class="k">def</span> <span class="f">_sync_query</span>(self, db, sql):
+        result_lst = self.connector.<span class="f">run</span>(sql)
+        <span class="k">return</span> result_lst[<span class="n">0</span>], result_lst[<span class="n">1</span>:]   <span class="c"># (columns, values)</span>
+
+<span class="k">class</span> <span class="t">SQLiteDBResource</span>(<span class="t">RDBMSConnectorResource</span>):
+    <span class="k">def</span> <span class="f">__init__</span>(self, name, db_name, executor=<span class="k">None</span>, **kwargs):
+        <span class="k">from</span> dbgpt_ext.datasource.rdbms.conn_sqlite <span class="k">import</span> SQLiteConnector
+        conn = SQLiteConnector.<span class="f">from_file_path</span>(db_name)
+        <span class="f">super</span>().<span class="f">__init__</span>(name, conn, executor=executor, **kwargs)</code></pre>
+    </div>
+  </div>
+
+  <h3>8.3 DbDataLoader：执行结果的展示渲染</h3>
+  <p>SQL 跑完后，<code>DbDataLoader.get_table_view_by_conn</code> 把 DataFrame 转成前端可渲染的
+    <code>&lt;chart-view&gt;</code> XML，包装成 response_table 类型：</p>
+
+  <div class="file-block">
+    <div class="file-header">
+      <span>dbgpt_app/scene/chat_db/data_loader.py</span>
+      <span class="lines">L8-L37 节选</span>
+    </div>
+    <div class="file-body">
+<pre><code><span class="k">class</span> <span class="t">DbDataLoader</span>:
+    <span class="k">def</span> <span class="f">get_table_view_by_conn</span>(self, data, speak, sql=<span class="k">None</span>):
+        param = {}
+        api_call_element = ET.<span class="t">Element</span>(<span class="s">"chart-view"</span>)
+        <span class="k">try</span>:
+            param[<span class="s">"type"</span>] = <span class="s">"response_table"</span>
+            param[<span class="s">"sql"</span>] = sql
+            param[<span class="s">"data"</span>] = json.<span class="f">loads</span>(
+                data.<span class="f">to_json</span>(orient=<span class="s">"records"</span>, date_format=<span class="s">"iso"</span>, date_unit=<span class="s">"s"</span>)
+            )
+            view_json_str = json.<span class="f">dumps</span>(param, default=serialize, ensure_ascii=<span class="k">False</span>)
+        <span class="k">except</span> <span class="t">Exception</span> <span class="k">as</span> e:
+            err_param = {<span class="s">"sql"</span>: sql, <span class="s">"type"</span>: <span class="s">"response_table"</span>, <span class="s">"err_msg"</span>: <span class="f">str</span>(e), <span class="s">"data"</span>: []}
+            view_json_str = json.<span class="f">dumps</span>(err_param, ...)
+        api_call_element.<span class="f">set</span>(<span class="s">"content"</span>, view_json_str)
+        <span class="k">return</span> speak + <span class="s">"\n"</span> + ET.<span class="f">tostring</span>(api_call_element, encoding=<span class="s">"utf-8"</span>).<span class="f">decode</span>(<span class="s">"utf-8"</span>)</code></pre>
+    </div>
+  </div>
+
+  <div class="callout tip">
+    <strong>三层联动的全景：</strong>
+    <em>DataSource</em>（取 schema + 跑 SQL）→ <em>Scene / Agent</em>（拼 prompt 调 LLM）→ <em>DataLoader</em>（渲染结果）。
+    这三块通过 <code>RDBMSConnector</code> 这一层抽象彻底解耦——
+    换数据库只改一个 Connector 类，上层一行不用动。
+  </div>
+
+  <!-- ===================== Quiz ===================== -->
+  <h2 id="quiz">九、本章测验</h2>
+
+  <div class="quiz">
+    <h4>题 1（基础）</h4>
+    <p><strong>BaseConnector 里唯一标了 <code>@abstractmethod</code> 的方法是什么？为什么是它？</strong></p>
+    <details><summary>参考答案</summary>
+      <p>是 <code>run(command, fetch=)</code>。因为它代表"执行查询并返回结果"这个所有数据源都<strong>必须</strong>具备的能力。
+        其他元数据方法（<code>get_table_names</code> / <code>get_columns</code> 等）默认 <code>raise NotImplementedError</code>，
+        允许子类按需覆盖——这是"宽接口 + 鸭子默认"的设计取舍：让 Spark、Neo4j 这种没有完整元数据的源也能低成本接入。</p>
+    </details>
+  </div>
+
+  <div class="quiz">
+    <h4>题 2（实现）</h4>
+    <p><strong>MySQLConnector 的实现只有 53 行就能 work，靠的是什么机制？</strong></p>
+    <details><summary>参考答案</summary>
+      <p>靠 SQLAlchemy 的 Engine + Inspector + MetaData 三件套。
+        父类 <code>RDBMSConnector</code> 在 <code>__init__</code> 里调 <code>MetaData.reflect(engine)</code>
+        把全库 schema 读进内存，后续 <code>get_columns</code> / <code>get_indexes</code> /
+        <code>get_table_info</code> 全部由 Inspector 或反射后的 MetaData 完成。
+        MySQL 子类只需要声明 <code>driver = "mysql+pymysql"</code>，
+        <code>create_engine</code> 就会自动选择 pymysql 驱动和 MySQL 方言。</p>
+    </details>
+  </div>
+
+  <div class="quiz">
+    <h4>题 3（设计）</h4>
+    <p><strong><code>sample_rows_in_table_info</code>（默认 3）这个参数解决的是什么问题？
+      它的依据是哪篇论文？</strong></p>
+    <details><summary>参考答案</summary>
+      <p>解决的是 Text-to-SQL 的准确率问题。仅给 LLM 看建表语句，模型不知道列里实际存的是什么类型/格式/枚举值的数据，
+        容易写出语法对但语义错的 SQL。在 <code>get_table_info</code> 末尾追加 3 行真实数据
+        （如看到 status 列实际是 "active"/"inactive"，就能写出正确的 WHERE），
+        能显著提升准确率。依据是 Rajkumar et al, 2022（arxiv.org/abs/2204.00498），
+        这篇论文实验证明了"建表语句 + 样本行"的 prompt 组合效果最好。</p>
+    </details>
+  </div>
+
+  <div class="quiz">
+    <h4>题 4（跨方言）</h4>
+    <p><strong><code>query_ex</code> 里 MySQL / PostgreSQL / OceanBase / DuckDB 的超时机制各是什么？
+      为什么 DuckDB 要用 ThreadPoolExecutor？</strong></p>
+    <details><summary>参考答案</summary>
+      <ul>
+        <li>MySQL：<code>SET SESSION MAX_EXECUTION_TIME = ms</code>（毫秒）</li>
+        <li>PostgreSQL：<code>SET statement_timeout = ms</code>（毫秒）</li>
+        <li>OceanBase：<code>SET SESSION ob_query_timeout = us</code>（微秒，量级不同！）</li>
+        <li>DuckDB：用 <code>ThreadPoolExecutor</code> 提交任务 + <code>future.result(timeout=)</code></li>
+      </ul>
+      <p>DuckDB 走线程池是因为它<strong>没有原生的查询超时 SQL</strong>——它是嵌入式库，
+        查询在调用线程里同步执行，只能靠外部线程池的 <code>future.result(timeout)</code> 强制超时。
+        这也意味着 DuckDB 的超时是"尽力而为"，超时后查询线程可能仍在后台跑。</p>
+    </details>
+  </div>
+
+  <div class="quiz">
+    <h4>题 5（联动）</h4>
+    <p><strong>从用户在前端选"MySQL 库 chat_db"到 LLM 收到带 schema 的 prompt，
+    中间经过哪些组件？画出数据流。</strong></p>
+    <details><summary>参考答案</summary>
+      <p>数据流（以 schema linking 模式为例）：</p>
+      <ol>
+        <li>前端选库 → 后端取 <code>ConnectorManager.get_connector(db_name)</code> 拿到 <code>RDBMSConnector</code></li>
+        <li>调 <code>_parse_db_summary(connector)</code> 把每张表压成"表名(列1, 列2, ...) and index keys: ..."格式的摘要</li>
+        <li>摘要写入 ChromaVectorStore 向量化</li>
+        <li>用户提问 → 用问题 embedding 在向量库召回 top-k 相关表</li>
+        <li>对命中的表调 <code>connector.get_table_info(hit_tables)</code> 取完整 DDL（含建表语句 + 样本行）</li>
+        <li>DDL 填入 prompt 模板的 <code>{table_info}</code>，<code>connector.dialect</code> 填入 <code>{dialect}</code></li>
+        <li>完整 prompt 发给 LLM → 返回 SQL</li>
+        <li><code>connector.run_to_df(sql)</code> 执行 → DataFrame</li>
+        <li><code>DbDataLoader.get_table_view_by_conn</code> 转成 <code>&lt;chart-view&gt;</code> XML 回前端</li>
+      </ol>
+    </details>
+  </div>
+
+  <div class="pager">
+    <a href="06-model.html">← 06 · 模型层</a>
+    <a href="08-scene.html">08 · Scene 场景 →</a>
+  </div>
+
+</main>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: 'base',
+    themeVariables: {
+      primaryColor: '#1a2029',
+      primaryTextColor: '#e6e6e6',
+      primaryBorderColor: '#4ec9b0',
+      lineColor: '#569cd6',
+      secondaryColor: '#232b37',
+      tertiaryColor: '#0f1419',
+      textColor: '#e6e6e6',
+      fontFamily: 'JetBrains Mono, Consolas, monospace',
+      fontSize: '16px'
+    },
+    flowchart: { curve: 'basis', padding: 20, useMaxWidth: true }
+  });
+</script>
+</body>
+</html>

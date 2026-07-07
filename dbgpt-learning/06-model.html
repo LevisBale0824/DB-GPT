@@ -1,0 +1,973 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>06 · 模型层 Model / LLM 子系统 · DB-GPT 源码精读</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="layout">
+
+<aside class="sidebar">
+  <h2>DBGPT 精读</h2>
+  <ul><li><a href="index.html">总览</a></li></ul>
+  <div class="group-title">入门</div>
+  <ul>
+    <li><a href="01-architecture.html">01 · 整体架构</a></li>
+    <li><a href="02-startup.html">02 · 启动流程</a></li>
+  </ul>
+  <div class="group-title">核心子系统</div>
+  <ul>
+    <li><a href="03-awel.html">03 · AWEL 工作流</a></li>
+    <li><a href="04-agent.html">04 · Agent 系统</a></li>
+    <li><a href="05-rag.html">05 · RAG 检索</a></li>
+    <li><a href="06-model.html" class="active">06 · 模型层</a></li>
+    <li><a href="07-datasource.html">07 · 数据源</a></li>
+  </ul>
+  <div class="group-title">应用层</div>
+  <ul>
+    <li><a href="08-scene.html">08 · Scene 场景</a></li>
+    <li><a href="09-serve.html">09 · Serve 服务</a></li>
+    <li><a href="10-ext.html">10 · Ext 扩展</a></li>
+  </ul>
+  <div class="group-title">实战</div>
+  <ul><li><a href="11-trace.html">11 · 链路追踪</a></li></ul>
+</aside>
+
+<main class="main">
+  <h1>06 · 模型层 Model / LLM 子系统 <span class="tag">Core</span></h1>
+  <p class="subtitle">三大职责、三套部署、Master-Worker 调度 —— DB-GPT 如何把"推理 / 适配 / 集群"拧成一根绳</p>
+
+  <div class="toc">
+    <div class="toc-title">本章导览</div>
+    <ol>
+      <li><a href="#overview">模型层全景：三大职责</a></li>
+      <li><a href="#adapter">ModelAdapter 体系：屏蔽千行模型差异</a></li>
+      <li><a href="#deploy">三种部署模式：Proxy / Local / Cluster</a></li>
+      <li><a href="#proxy">Proxy 模式深度解析</a></li>
+      <li><a href="#local">Local 模式：HF / vLLM / llama_cpp / MLX</a></li>
+      <li><a href="#cluster">Cluster 模式：Master-Worker 架构</a></li>
+      <li><a href="#worker">ModelWorker 抽象与 WorkerRunData</a></li>
+      <li><a href="#stream">流式输出：从 token 到 ModelOutput</a></li>
+      <li><a href="#operator">LLMOperator：把推理接入 AWEL DAG</a></li>
+      <li><a href="#config">配置驱动：TOML 模型加载实战</a></li>
+      <li><a href="#quiz">本章测验</a></li>
+    </ol>
+  </div>
+
+  <div class="callout tip">
+    <strong>一句话定位：</strong>DB-GPT 模型层把"<em>推理引擎</em>"、"<em>模型适配</em>"、"<em>集群调度</em>"
+    三件事正交拆开。底层用 <em>ModelAdapter</em> 屏蔽 HF / vLLM / proxy 等引擎差异，
+    上层用 <em>ModelController + ModelWorker</em> 组成 master-worker 集群，
+    再用 <em>LLMOperator</em> 把推理调用变成 AWEL DAG 节点。
+    一份 toml 配置就能在"OpenAI 代理"和"本地 vLLM"之间无缝切换。
+  </div>
+
+  <!-- ===================== 1. 三大职责 ===================== -->
+  <h2 id="overview">一、模型层全景：三大职责</h2>
+  <p>DB-GPT 的模型层源码集中在 <code>packages/dbgpt-core/src/dbgpt/model/</code> 目录下。
+    它承担三件事：</p>
+  <table>
+    <thead><tr><th>职责</th><th>核心目录</th><th>解决什么问题</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><strong>推理</strong></td>
+        <td><code>llm/</code> + <code>proxy/llms/</code></td>
+        <td>把一个 prompt 喂给模型，拿到输出（流式 or 非流式）</td>
+      </tr>
+      <tr>
+        <td><strong>适配</strong></td>
+        <td><code>adapter/</code></td>
+        <td>不同模型的 chat template、加载方式、tokenizer 各不相同，需要适配层屏蔽差异</td>
+      </tr>
+      <tr>
+        <td><strong>集群管理</strong></td>
+        <td><code>cluster/</code></td>
+        <td>多机多卡场景下，需要 Controller 注册中心 + Worker 执行器协同调度</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>整个模型层的目录结构如下：</p>
+  <pre><code><span class="k">model/</span>
+├── adapter/          <span class="com"># 模型适配器（HF / vLLM / proxy / llama_cpp / mlx）</span>
+│   ├── base.py       <span class="com"># LLMModelAdapter / EmbeddingModelAdapter 基类</span>
+│   ├── model_adapter.py  <span class="com"># get_llm_model_adapter 入口</span>
+│   ├── hf_adapter.py     <span class="com"># HuggingFace 适配器</span>
+│   ├── vllm_adapter.py   <span class="com"># vLLM 适配器</span>
+│   ├── proxy_adapter.py  <span class="com"># Proxy 适配器</span>
+│   └── loader.py     <span class="com"># ModelLoader：加载模型权重</span>
+├── llm/              <span class="com"># 推理引擎实现</span>
+│   ├── inference.py  <span class="com"># HF 原生流式推理（基于 FastChat）</span>
+│   └── llm_out/      <span class="com"># vLLM / HF Chat / llama_cpp / mlx 输出层</span>
+├── proxy/            <span class="com"># Proxy 模式：代理外部 API</span>
+│   ├── base.py       <span class="com"># ProxyLLMClient 基类 + register_proxy_model_adapter</span>
+│   └── llms/         <span class="com"># 20+ 厂商实现（openai/tongyi/ollama/baichuan/...）</span>
+├── cluster/          <span class="com"># 集群管理</span>
+│   ├── controller/   <span class="com"># ModelController：注册中心</span>
+│   ├── worker/       <span class="com"># DefaultModelWorker / WorkerManager</span>
+│   ├── registry.py   <span class="com"># EmbeddedModelRegistry：实例注册表</span>
+│   └── manager_base.py  <span class="com"># WorkerManager / WorkerRunData 抽象</span>
+├── operators/        <span class="com"># AWEL 接入</span>
+│   └── llm_operator.py  <span class="com"># LLMOperator / StreamingLLMOperator</span>
+└── parameter.py      <span class="com"># ModelWorkerParameters / ModelControllerParameters</span></code></pre>
+
+  <div class="callout">
+    <strong>与 AWEL 的关系：</strong>模型层本身是一个独立子系统，但它通过
+    <code>LLMOperator</code>（一个 AWEL Operator）把自己"挂载"到 AWEL 编排体系里。
+    这意味着任何 AWEL DAG 都可以把"调用 LLM"当作一个普通节点来编排。
+  </div>
+
+  <!-- ===================== 2. ModelAdapter ===================== -->
+  <h2 id="adapter">二、ModelAdapter 体系：屏蔽千行模型差异</h2>
+
+  <h3>2.1 为什么需要 Adapter？</h3>
+  <p>不同大模型的差异远超一般人的想象：</p>
+  <ul>
+    <li><strong>chat template 不同</strong>：Llama 用 <code>&lt;s&gt;[INST]...[/INST]</code>，Qwen 用 <code>&lt;|im_start|&gt;user\n...</code>，Baichuan 有自己的 special tokens</li>
+    <li><strong>加载方式不同</strong>：HF 要 <code>AutoModelForCausalLM.from_pretrained()</code>，vLLM 要 <code>AsyncLLMEngine.from_engine_args()</code>，proxy 模式直接 HTTP 请求</li>
+    <li><strong>system message 支持</strong>：有的模型支持 system role，有的不支持（要合并到 user message）</li>
+    <li><strong>量化支持</strong>：有的模型支持 4bit/8bit，有的不支持</li>
+    <li><strong>推理函数签名不同</strong>：HF 是 <code>model.generate()</code>，vLLM 是 <code>engine.generate()</code>，proxy 是 <code>client.chat.completions.create()</code></li>
+  </ul>
+  <p>如果没有 Adapter，上层调用方就要写无数 <code>if model_name == "xxx"</code> 的分支。
+    ModelAdapter 把这些差异封装到一个统一的抽象基类背后。</p>
+
+  <h3>2.2 LLMModelAdapter 基类</h3>
+  <p>文件：<code>model/adapter/base.py</code></p>
+  <pre><code><span class="k">class</span> <span class="type">LLMModelAdapter</span>(ABC):
+    model_name: Optional[str] = <span class="kw">None</span>
+    model_path: Optional[str] = <span class="kw">None</span>
+    conv_factory: Optional[ConversationAdapterFactory] = <span class="kw">None</span>
+    support_4bit: bool = <span class="kw">False</span>
+    support_8bit: bool = <span class="kw">False</span>
+    support_system_message: bool = <span class="kw">True</span>
+    _supported_models: List[ModelMetadata] = []
+
+    <span class="kw">def</span> <span class="fn">match</span>(<span class="kw">self</span>, provider: str, model_name=<span class="kw">None</span>, model_path=<span class="kw">None</span>) -> bool:
+        <span class="com"># 判断这个 adapter 能否处理给定的模型</span>
+        <span class="k">return</span> <span class="kw">False</span>
+
+    <span class="kw">def</span> <span class="fn">load</span>(<span class="kw">self</span>, model_path: str, from_pretrained_kwargs: dict):
+        <span class="com"># 加载模型和 tokenizer（返回 model, tokenizer 二元组）</span>
+        <span class="k">raise</span> NotImplementedError
+
+    <span class="kw">def</span> <span class="fn">get_generate_stream_function</span>(<span class="kw">self</span>, model, deploy_model_params):
+        <span class="com"># 返回流式推理函数（不同引擎签名不同）</span>
+        <span class="k">raise</span> NotImplementedError
+
+    <span class="kw">def</span> <span class="fn">get_default_conv_template</span>(<span class="kw">self</span>, model_name, model_path):
+        <span class="com"># 获取对话模板（chat template）</span>
+        <span class="k">raise</span> NotImplementedError
+
+    <span class="kw">def</span> <span class="fn">model_adaptation</span>(<span class="kw">self</span>, params, model_name, model_path, tokenizer, ...):
+        <span class="com"># 总入口：把 messages 转成模型需要的 prompt 格式</span>
+        <span class="com"># 1. 判断是否支持 system message</span>
+        <span class="com"># 2. 应用 chat template</span>
+        <span class="com"># 3. 设置 stop / stop_token_ids</span>
+        <span class="k">return</span> params, model_context</code></pre>
+
+  <p>关键方法 <code>model_adaptation()</code> 是适配的核心入口。它接收统一的 <code>messages</code>
+    列表（DB-GPT 内部格式 <code>ModelMessage</code>），根据 adapter 的 <code>support_system_message</code>
+    属性决定是否把 system message 合并到 user message，再通过 <code>get_default_conv_template()</code>
+    应用特定模型的 chat template，最终输出一个 <code>str</code> 形式的 prompt。</p>
+
+  <h3>2.3 Adapter 注册与选择</h3>
+  <p>Adapter 采用"注册表 + match 函数"模式。全局有两个列表：</p>
+  <pre><code><span class="com"># model/adapter/base.py</span>
+model_adapters: List[AdapterEntry] = []
+embedding_adapters: List[AdapterEntry] = []
+
+<span class="k">def</span> <span class="fn">register_model_adapter</span>(
+    model_adapter_cls: Type[LLMModelAdapter],
+    match_funcs=<span class="kw">None</span>,
+    supported_models=<span class="kw">None</span>,
+) -> <span class="kw">None</span>:
+    <span class="com"># 实例化 adapter，加入全局列表</span>
+    adapter = model_adapter_cls()
+    <span class="k">if</span> supported_models:
+        adapter._supported_models = supported_models
+    model_adapters.<span class="fn">append</span>(<span class="type">AdapterEntry</span>(adapter, match_funcs))
+
+<span class="k">def</span> <span class="fn">get_model_adapter</span>(provider, model_name=<span class="kw">None</span>, model_path=<span class="kw">None</span>) -> Optional[LLMModelAdapter]:
+    <span class="com"># 三级匹配：</span>
+    <span class="com"># 1. 先按 provider 匹配（如 "vllm", "proxy/openai"）</span>
+    <span class="com"># 2. 再按 model_name 精确匹配</span>
+    <span class="com"># 3. 最后按 model_path 匹配</span>
+    <span class="com"># 匹配优先级：model_name > model_path > provider</span></code></pre>
+
+  <p>注册动作发生在模块导入时（<code>@register_model_adapter</code> 装饰器或文件尾部直接调用）。
+    运行时 <code>get_llm_model_adapter()</code> 依次遍历注册表，调用每个 adapter 的 <code>match()</code>
+    方法找到第一个能处理该模型的 adapter。</p>
+
+  <h3>2.4 主要 Adapter 一览</h3>
+  <table>
+    <thead><tr><th>Adapter 类</th><th>ModelType</th><th>provider</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>VLLMModelAdapterWrapper</code></td><td>vllm</td><td><code>vllm</code></td><td>vLLM 引擎，支持 async stream、PagedAttention、tensor parallel</td></tr>
+      <tr><td><code>HFLLMModelAdapter</code>（hf_adapter.py）</td><td>hf</td><td><code>hf</code></td><td>原生 HuggingFace transformers，支持 4bit/8bit 量化</td></tr>
+      <tr><td><code>FschatAdapter</code>（fschat_adapter.py）</td><td>hf</td><td><code>hf</code></td><td>FastChat 兼容，老模型 fallback</td></tr>
+      <tr><td><code>LlamaCppAdapter</code></td><td>llama.cpp</td><td><code>llama.cpp</code></td><td>llama_cpp Python 绑定，CPU/边缘设备推理</td></tr>
+      <tr><td><code>MLXLLMModelAdapter</code></td><td>mlx</td><td><code>mlx</code></td><td>Apple Silicon（M1/M2/M3）专用</td></tr>
+      <tr><td><code>ProxyLLMModelAdapter</code>（动态生成）</td><td>proxy</td><td><code>proxy/*</code></td><td>代理模式，动态匹配 20+ 厂商</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout">
+    <strong>Provider 命名约定：</strong>provider 是一个斜杠分隔字符串，如 <code>"proxy/openai"</code>、<code>"proxy/tongyi"</code>。
+    对 local 模式，provider 就是引擎名：<code>"vllm"</code>、<code>"hf"</code>、<code>"llama.cpp"</code>、<code>"mlx"</code>。
+    toml 配置里的 <code>provider</code> 字段就是这个值，直接决定走哪个 adapter。
+  </div>
+
+  <!-- ===================== 3. 三种部署模式 ===================== -->
+  <h2 id="deploy">三、三种部署模式：Proxy / Local / Cluster</h2>
+  <p>DB-GPT 支持三种模型部署模式，它们不是互斥的——cluster 模式可以包含 proxy 和 local worker。</p>
+
+  <table>
+    <thead><tr><th>维度</th><th>Proxy 模式</th><th>Local 模式</th><th>Cluster 模式</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><strong>模型在哪</strong></td>
+        <td>外部 API（OpenAI / 通义 / Ollama 服务端）</td>
+        <td>本进程内（加载权重到 GPU/CPU）</td>
+        <td>独立 Worker 进程（可跨机器）</td>
+      </tr>
+      <tr>
+        <td><strong>谁做推理</strong></td>
+        <td>外部 API 服务商</td>
+        <td>当前 Python 进程</td>
+        <td>ModelWorker 进程</td>
+      </tr>
+      <tr>
+        <td><strong>需要 GPU？</strong></td>
+        <td>不需要</td>
+        <td>需要（除非 CPU 推理）</td>
+        <td>Worker 端需要</td>
+      </tr>
+      <tr>
+        <td><strong>启动开销</strong></td>
+        <td>几乎为零</td>
+        <td>加载权重耗时（分钟级）</td>
+        <td>Worker 启动 + 注册</td>
+      </tr>
+      <tr>
+        <td><strong>典型 provider</strong></td>
+        <td><code>proxy/openai</code> / <code>proxy/tongyi</code></td>
+        <td><code>vllm</code> / <code>hf</code> / <code>llama.cpp</code></td>
+        <td>任意（Worker 内部再用 proxy 或 local）</td>
+      </tr>
+      <tr>
+        <td><strong>适用场景</strong></td>
+        <td>快速体验、无 GPU、企业 API</td>
+        <td>单机单卡开发调试</td>
+        <td>生产部署、多模型并发</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <!-- ===================== 4. Proxy 模式 ===================== -->
+  <h2 id="proxy">四、Proxy 模式深度解析</h2>
+  <p>Proxy 模式的核心思想：<strong>把外部 LLM API 当成一个"虚拟模型"来管理</strong>。
+    它不加载任何权重，只负责把请求转发给外部 API，再把结果返回给 DB-GPT。</p>
+
+  <h3>4.1 ProxyLLMClient 基类</h3>
+  <p>文件：<code>model/proxy/base.py</code></p>
+  <pre><code><span class="k">class</span> <span class="type">ProxyLLMClient</span>(LLMClient):
+    <span class="com"># 所有 proxy 模式的客户端基类</span>
+
+    <span class="kw">def</span> <span class="fn">__init__</span>(<span class="kw">self</span>, model_names: List[str], context_length=4096,
+                 executor=<span class="kw">None</span>, proxy_tokenizer=<span class="kw">None</span>):
+        <span class="kw">self</span>.model_names = model_names
+        <span class="kw">self</span>.context_length = context_length
+        <span class="kw">self</span>.executor = executor <span class="k">or</span> <span class="type">ThreadPoolExecutor</span>()
+        <span class="kw">self</span>._proxy_tokenizer = proxy_tokenizer
+
+    <span class="kw">@classmethod</span>
+    <span class="kw">@abstractmethod</span>
+    <span class="k">def</span> <span class="fn">new_client</span>(cls, model_params: LLMDeployModelParameters,
+                          default_executor=<span class="kw">None</span>) -> <span class="str">"ProxyLLMClient"</span>:
+        <span class="com"># 从 toml 参数创建 client 实例</span>
+
+    <span class="kw">async</span> <span class="k">def</span> <span class="fn">generate_stream</span>(<span class="kw">self</span>, request: ModelRequest, ...) -> AsyncIterator[ModelOutput]:
+        <span class="com"># 默认用 sync_generate_stream + iterate_in_threadpool 实现异步</span>
+        <span class="com"># 子类可以覆盖此方法实现原生异步</span></code></pre>
+
+  <p><code>ProxyLLMClient</code> 继承自 <code>LLMClient</code>（core 接口），实现了
+    <code>generate()</code> / <code>generate_stream()</code> / <code>models()</code> / <code>count_token()</code>
+    四个核心方法。默认实现是把同步方法用线程池包装成异步，子类可以覆盖实现原生异步。</p>
+
+  <h3>4.2 动态注册：register_proxy_model_adapter</h3>
+  <p>每新增一个 proxy 厂商，只需写一个 <code>ProxyLLMClient</code> 子类，然后调用
+    <code>register_proxy_model_adapter()</code>。这个函数会<strong>动态生成</strong>一个
+    <code>ProxyLLMModelAdapter</code> 子类并注册到全局 adapter 列表：</p>
+  <pre><code><span class="k">def</span> <span class="fn">register_proxy_model_adapter</span>(client_cls: Type[ProxyLLMClient],
+                                      supported_models: List[ModelMetadata]):
+    <span class="com"># 从 client_cls 提取 provider、param_class、generate_stream_function</span>
+    generate_stream_function = client_cls.<span class="fn">generate_stream_function</span>()
+    is_async_stream = _is_async_function(generate_stream_function)
+    param_cls = client_cls.<span class="fn">param_class</span>()
+    provider = param_cls.<span class="fn">get_type_value</span>()
+
+    <span class="com"># 动态生成 adapter 子类</span>
+    <span class="k">class</span> <span class="type">_DynProxyLLMModelAdapter</span>(ProxyLLMModelAdapter):
+        __provider__ = provider
+
+        <span class="kw">def</span> <span class="fn">match</span>(<span class="kw">self</span>, _provider, model_name=<span class="kw">None</span>, ...):
+            <span class="k">return</span> _provider == provider
+
+        <span class="kw">def</span> <span class="fn">supported_models</span>(<span class="kw">self</span>):
+            <span class="k">return</span> supported_models
+
+    <span class="fn">register_model_adapter</span>(_DynProxyLLMModelAdapter)  <span class="com"># 注册到全局</span></code></pre>
+
+  <h3>4.3 厂商实现示例：TongyiLLMClient</h3>
+  <p>文件：<code>model/proxy/llms/tongyi.py</code>。通义千问的 API 兼容 OpenAI 格式，
+    所以直接继承 <code>OpenAILLMClient</code>：</p>
+  <pre><code>_DEFAULT_API_BASE = <span class="str">"https://dashscope.aliyuncs.com/compatible-mode/v1"</span>
+_DEFAULT_MODEL = <span class="str">"qwen-max-latest"</span>
+
+<span class="kw">@dataclass</span>
+<span class="k">class</span> <span class="type">TongyiDeployModelParameters</span>(OpenAICompatibleDeployModelParameters):
+    provider: str = <span class="str">"proxy/tongyi"</span>
+    api_base: Optional[str] = field(
+        default=_DEFAULT_API_BASE,
+        metadata={<span class="str">"help"</span>: <span class="str">"The base url of the tongyi API."</span>},
+    )
+    api_key: Optional[str] = field(
+        default=<span class="str">"${env:DASHSCOPE_API_KEY}"</span>,  <span class="com"># 从环境变量读取</span>
+    )
+
+<span class="k">class</span> <span class="type">TongyiLLMClient</span>(OpenAILLMClient):
+    <span class="kw">def</span> <span class="fn">__init__</span>(<span class="kw">self</span>, api_key=<span class="kw">None</span>, api_base=<span class="kw">None</span>, model=_DEFAULT_MODEL, ...):
+        api_base = api_base <span class="k">or</span> os.<span class="fn">getenv</span>(<span class="str">"DASHSCOPE_API_BASE"</span>) <span class="k">or</span> _DEFAULT_API_BASE
+        api_key = api_key <span class="k">or</span> os.<span class="fn">getenv</span>(<span class="str">"DASHSCOPE_API_KEY"</span>)
+        <span class="kw">super</span>().<span class="fn">__init__</span>(api_key=api_key, api_base=api_base, model=model, ...)
+
+<span class="fn">register_proxy_model_adapter</span>(
+    TongyiLLMClient,
+    supported_models=[
+        <span class="type">ModelMetadata</span>(model=[<span class="str">"qwen-max-latest"</span>, <span class="str">"qwen-max"</span>], context_length=32*1024, ...),
+        <span class="type">ModelMetadata</span>(model=<span class="str">"deepseek-r1"</span>, context_length=64*1024, ...),
+    ],
+)</code></pre>
+
+  <p>这种"基类 + 继承 + 注册"三件套让新增一个厂商只需不到 100 行代码。
+    目前已注册的 proxy 厂商包括：</p>
+  <table>
+    <thead><tr><th>厂商</th><th>provider</th><th>继承自</th><th>默认模型</th></tr></thead>
+    <tbody>
+      <tr><td>OpenAI</td><td><code>proxy/openai</code></td><td>ProxyLLMClient</td><td>gpt-4o-mini</td></tr>
+      <tr><td>通义千问</td><td><code>proxy/tongyi</code></td><td>OpenAILLMClient</td><td>qwen-max-latest</td></tr>
+      <tr><td>百川</td><td><code>proxy/baichuan</code></td><td>OpenAILLMClient</td><td>Baichuan4-Turbo</td></tr>
+      <tr><td>智谱</td><td><code>proxy/zhipu</code></td><td>OpenAILLMClient</td><td>glm-4</td></tr>
+      <tr><td>DeepSeek</td><td><code>proxy/deepseek</code></td><td>OpenAILLMClient</td><td>deepseek-chat</td></tr>
+      <tr><td>Moonshot</td><td><code>proxy/moonshot</code></td><td>OpenAILLMClient</td><td>moonshot-v1-8k</td></tr>
+      <tr><td>Ollama</td><td><code>proxy/ollama</code></td><td>ProxyLLMClient</td><td>llama2</td></tr>
+      <tr><td>Claude</td><td><code>proxy/claude</code></td><td>ProxyLLMClient</td><td>claude-3</td></tr>
+      <tr><td>Gemini</td><td><code>proxy/gemini</code></td><td>ProxyLLMClient</td><td>gemini-pro</td></tr>
+      <tr><td>文心</td><td><code>proxy/wenxin</code></td><td>ProxyLLMClient</td><td>ERNIE-Bot</td></tr>
+      <tr><td>火山引擎</td><td><code>proxy/volcengine</code></td><td>OpenAILLMClient</td><td>—</td></tr>
+      <tr><td>SiliconFlow</td><td><code>proxy/siliconflow</code></td><td>OpenAILLMClient</td><td>—</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout tip">
+    <strong>Ollama 的特殊之处：</strong>Ollama 虽然也是 proxy 模式（调外部 API），但它通常跑在本地
+    <code>http://localhost:11434</code>。DB-GPT 把它归类为 proxy 因为它走 HTTP API 而非直接加载权重。
+    <code>OllamaLLMClient.sync_generate_stream()</code> 直接调用 <code>ollama.Client(host).chat()</code>，
+    返回的是同步迭代器。
+  </div>
+
+  <!-- ===================== 5. Local 模式 ===================== -->
+  <h2 id="local">五、Local 模式：HF / vLLM / llama_cpp / MLX</h2>
+  <p>Local 模式下，模型权重被加载到当前进程的 GPU/CPU 中，推理在本地完成。
+    核心区别于 proxy：需要加载 <code>model</code> 和 <code>tokenizer</code> 对象。</p>
+
+  <h3>5.1 ModelLoader：加载权重的统一入口</h3>
+  <p>文件：<code>model/adapter/loader.py</code></p>
+  <pre><code><span class="k">class</span> <span class="type">ModelLoader</span>:
+    <span class="kw">def</span> <span class="fn">__init__</span>(<span class="kw">self</span>, prompt_template: Optional[str] = <span class="kw">None</span>):
+        <span class="kw">self</span>.prompt_template = prompt_template
+
+    <span class="kw">def</span> <span class="fn">loader_with_params</span>(<span class="kw">self</span>, model_params, llm_adapter):
+        <span class="com"># 委托给 adapter.load_from_params()</span>
+        <span class="com"># 不同 adapter 内部实现不同：</span>
+        <span class="com"># - HF: AutoModelForCausalLM.from_pretrained(path)</span>
+        <span class="com"># - vLLM: AsyncLLMEngine.from_engine_args()</span>
+        <span class="com"># - Proxy: ProxyModel(params, proxy_llm_client)</span>
+        <span class="k">return</span> llm_adapter.<span class="fn">load_from_params</span>(model_params)</code></pre>
+
+  <h3>5.2 vLLM Adapter</h3>
+  <p>vLLM 是目前最流行的开源推理引擎，支持 PagedAttention、continuous batching、tensor parallelism。
+    <code>VLLMModelAdapterWrapper</code> 是它的适配器：</p>
+  <pre><code><span class="k">class</span> <span class="type">VLLMModelAdapterWrapper</span>(LLMModelAdapter):
+    <span class="kw">def</span> <span class="fn">model_type</span>(<span class="kw">self</span>) -> str:
+        <span class="k">return</span> ModelType.VLLM  <span class="com"># "vllm"</span>
+
+    <span class="kw">def</span> <span class="fn">match</span>(<span class="kw">self</span>, provider, model_name=<span class="kw">None</span>, model_path=<span class="kw">None</span>) -> bool:
+        <span class="k">return</span> provider == ModelType.VLLM
+
+    <span class="kw">def</span> <span class="fn">get_str_prompt</span>(<span class="kw">self</span>, params, messages, tokenizer, ...):
+        <span class="com"># vLLM 使用 tokenizer.apply_chat_template() 生成 prompt</span>
+        <span class="kw">if</span> <span class="fn">hasattr</span>(tokenizer, <span class="str">"apply_chat_template"</span>):
+            messages = <span class="kw">self</span>.<span class="fn">transform_model_messages</span>(messages, ...)
+            <span class="k">return</span> tokenizer.<span class="fn">apply_chat_template</span>(
+                messages, tokenize=<span class="kw">False</span>, add_generation_prompt=<span class="kw">True</span>
+            )
+
+    <span class="kw">def</span> <span class="fn">load_from_params</span>(<span class="kw">self</span>, params: VLLMDeployModelParameters):
+        <span class="k">from</span> vllm <span class="k">import</span> AsyncLLMEngine
+        <span class="k">from</span> vllm.engine.arg_utils <span class="k">import</span> AsyncEngineArgs
+        vllm_engine_args_dict = params.<span class="fn">to_vllm_params</span>(AsyncEngineArgs)
+        engine_args = <span class="type">AsyncEngineArgs</span>(**vllm_engine_args_dict)
+        engine = AsyncLLMEngine.<span class="fn">from_engine_args</span>(engine_args)
+        tokenizer = engine.engine.tokenizer
+        <span class="k">return</span> engine, tokenizer  <span class="com"># model=engine, tokenizer=tokenizer</span>
+
+    <span class="kw">def</span> <span class="fn">support_async</span>(<span class="kw">self</span>) -> bool:
+        <span class="k">return</span> <span class="kw">True</span>  <span class="com"># vLLM 支持原生异步</span>
+
+<span class="fn">register_model_adapter</span>(VLLMModelAdapterWrapper, supported_models=COMMON_HF_MODELS)</code></pre>
+
+  <p><code>VLLMDeployModelParameters</code> 是一个丰富的 dataclass，包含了 vLLM 所有可配参数
+    （<code>gpu_memory_utilization</code>、<code>tensor_parallel_size</code>、<code>quantization</code>、
+    <code>max_model_len</code> 等 30+ 字段），<code>to_vllm_params()</code> 方法把它们转换成 vLLM 的
+    <code>AsyncEngineArgs</code>。</p>
+
+  <h3>5.3 HF 原生推理</h3>
+  <p>文件：<code>model/llm/inference.py</code> 提供了纯 HuggingFace 的流式推理函数
+    <code>generate_stream()</code>。它基于 <code>torch.inference_mode()</code>，
+    手动实现 KV-cache、logits processor（temperature / top_p / top_k / repetition_penalty）、
+    逐 token 生成并 <code>yield</code>：</p>
+  <pre><code><span class="kw">@torch.inference_mode</span>()
+<span class="k">def</span> <span class="fn">generate_stream</span>(model, tokenizer, params: Dict, device: str,
+                   context_len: int, stream_interval=2, judge_sent_end=<span class="kw">False</span>):
+    prompt = params[<span class="str">"prompt"</span>]
+    temperature = <span class="fn">float</span>(params.<span class="fn">get</span>(<span class="str">"temperature"</span>, 1.0))
+    max_new_tokens = <span class="fn">int</span>(params.<span class="fn">get</span>(<span class="str">"max_new_tokens"</span>, 2048))
+    stop_str = params.<span class="fn">get</span>(<span class="str">"stop"</span>, <span class="kw">None</span>)
+
+    input_ids = tokenizer(prompt).input_ids
+    input_ids = input_ids[-max_src_len:]  <span class="com"># 截断到 context_len</span>
+    output_ids = <span class="fn">list</span>(input_ids)
+    past_key_values = <span class="kw">None</span>
+
+    <span class="k">for</span> i <span class="k">in</span> <span class="fn">range</span>(max_new_tokens):
+        <span class="k">if</span> i == 0:  <span class="com"># prefill 阶段</span>
+            out = model(torch.<span class="fn">as_tensor</span>([input_ids], device=device), use_cache=<span class="kw">True</span>)
+            past_key_values = out.past_key_values
+        <span class="k">else</span>:        <span class="com"># decode 阶段</span>
+            out = model(torch.<span class="fn">as_tensor</span>([[token]], device=device),
+                       use_cache=<span class="kw">True</span>, past_key_values=past_key_values)
+            past_key_values = out.past_key_values
+
+        logits = out.logits[:, -1, :]
+        <span class="k">if</span> temperature &lt; 1e-5:  <span class="com"># 贪心解码</span>
+            token = torch.<span class="fn">argmax</span>(logits, dim=-1).<span class="fn">item</span>()
+        <span class="k">else</span>:                 <span class="com"># 采样</span>
+            probs = torch.<span class="fn">softmax</span>(logits, dim=-1)
+            token = torch.<span class="fn">multinomial</span>(probs, num_samples=1).<span class="fn">item</span>()
+        output_ids.<span class="fn">append</span>(token)
+
+        <span class="k">if</span> i % stream_interval == 0:  <span class="com"># 按间隔 yield</span>
+            output = tokenizer.<span class="fn">decode</span>(output_ids, skip_special_tokens=<span class="kw">True</span>)
+            <span class="k">yield</span> output
+        <span class="k">if</span> token == tokenizer.eos_token_id:
+            <span class="k">break</span>
+    <span class="k">yield</span> output</code></pre>
+
+  <!-- ===================== 6. Cluster 模式 ===================== -->
+  <h2 id="cluster">六、Cluster 模式：Master-Worker 架构</h2>
+  <p>当需要多模型、多卡、多机协同工作时，Cluster 模式登场。它采用经典的
+    <strong>master-worker</strong> 架构：</p>
+
+  <h3>6.1 架构图</h3>
+  <div class="mermaid">
+flowchart TD
+    REG["ModelRegistry<br/>EmbeddedModelRegistry / StorageModelRegistry<br/>维护 model_name 到 instance 列表的映射"]
+    REG --> M1["qwen-max<br/>192.168.1.10:5670<br/>192.168.1.11:5670"]
+    REG --> M2["vicuna-13b<br/>192.168.1.12:5670"]
+
+    REG -.->|"heartbeat"| WR1
+    REG -.->|"heartbeat"| WR2
+
+    subgraph W1BOX ["ModelWorker 1"]
+        WR1["WorkerRunData<br/>model vLLM<br/>adapter ProxyLLMClientAdapter<br/>semaphore 并发槽"]
+        GPU1[("GPU 0<br/>Qwen-72B")]
+        WR1 --- GPU1
+    end
+
+    subgraph W2BOX ["ModelWorker 2"]
+        WR2["WorkerRunData<br/>model HF<br/>adapter FusedLLMAdapter<br/>semaphore 并发槽"]
+        GPU2[("GPU 0<br/>Vicuna")]
+        WR2 --- GPU2
+    end
+
+    classDef registry fill:#1a3a4a,stroke:#4ec9b0,stroke-width:2px,color:#e6e6e6
+    classDef worker fill:#1a2029,stroke:#569cd6,stroke-width:2px,color:#e6e6e6
+    classDef gpu fill:#0f1419,stroke:#ce9178,color:#e6e6e6
+    class REG,M1,M2 registry
+    class WR1,WR2 worker
+    class GPU1,GPU2 gpu
+  </div>
+
+  <h4>请求流程</h4>
+  <div class="mermaid">
+sequenceDiagram
+    participant C as Client
+    participant WM as WorkerManager
+    participant RG as Registry
+    participant W as ModelWorker
+    participant AD as ModelAdapter
+
+    C->>WM: select_one_instance model_name
+    WM->>RG: 查询 model_name 的 instance 列表
+    RG-->>WM: 返回健康的 WorkerRunData
+    WM->>W: 转发请求 prompt stream True
+    W->>AD: apply_chat_template messages
+    AD-->>W: input_ids
+    W->>AD: generate_stream input_ids
+    loop 逐 token 输出
+        AD-->>W: token chunk
+        W-->>C: ModelOutput stream chunk
+    end
+  </div>
+
+  <h3>6.2 ModelController：注册中心</h3>
+  <p>文件：<code>model/cluster/controller/controller.py</code></p>
+  <pre><code><span class="k">class</span> <span class="type">BaseModelController</span>(BaseComponent, ABC):
+    name = ComponentType.MODEL_CONTROLLER
+
+    <span class="kw">@abstractmethod</span>
+    <span class="kw">async</span> <span class="k">def</span> <span class="fn">register_instance</span>(<span class="kw">self</span>, instance: ModelInstance) -> bool:
+        <span class="com"># Worker 启动后向 Controller 注册自己</span>
+
+    <span class="kw">@abstractmethod</span>
+    <span class="kw">async</span> <span class="k">def</span> <span class="fn">get_all_instances</span>(<span class="kw">self</span>, model_name=<span class="kw">None</span>, healthy_only=<span class="kw">False</span>):
+        <span class="com"># 查询所有（或指定模型的）实例</span>
+
+    <span class="kw">@abstractmethod</span>
+    <span class="kw">async</span> <span class="k">def</span> <span class="fn">send_heartbeat</span>(<span class="kw">self</span>, instance: ModelInstance) -> bool:
+        <span class="com"># Worker 定期发送心跳，Controller 更新 last_heartbeat</span>
+
+<span class="k">class</span> <span class="type">LocalModelController</span>(BaseModelController):
+    <span class="kw">def</span> <span class="fn">__init__</span>(<span class="kw">self</span>, registry: ModelRegistry):
+        <span class="kw">self</span>.registry = registry  <span class="com"># 内嵌注册表</span>
+
+<span class="k">class</span> <span class="type">_RemoteModelController</span>(APIMixin, BaseModelController):
+    <span class="com"># 通过 HTTP 调用远程 Controller（跨机器部署）</span>
+    <span class="kw">@api_remote</span>(path=<span class="str">"/api/controller/models"</span>, method=<span class="str">"POST"</span>)
+    <span class="kw">async</span> <span class="k">def</span> <span class="fn">register_instance</span>(<span class="kw">self</span>, instance): <span class="k">pass</span></code></pre>
+
+  <p>Controller 有两种实现：<code>LocalModelController</code>（内嵌注册表，单机模式）
+    和 <code>_RemoteModelController</code>（HTTP 远程调用，分布式模式）。通过
+    <code>initialize_controller(remote_controller_addr=...)</code> 切换。</p>
+
+  <h3>6.3 ModelRegistry：实例存储</h3>
+  <p>文件：<code>model/cluster/registry.py</code>。Registry 负责存储所有 Worker 实例的元数据，
+    有两种实现：</p>
+  <pre><code><span class="k">class</span> <span class="type">EmbeddedModelRegistry</span>(ModelRegistry):
+    <span class="com"># 内存注册表（单机模式），dict 存储</span>
+    <span class="kw">def</span> <span class="fn">__init__</span>(<span class="kw">self</span>, heartbeat_interval_secs=60, heartbeat_timeout_secs=120):
+        <span class="kw">self</span>.registry: Dict[str, List[ModelInstance]] = defaultdict(list)
+        <span class="com"># 后台线程定期检查心跳，超时标记为 unhealthy</span>
+        <span class="kw">self</span>.heartbeat_thread = threading.<span class="fn">Thread</span>(target=<span class="kw">self</span>._heartbeat_checker)
+        <span class="kw">self</span>.heartbeat_thread.daemon = <span class="kw">True</span>
+        <span class="kw">self</span>.heartbeat_thread.<span class="fn">start</span>()
+
+    <span class="kw">def</span> <span class="fn">_heartbeat_checker</span>(<span class="kw">self</span>):
+        <span class="k">while</span> <span class="kw">True</span>:
+            <span class="k">for</span> instances <span class="k">in</span> <span class="kw">self</span>.registry.<span class="fn">values</span>():
+                <span class="k">for</span> instance <span class="k">in</span> instances:
+                    <span class="k">if</span> (instance.check_healthy <span class="k">and</span>
+                        datetime.<span class="fn">now</span>() - instance.last_heartbeat &gt;
+                        <span class="fn">timedelta</span>(seconds=<span class="kw">self</span>.heartbeat_timeout_secs)):
+                        instance.healthy = <span class="kw">False</span>  <span class="com"># 心跳超时</span>
+            time.<span class="fn">sleep</span>(<span class="kw">self</span>.heartbeat_interval_secs)</code></pre>
+
+  <p>另一种实现 <code>StorageModelRegistry</code> 使用数据库（SQLite / MySQL）持久化，
+    适合 Controller 重启后恢复状态。Registry 的核心数据结构是
+    <code>Dict[model_name, List[ModelInstance]]</code>。</p>
+
+  <!-- ===================== 7. ModelWorker ===================== -->
+  <h2 id="worker">七、ModelWorker 抽象与 WorkerRunData</h2>
+
+  <h3>7.1 ModelWorker 基类</h3>
+  <p>文件：<code>model/cluster/worker_base.py</code></p>
+  <pre><code><span class="k">class</span> <span class="type">ModelWorker</span>(ABC):
+    <span class="com"># 抽象基类，定义 Worker 的完整契约</span>
+
+    <span class="kw">@abstractmethod</span>
+    <span class="k">def</span> <span class="fn">load_worker</span>(<span class="kw">self</span>, model_name, deploy_model_params, **kwargs):
+        <span class="com"># 加载 Worker 配置（不加载模型权重）</span>
+
+    <span class="kw">@abstractmethod</span>
+    <span class="k">def</span> <span class="fn">start</span>(<span class="kw">self</span>, command_args=<span class="kw">None</span>):
+        <span class="com"># 加载模型权重到内存</span>
+
+    <span class="kw">@abstractmethod</span>
+    <span class="k">def</span> <span class="fn">stop</span>(<span class="kw">self</span>):
+        <span class="com"># 释放模型权重</span>
+
+    <span class="kw">@abstractmethod</span>
+    <span class="k">def</span> <span class="fn">generate_stream</span>(<span class="kw">self</span>, params: Dict) -> Iterator[ModelOutput]:
+        <span class="com"># 流式推理（核心方法）</span>
+        <span class="com"># params 示例：</span>
+        <span class="com"># {"messages": [{"role":"user","content":"Hello"}],</span>
+        <span class="com">#  "model": "vicuna-13b", "temperature": 0.7, "max_new_tokens": 2048}</span>
+
+    <span class="kw">@abstractmethod</span>
+    <span class="k">def</span> <span class="fn">generate</span>(<span class="kw">self</span>, params: Dict) -> ModelOutput:
+        <span class="com"># 非流式推理</span>
+
+    <span class="kw">@abstractmethod</span>
+    <span class="k">def</span> <span class="fn">count_token</span>(<span class="kw">self</span>, prompt: str) -> int:
+        <span class="com"># Token 计数</span>
+
+    <span class="kw">@abstractmethod</span>
+    <span class="k">def</span> <span class="fn">get_model_metadata</span>(<span class="kw">self</span>, params: Dict) -> ModelMetadata:
+        <span class="com"># 获取模型元信息（context_length 等）</span>
+
+    <span class="kw">def</span> <span class="fn">support_async</span>(<span class="kw">self</span>) -> bool:
+        <span class="k">return</span> <span class="kw">False</span>  <span class="com"># 是否支持原生异步</span></code></pre>
+
+  <h3>7.2 DefaultModelWorker</h3>
+  <p>文件：<code>model/cluster/worker/default_worker.py</code>。这是最常用的 Worker 实现，
+    它把 <code>ModelWorker</code> 接口和 <code>LLMModelAdapter</code> 粘合起来：</p>
+  <pre><code><span class="k">class</span> <span class="type">DefaultModelWorker</span>(ModelWorker):
+    <span class="kw">def</span> <span class="fn">__init__</span>(<span class="kw">self</span>):
+        <span class="kw">self</span>.model = <span class="kw">None</span>          <span class="com"># 模型对象（HF/vLLM engine/ProxyModel）</span>
+        <span class="kw">self</span>.tokenizer = <span class="kw">None</span>     <span class="com"># tokenizer</span>
+        <span class="kw">self</span>.llm_adapter: LLMModelAdapter = <span class="kw">None</span>
+        <span class="kw">self</span>.context_len = 4096
+        <span class="kw">self</span>._device = <span class="fn">get_device</span>()
+
+    <span class="kw">def</span> <span class="fn">load_worker</span>(<span class="kw">self</span>, model_name, deploy_model_params, **kwargs):
+        <span class="com"># 1. 通过 get_llm_model_adapter 匹配 adapter</span>
+        <span class="kw">self</span>.llm_adapter = <span class="fn">get_llm_model_adapter</span>(
+            model_name, model_path,
+            model_type=deploy_model_params.provider
+        )
+        <span class="kw">self</span>._support_async = <span class="kw">self</span>.llm_adapter.<span class="fn">support_async</span>()
+        <span class="kw">self</span>.ml = <span class="type">ModelLoader</span>(prompt_template=params.prompt_template)
+
+    <span class="kw">def</span> <span class="fn">start</span>(<span class="kw">self</span>, command_args=<span class="kw">None</span>):
+        <span class="com"># 2. 通过 ModelLoader 加载模型权重</span>
+        <span class="kw">self</span>.model, <span class="kw">self</span>.tokenizer = <span class="kw">self</span>.ml.<span class="fn">loader_with_params</span>(
+            <span class="kw">self</span>._model_params, <span class="kw">self</span>.llm_adapter
+        )
+        <span class="com"># 3. 解析 context_length（从 params 或 model config）</span>
+        parsed = <span class="kw">self</span>.llm_adapter.<span class="fn">parse_max_length</span>(<span class="kw">self</span>.model, <span class="kw">self</span>.tokenizer)
+        <span class="kw">self</span>.context_len = params.context_length <span class="k">or</span> parsed <span class="k">or</span> 4096
+
+    <span class="kw">def</span> <span class="fn">generate_stream</span>(<span class="kw">self</span>, params: Dict) -> Iterator[ModelOutput]:
+        <span class="com"># 4. 准备推理：adapter.model_adaptation → 拿到推理函数</span>
+        params, model_context, generate_stream_func, model_span = <span class="kw">self</span>._prepare_generate_stream(params)
+        <span class="com"># 5. 调用推理函数，逐个 yield ModelOutput</span>
+        previous_response = <span class="str">""</span>
+        <span class="k">for</span> output <span class="k">in</span> <span class="fn">generate_stream_func</span>(<span class="kw">self</span>.model, <span class="kw">self</span>.tokenizer,
+                                           params, <span class="fn">get_device</span>(), <span class="kw">self</span>.context_len):
+            model_output, incremental, output_str, metrics = <span class="kw">self</span>._handle_output(...)
+            previous_response = output_str
+            <span class="k">yield</span> model_output</code></pre>
+
+  <h3>7.3 WorkerRunData：运行时状态</h3>
+  <p>文件：<code>model/cluster/manager_base.py</code>。<code>WorkerRunData</code> 是一个 dataclass，
+    封装了 Worker 的完整运行时状态：</p>
+  <pre><code><span class="kw">@dataclass</span>
+<span class="k">class</span> <span class="type">WorkerRunData</span>:
+    host: str                    <span class="com"># Worker 所在机器</span>
+    port: int                    <span class="com"># Worker 端口</span>
+    worker_type: str             <span class="com"># "llm" / "text2vec" / "reranker"</span>
+    worker_key: str              <span class="com"># 唯一标识（model_name@provider）</span>
+    worker: ModelWorker          <span class="com"># Worker 实例</span>
+    worker_params: ModelWorkerParameters
+    model_params: BaseDeployModelParameters
+    stop_event: asyncio.Event    <span class="com"># 停止信号</span>
+    semaphore: asyncio.Semaphore = <span class="kw">None</span>  <span class="com"># 并发控制</span>
+    _heartbeat_future: Optional[Future] = <span class="kw">None</span>  <span class="com"># 心跳 Future</span>
+    _last_heartbeat: Optional[datetime] = <span class="kw">None</span>
+    remove_from_registry: bool = <span class="kw">False</span>
+
+    <span class="kw">@property</span>
+    <span class="kw">def</span> <span class="fn">stopped</span>(<span class="kw">self</span>):
+        <span class="k">return</span> <span class="kw">self</span>.stop_event.<span class="fn">is_set</span>()</code></pre>
+
+  <p><code>WorkerManager</code> 抽象类管理所有 <code>WorkerRunData</code>，提供实例选择
+    （<code>select_one_instance</code>）、流式推理转发（<code>generate_stream</code>）、
+    模型生命周期管理（<code>model_startup</code> / <code>model_shutdown</code>）等能力。</p>
+
+  <!-- ===================== 8. 流式输出 ===================== -->
+  <h2 id="stream">八、流式输出：从 token 到 ModelOutput</h2>
+  <p>流式输出是 LLM 的基本能力——生成一个 token 就推送一个 token，而不是等全部生成完再返回。
+    DB-GPT 的流式输出链路贯穿五层抽象：</p>
+  <div class="mermaid">
+flowchart TD
+    U["用户请求 HTTP SSE"]
+    U --> WM
+    WM["WorkerManager.generate_stream<br/>1. 选择 Worker 转发请求"]
+    WM --> DW
+    DW["DefaultModelWorker.generate_stream<br/>2. 调用 adapter 适配"]
+    DW --> ADAPT["llm_adapter.model_adaptation<br/>messages 到 str prompt"]
+    DW --> GETFN["get_generate_stream_function<br/>获取推理函数"]
+    ADAPT --> GEN
+    GETFN --> GEN
+    GEN["generate_stream_func<br/>model tokenizer params device ctx_len<br/>3. 引擎推理"]
+    GEN --> GEN_HF["HF yield output_str<br/>每次多个 token"]
+    GEN --> GEN_VLLM["vLLM async yield ModelOutput<br/>每次一个 token"]
+    GEN --> GEN_PROXY["Proxy async for chunk<br/>client.chat stream True"]
+    GEN_HF --> HD
+    GEN_VLLM --> HD
+    GEN_PROXY --> HD
+    HD["DefaultModelWorker._handle_output<br/>4. 包装成 ModelOutput"]
+    HD --> HD1["计算 incremental_output 增量文本"]
+    HD --> HD2["更新 ModelInferenceMetrics<br/>首 token 时间 吞吐量"]
+    HD --> HD3["设置 model_context"]
+    HD --> Y["yield ModelOutput<br/>5. 逐个返回"]
+    Y --> SR["StreamingResponse FastAPI SSE<br/>6. HTTP 流式推送给客户端"]
+
+    classDef entry fill:#1a3a4a,stroke:#4ec9b0,stroke-width:2px,color:#e6e6e6
+    classDef stage fill:#1a2029,stroke:#569cd6,stroke-width:2px,color:#e6e6e6
+    classDef detail fill:#232b37,stroke:#9aa5b1,color:#9aa5b1
+    class U entry
+    class WM,DW,GEN,HD,Y,SR stage
+    class ADAPT,GETFN,GEN_HF,GEN_VLLM,GEN_PROXY,HD1,HD2,HD3 detail
+  </div>
+
+  <p><code>ModelOutput</code> 是流式输出的核心数据结构。每次 yield 的 <code>ModelOutput</code> 包含：</p>
+  <ul>
+    <li><code>text</code>：当前累积的完整文本（非增量）</li>
+    <li><code>error_code</code>：0 表示正常，非 0 表示出错</li>
+    <li><code>finish_reason</code>：<code>None</code>（生成中）/ <code>"stop"</code> / <code>"length"</code></li>
+    <li><code>usage</code>：token 用量（prompt_tokens / completion_tokens / total_tokens）</li>
+    <li><code>metrics</code>：<code>ModelInferenceMetrics</code>，首 token 延迟、吞吐、GPU 显存</li>
+    <li><code>model_context</code>：适配上下文（prompt_echo_len_char、has_format_prompt）</li>
+  </ul>
+
+  <p>客户端拿到的是<strong>累积文本</strong>（每次都是完整输出），不是增量。增量计算由
+    <code>_handle_output()</code> 内部完成（<code>incremental = current[len(previous):]</code>），
+    主要用于日志打印和指标计算。</p>
+
+  <div class="callout">
+    <strong>三种推理函数签名：</strong>
+    <ul>
+      <li><strong>HF 同步流式</strong>：<code>generate_stream(model, tokenizer, params, device, context_len) → Iterator[str]</code></li>
+      <li><strong>vLLM 异步流式</strong>：<code>async generate_stream(engine, tokenizer, params, device, ctx_len) → AsyncIterator[ModelOutput]</code></li>
+      <li><strong>Proxy 异步流式</strong>：<code>async generate_stream(model: ProxyModel, tokenizer, params, device, ctx_len) → AsyncGenerator[ModelOutput]</code></li>
+    </ul>
+    Worker 会根据 <code>adapter.support_async()</code> 选择同步或异步路径。
+  </div>
+
+  <!-- ===================== 9. LLMOperator ===================== -->
+  <h2 id="operator">九、LLMOperator：把推理接入 AWEL DAG</h2>
+  <p>文件：<code>model/operators/llm_operator.py</code>。模型层通过两个 AWEL Operator
+    暴露给编排系统：</p>
+
+  <pre><code><span class="k">class</span> <span class="type">MixinLLMOperator</span>(BaseLLM, BaseOperator, ABC):
+    <span class="com"># 把 LLM 能力混入 AWEL Operator</span>
+
+    <span class="kw">@property</span>
+    <span class="kw">def</span> <span class="fn">llm_client</span>(<span class="kw">self</span>) -> LLMClient:
+        <span class="kw">if</span> <span class="kw">not</span> <span class="kw">self</span>._llm_client:
+            <span class="k">try</span>:
+                <span class="com"># 优先从集群获取 DefaultLLMClient</span>
+                <span class="k">from</span> dbgpt.model.cluster <span class="k">import</span> WorkerManagerFactory
+                <span class="k">from</span> dbgpt.model.cluster.client <span class="k">import</span> DefaultLLMClient
+                factory = <span class="kw">self</span>.system_app.<span class="fn">get_component</span>(
+                    ComponentType.WORKER_MANAGER_FACTORY, WorkerManagerFactory)
+                <span class="kw">self</span>._llm_client = <span class="type">DefaultLLMClient</span>(factory.<span class="fn">create</span>())
+            <span class="k">except</span> Exception:
+                <span class="k">pass</span>
+            <span class="k">if</span> <span class="kw">not</span> <span class="kw">self</span>._llm_client:
+                <span class="com"># fallback：用 OpenAILLMClient</span>
+                <span class="k">from</span> dbgpt.model.proxy.llms.chatgpt <span class="k">import</span> OpenAILLMClient
+                <span class="kw">self</span>._llm_client = <span class="type">OpenAILLMClient</span>()
+        <span class="k">return</span> <span class="kw">self</span>._llm_client
+
+
+<span class="k">class</span> <span class="type">LLMOperator</span>(MixinLLMOperator, BaseLLMOperator):
+    <span class="com"># 非流式 LLM Operator</span>
+    metadata = <span class="type">ViewMetadata</span>(
+        label=<span class="str">"LLM Operator"</span>, name=<span class="str">"llm_operator"</span>,
+        category=OperatorCategory.LLM,
+        inputs=[<span class="type">IOField</span>(<span class="str">"model_request"</span>, ModelRequest)],
+        outputs=[<span class="type">IOField</span>(<span class="str">"model_output"</span>, ModelOutput)],
+    )
+
+
+<span class="k">class</span> <span class="type">StreamingLLMOperator</span>(MixinLLMOperator, BaseStreamingLLMOperator):
+    <span class="com"># 流式 LLM Operator（operator_type=STREAMIFY）</span>
+    metadata = <span class="type">ViewMetadata</span>(
+        label=<span class="str">"Streaming LLM Operator"</span>, name=<span class="str">"streaming_llm_operator"</span>,
+        operator_type=OperatorType.STREAMIFY,
+        outputs=[<span class="type">IOField</span>(<span class="str">"model_output"</span>, ModelOutput, is_list=<span class="kw">True</span>)],
+    )</code></pre>
+
+  <p>这两个 Operator 的 <code>llm_client</code> 属性采用了<strong>优雅降级策略</strong>：</p>
+  <ol>
+    <li>优先从 <code>WorkerManagerFactory</code> 获取 <code>DefaultLLMClient</code>（集群模式）</li>
+    <li>如果集群不可用，fallback 到 <code>OpenAILLMClient</code>（proxy 模式，直连 OpenAI）</li>
+  </ol>
+  <p>这意味着即使没有部署任何本地模型，AWEL DAG 中的 LLM Operator 也能正常工作（只要配了 OpenAI API Key）。</p>
+
+  <div class="callout tip">
+    <strong>AWEL DAG 示例：</strong>一个典型的聊天 DAG 是
+    <code>RequestBuilder → PromptTemplate → LLMOperator → ResponseFormatter</code>。
+    如果要流式输出，把 <code>LLMOperator</code> 换成 <code>StreamingLLMOperator</code>，
+    OperatorType 从 MAP 变成 STREAMIFY，下游会收到 <code>List[ModelOutput]</code>。
+  </div>
+
+  <!-- ===================== 10. 配置驱动 ===================== -->
+  <h2 id="config">十、配置驱动：TOML 模型加载实战</h2>
+  <p>DB-GPT 使用 TOML 文件管理模型配置。两种典型场景如下：</p>
+
+  <h3>10.1 Proxy OpenAI 配置</h3>
+  <p>文件：<code>configs/dbgpt-proxy-openai.toml</code></p>
+  <pre><code><span class="com"># 模型配置（LLM + Embedding）</span>
+[models]
+[[models.llms]]
+name = <span class="str">"${env:LLM_MODEL_NAME:-gpt-4o}"</span>
+provider = <span class="str">"${env:LLM_MODEL_PROVIDER:-proxy/openai}"</span>
+api_base = <span class="str">"${env:OPENAI_API_BASE:-https://api.openai.com/v1}"</span>
+api_key = <span class="str">"${env:OPENAI_API_KEY}"</span>
+
+[[models.embeddings]]
+name = <span class="str">"${env:EMBEDDING_MODEL_NAME:-text-embedding-3-small}"</span>
+provider = <span class="str">"${env:EMBEDDING_MODEL_PROVIDER:-proxy/openai}"</span>
+api_url = <span class="str">"${env:EMBEDDING_MODEL_API_URL:-...}"</span>
+api_key = <span class="str">"${env:OPENAI_API_KEY}"</span></code></pre>
+
+  <p>配置解读：</p>
+  <ul>
+    <li><code>[[models.llms]]</code>：TOML 数组语法，可以配置多个 LLM</li>
+    <li><code>name</code>：模型名称，发给 API 时用</li>
+    <li><code>provider</code>：决定走哪个 adapter（<code>proxy/openai</code> → OpenAILLMClient）</li>
+    <li><code>${env:XXX:-default}</code>：环境变量插值，<code>:-</code> 后是默认值</li>
+  </ul>
+
+  <h3>10.2 Local vLLM 配置</h3>
+  <p>文件：<code>configs/dbgpt-local-vllm.toml</code></p>
+  <pre><code>[models]
+[[models.llms]]
+name = <span class="str">"DeepSeek-R1-Distill-Qwen-1.5B"</span>
+provider = <span class="str">"vllm"</span>
+path = <span class="str">"models/DeepSeek-R1-Distill-Qwen-1.5B"</span>
+<span class="com"># dtype = "float32"</span>
+<span class="com"># tensor_parallel_size = 1        # vLLM 特有：张量并行数</span>
+<span class="com"># gpu_memory_utilization = 0.90   # vLLM 特有：GPU 显存利用率</span>
+<span class="com"># max_model_len = 4096            # vLLM 特有：最大序列长度</span>
+<span class="com"># quantization = "awq"            # vLLM 特有：量化方式</span>
+
+[[models.embeddings]]
+name = <span class="str">"BAAI/bge-large-zh-v1.5"</span>
+provider = <span class="str">"hf"</span>
+path = <span class="str">"/data/models/bge-large-zh-v1.5"</span></code></pre>
+
+  <p>vLLM 配置的关键字段：</p>
+  <ul>
+    <li><code>provider = "vllm"</code>：匹配 <code>VLLMModelAdapterWrapper</code></li>
+    <li><code>path</code>：模型权重本地路径（或 HuggingFace repo ID）</li>
+    <li>vLLM 特有参数（<code>gpu_memory_utilization</code>、<code>tensor_parallel_size</code> 等）
+      通过 <code>VLLMDeployModelParameters</code> dataclass 定义，可以直接在 toml 中配置</li>
+  </ul>
+
+  <h3>10.3 配置加载流程</h3>
+  <pre><code>1. ConfigurationManager.from_file(config_file)     <span class="com"># 解析 TOML</span>
+2. cfg.parse_config(ModelsDeployParameters, prefix="models")  <span class="com"># 映射到 dataclass</span>
+3. <span class="k">for</span> llm_params <span class="k">in</span> models.llms:
+       adapter = get_model_adapter(llm_params.provider, llm_params.name)
+       worker = DefaultModelWorker()
+       worker.load_worker(llm_params.name, llm_params)
+       worker.start()  <span class="com"># 加载模型权重</span>
+4. WorkerManager 注册 WorkerRunData
+5. Worker 向 Controller 发送心跳（如果是集群模式）</code></pre>
+
+  <div class="callout warn">
+    <strong>环境变量插值：</strong>TOML 中的 <code>${env:VAR:-default}</code> 语法由
+    <code>dbgpt.util.configure.manager._resolve_env_vars()</code> 解析。
+    这让同一份 toml 文件可以在不同环境（开发/测试/生产）复用，只需设置不同的环境变量。
+  </div>
+
+  <div class="callout">
+    <strong>20+ 种现成配置：</strong><code>configs/</code> 目录下有 20+ 个预置 toml：
+    <code>dbgpt-proxy-tongyi.toml</code>（通义）、<code>dbgpt-proxy-deepseek.toml</code>（DeepSeek）、
+    <code>dbgpt-proxy-ollama.toml</code>（Ollama）、<code>dbgpt-local-qwen.toml</code>（本地 Qwen）、
+    <code>dbgpt-local-mlx.toml</code>（Mac MLX）等。直接 <code>dbgpt start --config xxx.toml</code> 即可启动。
+  </div>
+
+  <!-- ===================== Quiz ===================== -->
+  <h2 id="quiz">十一、本章测验</h2>
+  <div class="quiz">
+    <h4>基础题</h4>
+    <ol>
+      <li>模型层的三大职责是什么？分别对应哪个核心目录？</li>
+      <li><code>LLMModelAdapter</code> 的 <code>model_adaptation()</code> 方法做了哪几件事？
+        它接收什么、返回什么？</li>
+      <li><code>ProxyLLMClient</code> 和 <code>LLMClient</code> 是什么关系？
+        ProxyLLMClient 的默认异步实现策略是什么？</li>
+    </ol>
+  </div>
+  <div class="quiz">
+    <h4>进阶题</h4>
+    <ol start="4">
+      <li>从 toml 配置的 <code>provider = "proxy/tongyi"</code> 开始，追踪到 <code>TongyiLLMClient.generate_stream()</code>，
+        中间经过了哪几个类和方法？（画出调用链）</li>
+      <li><code>register_proxy_model_adapter()</code> 为什么要动态生成一个 <code>_DynProxyLLMModelAdapter</code> 类？
+        直接写一个静态类不行吗？</li>
+      <li><code>WorkerRunData</code> 的 <code>semaphore</code> 字段有什么作用？如果没有它会怎样？</li>
+    </ol>
+  </div>
+  <div class="quiz">
+    <h4>设计题</h4>
+    <ol start="7">
+      <li>如果要新增一个 proxy 厂商（比如阶跃星辰 StepFun），需要创建哪些文件、实现哪些方法？
+        最少需要多少行代码？</li>
+      <li><code>LLMOperator.llm_client</code> 的优雅降级策略（先尝试集群，再 fallback 到 OpenAI）
+        有什么潜在问题？你会怎么改进？</li>
+      <li>画一个"用户消息 → WorkerManager → DefaultModelWorker → vLLM Engine → ModelOutput → HTTP SSE"
+        的完整时序图，标注同步/异步边界。</li>
+    </ol>
+  </div>
+
+  <div class="callout warn">
+    <strong>小结：</strong>DB-GPT 模型层的设计可以用"三条线"概括：
+    <ul>
+      <li><strong>适配线</strong>：<code>LLMModelAdapter</code> → 屏蔽 HF / vLLM / proxy 引擎差异</li>
+      <li><strong>调度线</strong>：<code>ModelController</code> + <code>ModelRegistry</code> + <code>ModelWorker</code>
+        → master-worker 集群管理</li>
+      <li><strong>编排线</strong>：<code>LLMOperator</code> → 把推理能力接入 AWEL DAG</li>
+    </ul>
+    三条线通过 <code>DefaultModelWorker</code> 汇合：Worker 用 Adapter 加载模型，注册到 Controller，
+    被 WorkerManager 调度，最终通过 LLMOperator 暴露给上层。一份 toml 配置驱动一切。
+  </div>
+
+  <div class="pager">
+    <a href="05-rag.html">← 05 · RAG 检索</a>
+    <a href="07-datasource.html">07 · 数据源 →</a>
+  </div>
+
+</main>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: 'base',
+    themeVariables: {
+      primaryColor: '#1a2029',
+      primaryTextColor: '#e6e6e6',
+      primaryBorderColor: '#4ec9b0',
+      lineColor: '#569cd6',
+      secondaryColor: '#232b37',
+      tertiaryColor: '#0f1419',
+      textColor: '#e6e6e6',
+      fontFamily: 'JetBrains Mono, Consolas, monospace',
+      fontSize: '16px'
+    },
+    flowchart: { curve: 'basis', padding: 20, useMaxWidth: true },
+    sequence: { mirrorActors: false, boxMargin: 8 }
+  });
+</script>
+</body>
+</html>

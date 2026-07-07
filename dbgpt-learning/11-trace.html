@@ -1,0 +1,422 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>11 · 端到端链路追踪 · DB-GPT 精读</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="layout">
+
+<aside class="sidebar">
+  <h2>DBGPT 精读</h2>
+  <ul><li><a href="index.html">总览</a></li></ul>
+  <div class="group-title">入门</div>
+  <ul>
+    <li><a href="01-architecture.html">01 · 整体架构</a></li>
+    <li><a href="02-startup.html">02 · 启动流程</a></li>
+  </ul>
+  <div class="group-title">核心子系统</div>
+  <ul>
+    <li><a href="03-awel.html">03 · AWEL 工作流</a></li>
+    <li><a href="04-agent.html">04 · Agent 系统</a></li>
+    <li><a href="05-rag.html">05 · RAG 检索</a></li>
+    <li><a href="06-model.html">06 · 模型层</a></li>
+    <li><a href="07-datasource.html">07 · 数据源</a></li>
+  </ul>
+  <div class="group-title">应用层</div>
+  <ul>
+    <li><a href="08-scene.html">08 · Scene 场景</a></li>
+    <li><a href="09-serve.html">09 · Serve 服务</a></li>
+    <li><a href="10-ext.html">10 · Ext 扩展</a></li>
+  </ul>
+  <div class="group-title">实战</div>
+  <ul><li><a href="11-trace.html" class="active">11 · 链路追踪</a></li></ul>
+</aside>
+
+<main class="main">
+  <h1>11 · 端到端链路追踪 <span class="tag">综合实战</span></h1>
+  <p class="subtitle">把前 10 章的所有知识串起来 —— 跟着一条请求从浏览器走到 SQL 结果再回到图表。</p>
+
+  <div class="toc">
+    <div class="toc-title">本章导览</div>
+    <ol>
+      <li><a href="#scenario">场景设定：用户问"近 30 天 Top10 客户"</a></li>
+      <li><a href="#overview">16 步旅程总览</li></li>
+      <li><a href="#phase-frontend">阶段 1：前端（Step 1–2）</a></li>
+      <li><a href="#phase-routing">阶段 2：路由 + Scene 选择（Step 3–5）</a></li>
+      <li><a href="#phase-awel">阶段 3：AWEL DAG 编排（Step 6）</a></li>
+      <li><a href="#phase-llm">阶段 4：LLM 推理（Step 7–10）</a></li>
+      <li><a href="#phase-db">阶段 5：SQL 执行（Step 11–13）</a></li>
+      <li><a href="#phase-vis">阶段 6：可视化与流式回传（Step 14–16）</a></li>
+      <li><a href="#failed-path">失败路径：当 LLM 给出错 SQL</a></li>
+      <li><a href="#debug">实战调试指南</a></li>
+      <li><a href="#summary">全书总结</a></li>
+    </ol>
+  </div>
+
+  <h2 id="scenario">一、场景设定</h2>
+  <p>用户在 DB-GPT 前端选中了一个已配置的 MySQL 数据源（<code>sales_db</code>），
+  并选择聊天模式为 <strong>chat_db</strong>（NL2SQL 自动执行）。在输入框敲下：</p>
+
+  <pre><code><span class="c"># 用户输入</span>
+<span class="k">查询近 30 天销售额 Top10 的客户，并画出柱状图</span></code></pre>
+
+  <p>点发送。接下来 16 步会在大约 <strong>3–8 秒</strong>内完成。</p>
+
+  <div class="callout tip">
+    <strong>为什么选这个场景？</strong> 它一次串起了 Scene、AWEL、LLM、DataSource、Vis 五大子系统，
+    是验证你"是否真懂 DB-GPT"的最佳测试题。如果跟得上这 16 步，本书就达到目的了。
+  </div>
+
+  <h2 id="overview">二、16 步旅程总览</h2>
+
+  <div class="mermaid">flowchart TD
+    subgraph P1["阶段 1：前端"]
+        S1["Step 1: Chat 输入框\n构造 chat_mode = chat_db"]
+        S2["Step 2: POST /api/v1/chat/completions"]
+        S1 --> S2
+    end
+    subgraph P2["阶段 2：路由 + Scene 选择"]
+        S3["Step 3: openapi/api_v1/chat/__init__.py 路由命中"]
+        S4["Step 4: flow_id → DAGLoader.load_dag()"]
+        S5["Step 5: SceneResolver 选 chat_db 的 ChatScene"]
+        S3 --> S4 --> S5
+    end
+    subgraph P3["阶段 3：AWEL DAG 编排"]
+        S6["Step 6: AppChatComposerOperator DAG 启动\nPromptBuild → LLMOperator → SQLOutParser\n→ SqlExecOperator → ChartVisOperator"]
+    end
+    subgraph P4["阶段 4：LLM 推理"]
+        S7["Step 7: LLMOperator 调 ModelControllerClient"]
+        S8["Step 8: Controller 路由到 ModelWorker"]
+        S9["Step 9: ModelAdapter 把 prompt 转成 chat template"]
+        S10["Step 10: Worker 流式返回 token chunks"]
+        S7 --> S8 --> S9 --> S10
+    end
+    subgraph P5["阶段 5：SQL 执行"]
+        S11["Step 11: SQLOutParser 解析出 SQL"]
+        S12["Step 12: SqlExecOperator → RDBMS.query_to_df()"]
+        S13["Step 13: 返回 DataFrame (10 行 × N 列)"]
+        S11 --> S12 --> S13
+    end
+    subgraph P6["阶段 6：可视化 + 流式回传"]
+        S14["Step 14: ChartVisOperator: DF → ECharts option"]
+        S15["Step 15: StreamingResponse chunk（SSE）"]
+        S16["Step 16: 前端流式渲染：SQL + 表格 + 柱状图"]
+        S14 --> S15 --> S16
+    end
+    S2 --> S3
+    S5 --> S6
+    S6 --> S7
+    S10 --> S11
+    S13 --> S14</div>
+
+  <p>下面逐阶段深入。每一步都会标出 <strong>涉及的源码文件</strong>，
+  方便你打开 IDE 跟着看。</p>
+
+  <h2 id="phase-frontend">三、阶段 1：前端发起（Step 1–2）</h2>
+
+  <h3>Step 1 · 前端构造请求</h3>
+  <p>前端 <code>web/pages/chat</code> 的 Chat 输入框组件收集：</p>
+  <pre><code><span class="c">// web/client/api/chat.ts (示意)</span>
+{
+  <span class="s">"chat_mode"</span>: <span class="s">"chat_db"</span>,          <span class="c">// 决定走哪个 Scene</span>
+  <span class="s">"chat_scene"</span>: <span class="s">"chat_db"</span>,
+  <span class="s">"model_name"</span>: <span class="s">"gpt-4o-mini"</span>,
+  <span class="s">"chat_param"</span>: {
+    <span class="s">"db_name"</span>: <span class="s">"sales_db"</span>,         <span class="c">// 目标数据源</span>
+    <span class="s">"model_type"</span>: <span class="s">"llm_with_result"</span>  <span class="c">// 让 LLM 自动执行 SQL</span>
+  },
+  <span class="s">"user_input"</span>: <span class="s">"查询近 30 天销售额 Top10 的客户..."</span>,
+  <span class="s">"stream"</span>: <span class="k">true</span>
+}</code></pre>
+
+  <p><strong>关键点</strong>：<code>chat_mode</code> 是路由的核心字段，前端只是透传，
+  后端 SceneResolver 根据它选场景。</p>
+
+  <h3>Step 2 · 发起 HTTP 请求</h3>
+  <p>前端用 <code>fetch</code> + <code>ReadableStream</code> 发起流式请求：</p>
+  <pre><code>POST <span class="s">/api/v1/chat/completions</span>
+Content-Type: application/json
+Accept: text/event-stream</code></pre>
+
+  <p>对应后端入口见 Step 3。</p>
+
+  <h2 id="phase-routing">四、阶段 2：路由 + Scene 选择（Step 3–5）</h2>
+
+  <h3>Step 3 · FastAPI 路由命中</h3>
+  <p>请求落到 <code>dbgpt-app/openapi/api_v1/chat/__init__.py</code> 注册的 router 上。</p>
+
+  <div class="file-block">
+    <div class="file-header">packages/dbgpt-app/src/dbgpt_app/openapi/api_v1/chat/__init__.py<span class="lines">关键路由</span></div>
+    <div class="file-body"><pre><code><span class="n">@router.post</span>(<span class="s">"/chat/completions"</span>, streaming=<span class="k">True</span>)
+<span class="k">async def</span> <span class="f">chat_completions</span>(request: ChatSceneV2):
+    <span class="c"># 1. 根据 flow_id 加载持久化的 AWEL DAG</span>
+    <span class="k">if</span> request.flow_id:
+        dag = <span class="k">await</span> dag_loader.load_dag(request.flow_id)
+        <span class="k">return</span> <span class="k">await</span> dag._run(
+            http_request=request, user_input=request.user_input, ...
+        )
+    <span class="c"># 2. 兜底路径：用 Scene 兼容老接口</span>
+    <span class="k">return</span> <span class="k">await</span> run_scene_v2(request)</code></pre></div>
+  </div>
+
+  <p><strong>这里有一个分支</strong>：如果请求带 <code>flow_id</code>，直接走持久化的 AWEL DAG（来自前端的"工作流"页面）；
+  否则走传统 Scene 路径（下面 Step 4–5）。</p>
+
+  <h3>Step 4 · 加载 Scene 模板</h3>
+  <p>传统路径下，由 <code>scene/chat_factory.py</code> 根据 <code>chat_mode</code> 实例化对应 ChatScene：</p>
+
+  <pre><code>chat_mode = <span class="s">"chat_db"</span>
+→ ChatFactory.create(chat_mode=<span class="s">"chat_db"</span>)
+→ <span class="k">return</span> ChatDB(...)</code></pre>
+
+  <h3>Step 5 · Scene 装配 prompt 与依赖</h3>
+  <p>ChatScene 在 <code>from_scene()</code> 阶段做三件事：</p>
+  <ol>
+    <li><strong>拉取 DB Schema</strong>：调 <code>RDBMS.table_info()</code> 把表结构（CREATE TABLE 语句 + 索引 + 注释）注入 prompt</li>
+    <li><strong>加载 prompt 模板</strong>：从 <code>scene/chat_db/auto_execute/prompt.py</code> 读取 SUFFIX 双分隔符模板</li>
+    <li><strong>选择 Agent</strong>：默认走 <code>default_awel_layout_agent</code>（基于 AWEL Layout 的 Agent）</li>
+  </ol>
+
+  <p>此时 Scene 已具备 prompt + 上下文，但它不直接调 LLM——而是交给一个 AWEL DAG。</p>
+
+  <h2 id="phase-awel">五、阶段 3：AWEL DAG 编排（Step 6）⭐</h2>
+
+  <p>这是整个链路的<strong>枢纽</strong>。DB-GPT 0.6+ 的设计哲学：所有业务逻辑都是 DAG。</p>
+
+  <div class="file-block">
+    <div class="file-header">scene/operators/app_operator.py<span class="lines">AppChatComposerOperator</span></div>
+    <div class="file-body"><pre><code><span class="c"># 简化的 DAG 拼装</span>
+input_op = InputOperator(req_dict)
+history_op = history_load_op(input_op)              <span class="c"># 加载历史对话</span>
+prompt_op = prompt_build_op(history_op, db_info)    <span class="c"># 拼接最终 prompt</span>
+llm_op    = LLMOperator(prompt_op, model_instance)  <span class="c"># 调 LLM</span>
+sql_op    = SQLOutParser(llm_op)                    <span class="c"># 解析 SQL</span>
+exec_op   = SqlExecOperator(sql_op, datasource)     <span class="c"># 执行 SQL</span>
+vis_op    = ChartVisOperator(exec_op, chart_type=<span class="s">"bar"</span>)
+stream_op = ResponseStreamOperator(vis_op)          <span class="c"># 转 SSE</span>
+
+dag = DAG(<span class="s">"chat_db_pipeline"</span>, nodes=[...], edges=[...])
+dag.compile()</code></pre></div>
+  </div>
+
+  <p>DAG 一旦编译完成，就触发 <code>_run_node</code> 递归执行。
+  每个 Operator 都是 <code>async def __call__(self, *args)</code>，输入是上游 Output，输出给下游。</p>
+
+  <div class="callout">
+    <strong>关键洞察</strong>：从这一步开始，控制权完全交给 AWEL Runner。
+    <code>DefaultWorkflowRunner._execute_node</code> 会按拓扑序遍历每个节点，
+    流式输出通过 <code>SimpleStreamTaskOutput</code> 在节点间传递。
+  </div>
+
+  <h2 id="phase-llm">六、阶段 4：LLM 推理（Step 7–10）</h2>
+
+  <h3>Step 7 · LLMOperator 调 Controller</h3>
+  <p>LLMOperator 不直接对接模型，而是通过 <code>ModelControllerClient</code> 找 Worker：</p>
+
+  <pre><code><span class="c"># LLMOperator 内部</span>
+<span class="k">async def</span> <span class="f">_call_llm</span>(self, prompt, model_name):
+    instance = <span class="k">await</span> self.controllerClient.select_model(model_name)
+    <span class="k">return</span> <span class="k">await</span> instance.generate_stream(prompt)</code></pre>
+
+  <h3>Step 8 · Controller 路由到 Worker</h3>
+  <p><code>ModelController</code> 在所有注册的 Worker 里挑一个健康的，返回 <code>WorkerRunData</code>。
+  如果是 <strong>proxy 模式</strong>，Worker 实际上是 <code>ProxyLLMClient</code>，
+  会把请求转给 OpenAI/Qwen/Tongyi 等 API。</p>
+
+  <h3>Step 9 · ModelAdapter 转换格式</h3>
+  <p>不同模型 prompt 格式不一样（chat template / system + user 分隔符 / 特殊 token）。
+  <code>ModelAdapter</code> 负责：</p>
+  <pre><code>[<span class="s">"system"</span>, <span class="s">"You are a SQL expert..."</span>]
+[<span class="s">"user"</span>,   <span class="s">"&lt;schema&gt;CREATE TABLE sales...&lt;/schema&gt;\n查询 Top10..."</span>]
+
+<span class="c">→ apply_chat_template() → 模型最终输入 tokens</span></code></pre>
+
+  <h3>Step 10 · 流式返回 token chunks</h3>
+  <p>Worker 用 <code>async for chunk in generate_stream(...)</code> 把每个 token chunk yield 给 LLMOperator。
+  LLMOperator 是 <code>StreamingLLMOperator</code>，它会原样把 stream 推给下游，
+  实现<strong>"边出 token 边执行下一步"</strong>的效果。</p>
+
+  <p>LLM 大概会用 2–4 秒生成形如：</p>
+  <pre><code><span class="k">SELECT</span> customer_name, <span class="f">SUM</span>(amount) <span class="k">AS</span> total
+<span class="k">FROM</span> sales
+<span class="k">WHERE</span> sale_date &gt;= <span class="f">DATE_SUB</span>(<span class="f">CURDATE</span>(), <span class="n">INTERVAL 30 DAY</span>)
+<span class="k">GROUP BY</span> customer_name
+<span class="k">ORDER BY</span> total <span class="k">DESC</span>
+<span class="k">LIMIT</span> 10;</code></pre>
+
+  <h2 id="phase-db">七、阶段 5：SQL 执行（Step 11–13）</h2>
+
+  <h3>Step 11 · SQLOutParser 解析</h3>
+  <p><code>scene/chat_db/auto_execute/out_parser.py</code> 用正则 + Markdown code fence 提取 SQL：</p>
+  <pre><code>llm_output = <span class="s">"""```sql\nSELECT ...\n```"""</span>
+sql = parse_sql_from_markdown(llm_output)
+<span class="c"># → "SELECT customer_name, SUM(amount) ... LIMIT 10"</span></code></pre>
+
+  <h3>Step 12 · SqlExecOperator 执行</h3>
+  <p>调用 <code>RDBMSConnector.query_to_df(sql)</code>，背后是 SQLAlchemy：</p>
+  <pre><code>df = pd.read_sql(sql, self.engine)  <span class="c"># 10 行 DataFrame</span></code></pre>
+
+  <div class="callout warn">
+    <strong>注意</strong>：默认实现 <strong>不防 SQL 注入</strong>（让 LLM 直接执行），
+  生产环境需要 <code>sqlparse</code> 解析后拒绝 DDL/DROP。社区版本会做基本的白名单过滤，
+  企业部署建议用<strong>只读账号 + 表级权限</strong>。
+  </div>
+
+  <h3>Step 13 · 返回 DataFrame</h3>
+  <p>10 行 × 2 列：customer_name + total。这个 DataFrame 会作为 <code>SqlExecOperator</code> 的输出，传给下游 Vis。</p>
+
+  <h2 id="phase-vis">八、阶段 6：可视化与流式回传（Step 14–16）</h2>
+
+  <h3>Step 14 · ChartVisOperator 生成图表配置</h3>
+  <p>调用 <code>dbgpt_core.vis.tags.vis_chart.VisChart</code>，把 DataFrame 转成 ECharts option JSON：</p>
+  <pre><code>{
+  <span class="s">"echarts_type"</span>: <span class="s">"bar"</span>,
+  <span class="s">"title"</span>: <span class="s">"近 30 天 Top10 客户销售额"</span>,
+  <span class="s">"x_axis"</span>: [<span class="s">"客户A"</span>, <span class="s">"客户B"</span>, ...],
+  <span class="s">"series"</span>: [{ <span class="s">"name"</span>: <span class="s">"销售额"</span>, <span class="s">"data"</span>: [...] }]
+}</code></pre>
+
+  <p>同时还有 <code>VisTable</code> 把 DataFrame 转 HTML 表格片段。</p>
+
+  <h3>Step 15 · 流式回传（SSE）</h3>
+  <p>整条 DAG 的最终输出是一个 <strong>多 chunk 的流</strong>，
+  FastAPI 用 <code>StreamingResponse</code> 推给前端：</p>
+  <pre><code>data: {<span class="s">"vis_type"</span>: <span class="s">"llm_response"</span>, <span class="s">"content"</span>: <span class="s">"SELECT customer_name..."</span>}
+
+data: {<span class="s">"vis_type"</span>: <span class="s">"table"</span>, <span class="s">"content"</span>: <span class="s">"&lt;table&gt;...&lt;/table&gt;"</span>}
+
+data: {<span class="s">"vis_type"</span>: <span class="s">"chart"</span>, <span class="s">"content"</span>: {...echarts option...}}
+
+data: [DONE]</code></pre>
+
+  <h3>Step 16 · 前端流式渲染</h3>
+  <p>前端根据 <code>vis_type</code> 分发到不同渲染组件：</p>
+  <ul>
+    <li><code>llm_response</code> → Markdown 渲染器（显示 SQL）</li>
+    <li><code>table</code> → Ant Design Table</li>
+    <li><code>chart</code> → ECharts React 组件（画出柱状图）</li>
+  </ul>
+
+  <p>用户看到完整答案。整条链路结束。</p>
+
+  <h2 id="failed-path">九、失败路径：当 LLM 给出错 SQL</h2>
+  <p>真实场景远比上面复杂。下面看几种典型失败路径，理解 DB-GPT 的容错设计。</p>
+
+  <h3>路径 A · SQL 语法错</h3>
+  <p>LLM 生成 <code>SELET *</code> 这种语法错 → Step 12 SQLAlchemy 抛异常 →
+  如果配置了 <strong>SQLFixAgent</strong>，错误信息会回灌给 LLM 让它修正，
+  最多重试 N 次（默认 3）。</p>
+
+  <h3>路径 B · Schema 不匹配</h3>
+  <p>LLM 引用了不存在的字段 <code>customer_phone</code>。
+  这通常说明 <strong>Step 5 的 schema 注入不完整</strong>（比如大表做了截断）。
+  调试方法：打开 <code>scene/chat_db/auto_execute/prompt.py</code> 看 SUFFIX 模板的截断阈值。</p>
+
+  <h3>路径 C · LLM 不返回 SQL</h3>
+  <p>有时 LLM 直接回答"这个查询应该用 ..."却没出 SQL。
+  <code>SQLOutParser</code> 解析失败 → 抛 <code>ValueError</code> → DAG 中断 →
+  Runner 把错误包成 <code>error</code> vis_type 推给前端。</p>
+
+  <h3>路径 D · 流式中断</h3>
+  <p>网络中断 / Worker 崩溃。前端 SSE 连接断开，但后端 DAG 还在跑（除非触发 <code>asyncio.CancelledError</code>）。
+  这是 DB-GPT 的<strong>已知技术债</strong>，社区在研究如何把 DAG 执行做成可断点续传。</p>
+
+  <h2 id="debug">十、实战调试指南</h2>
+
+  <h3>1. 打开 AWEL 调试日志</h3>
+  <p>设置环境变量 <code>DBGPT_AWEL_LOG_LEVEL=DEBUG</code>，
+  可以看到每个 Operator 的输入输出、节点执行时间。</p>
+
+  <h3>2. 用 AWEL 可视化编辑器单步</h3>
+  <p>前端 <code>/flow</code> 页面打开任意 DAG，可以单节点运行。
+  跑到 LLMOperator 时点 "暂停"，就能看到完整 prompt 和 LLM 返回。</p>
+
+  <h3>3. 抓 LLM 实际 prompt</h3>
+  <p>在 <code>LLMOperator._call_llm</code> 入口加日志：
+  <code>logger.debug("LLM input: %s", prompt)</code></p>
+
+  <h3>4. 抓 SQL 实际执行</h3>
+  <p>在 <code>RDBMSConnector.query_ex</code> 加日志，看真实 SQL 是什么、耗时多少。</p>
+
+  <h3>5. 启用 SQLite + 本地模型</h3>
+  <p>调试时用 <code>dbgpt-local-qwen.toml</code> + SQLite 数据源，
+  完全本地跑通链路，避免网络/鉴权干扰。</p>
+
+  <h3>6. 常见问题速查表</h3>
+  <table>
+    <thead><tr><th>症状</th><th>排查方向</th></tr></thead>
+    <tbody>
+      <tr><td>LLM 一直不出 SQL</td><td>检查 prompt 模板 + DB schema 注入是否完整</td></tr>
+      <tr><td>SQL 执行报错</td><td>看 Step 12 的 SQLAlchemy 异常堆栈</td></tr>
+      <tr><td>图表不显示</td><td>看 <code>vis_type=chart</code> 的 chunk 是否到达前端</td></tr>
+      <tr><td>流式卡住</td><td>Worker 是否健康 / Controller 是否选错 Worker</td></tr>
+      <tr><td>整个请求 500</td><td>看后端 stack trace，通常在 DAG 编译或 Operator 执行</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="summary">十一、全书总结</h2>
+
+  <p>恭喜你读完了全部 11 章。现在你应该能回答这些核心问题：</p>
+
+  <div class="quiz">
+    <h4>核心检查点</h4>
+    <ul>
+      <li><strong>DB-GPT 的灵魂是什么？</strong> → AWEL（DAG 编排）。所有功能都是 DAG 节点。</li>
+      <li><strong>为什么分包？</strong> → 依赖倒置：core 抽象、ext 实现、serve/app 依赖 core。</li>
+      <li><strong>SystemApp 解决什么问题？</strong> → 组件注册 + 生命周期 + 避免循环依赖。</li>
+      <li><strong>Scene 和 AWEL 是什么关系？</strong> → Scene 是模板，最终会被编译成 AWEL DAG 执行。</li>
+      <li><strong>Agent 在哪用 AWEL？</strong> → <code>WrappedAgentOperator</code> 把 Agent 包装成 DAG 节点。</li>
+      <li><strong>RAG 怎么进 DAG？</strong> → <code>EmbeddingOperator / RetrievalOperator / RerankOperator</code>。</li>
+      <li><strong>多模型怎么调度？</strong> → ModelController + WorkerManager + Registry。</li>
+      <li><strong>怎么扩展一个新功能？</strong> → 写一个 Operator 挂到 DAG；或写一个 ext 实现 core 接口。</li>
+    </ul>
+  </div>
+
+  <h3>推荐下一步学习</h3>
+  <ol>
+    <li><strong>跑通 examples/</strong> 至少 3 个示例，加深对 AWEL API 的肌肉记忆</li>
+    <li><strong>写一个新 Operator</strong>（比如"调一个外部天气 API"），挂到一个 chat_scene DAG 里</li>
+    <li><strong>写一个新 Scene</strong>：参考 <code>chat_normal</code> 模板，加一个 <code>chat_weather</code></li>
+    <li><strong>读源码社区的 PR</strong>：看大牛怎么给 DB-GPT 加 datasource / LLM adapter</li>
+    <li><strong>读论文</strong>：arxiv.org/pdf/2312.17449.pdf（DB-GPT 原始论文）</li>
+    <li><strong>关注 AWEL 文档</strong>：docs.dbgpt.cn 最新版有 AWEL 教程</li>
+  </ol>
+
+  <div class="callout tip">
+    <strong>最后一句</strong>：理解 DB-GPT 的最快路径是<strong>动手改一行代码</strong>。
+    现在打开 <code>dbgpt_server.py</code>，在 <code>initialize_app</code> 里加一行
+    <code>print("components:", system_app.list_components())</code>，
+    启动服务，你就能看到整个 IoC 容器的全貌。
+  </div>
+
+  <div class="pager">
+    <a href="10-ext.html">← 10 · Ext 扩展</a>
+    <a href="index.html">回到总览 ↑</a>
+  </div>
+
+</main>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: 'base',
+    themeVariables: {
+      primaryColor: '#1a2029',
+      primaryTextColor: '#e6e6e6',
+      primaryBorderColor: '#4ec9b0',
+      lineColor: '#569cd6',
+      secondaryColor: '#232b37',
+      tertiaryColor: '#0f1419',
+      textColor: '#e6e6e6',
+      fontFamily: 'JetBrains Mono, Consolas, monospace',
+      fontSize: '16px'
+    },
+    flowchart: { curve: 'basis', padding: 20, useMaxWidth: true }
+  });
+</script>
+</body>
+</html>

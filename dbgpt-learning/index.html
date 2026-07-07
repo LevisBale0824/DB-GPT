@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DB-GPT 源码精读 · 学习手册</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="layout">
+
+<aside class="sidebar">
+  <h2>DBGPT 精读</h2>
+  <ul>
+    <li><a href="index.html" class="active">总览</a></li>
+  </ul>
+  <div class="group-title">入门</div>
+  <ul>
+    <li><a href="01-architecture.html">01 · 整体架构</a></li>
+    <li><a href="02-startup.html">02 · 启动流程</a></li>
+  </ul>
+  <div class="group-title">核心子系统</div>
+  <ul>
+    <li><a href="03-awel.html">03 · AWEL 工作流</a></li>
+    <li><a href="04-agent.html">04 · Agent 系统</a></li>
+    <li><a href="05-rag.html">05 · RAG 检索</a></li>
+    <li><a href="06-model.html">06 · 模型层</a></li>
+    <li><a href="07-datasource.html">07 · 数据源</a></li>
+  </ul>
+  <div class="group-title">应用层</div>
+  <ul>
+    <li><a href="08-scene.html">08 · Scene 场景</a></li>
+    <li><a href="09-serve.html">09 · Serve 服务</a></li>
+    <li><a href="10-ext.html">10 · Ext 扩展</a></li>
+  </ul>
+  <div class="group-title">实战</div>
+  <ul>
+    <li><a href="11-trace.html">11 · 链路追踪</a></li>
+  </ul>
+</aside>
+
+<main class="main">
+  <h1>DB-GPT 源码精读 <span class="tag">v0.8.1</span></h1>
+  <p class="subtitle">从启动一行命令到一条完整请求的端到端旅程 —— 全部源码逐段精读</p>
+
+  <div class="callout tip">
+    <strong>定位：</strong>DB-GPT 是一个 <em>Agentic AI 数据助理平台</em>，
+    用 LLM + Agent + AWEL Workflow，把"自然语言 → SQL/代码 → 数据分析 → 报告/图表"打通，
+    并提供 RAG、多模型管理、沙箱执行、可视化编排能力。
+  </div>
+
+  <div class="toc">
+    <div class="toc-title">本手册导览</div>
+    <ol>
+      <li><a href="#what">一句话定位 & 四件套能力</a></li>
+      <li><a href="#packages">Monorepo 包结构</a></li>
+      <li><a href="#deps">包依赖图与依赖倒置</a></li>
+      <li><a href="#route">推荐阅读路径（4 周）</a></li>
+      <li><a href="#modules">11 个章节导览</a></li>
+      <li><a href="#questions">核心技术问题清单</a></li>
+    </ol>
+  </div>
+
+  <h2 id="what">一、工程定位</h2>
+  <p>核心能力四件套：</p>
+  <ul>
+    <li><strong>Agent</strong> —— 自主规划、调用工具（ReAct / AutoGen 风格）</li>
+    <li><strong>AWEL</strong> —— Agentic Workflow Expression Language，DAG 编排（DB-GPT 灵魂）</li>
+    <li><strong>RAG</strong> —— 知识检索（Knowledge → Embedding → VectorStore → Retriever → Reranker）</li>
+    <li><strong>多源数据访问 + 沙箱执行</strong> —— 数据库/CSV/知识库 + 隔离 Python 执行</li>
+  </ul>
+
+  <h2 id="packages">二、Monorepo 包结构</h2>
+  <p>使用 <code>uv workspace</code> 管理 7 个包：</p>
+  <pre><code><span class="c"># pyproject.toml (顶层)</span>
+<span class="k">[tool.uv.workspace]</span>
+members = [
+  <span class="s">"packages/dbgpt-app"</span>,
+  <span class="s">"packages/dbgpt-client"</span>,
+  <span class="s">"packages/dbgpt-core"</span>,
+  <span class="s">"packages/dbgpt-ext"</span>,
+  <span class="s">"packages/dbgpt-serve"</span>,
+  <span class="s">"packages/dbgpt-sandbox"</span>,
+  <span class="s">"packages/dbgpt-accelerator/dbgpt-acc*"</span>,
+]}</code></pre>
+
+  <table>
+    <thead><tr><th>包</th><th>角色</th><th>徽章</th></tr></thead>
+    <tbody>
+      <tr><td><code>dbgpt-core</code></td><td>核心抽象与接口（awel/agent/rag/model/datasource 全在这里定义）</td><td><span class="badge core">core</span></td></tr>
+      <tr><td><code>dbgpt-ext</code></td><td>扩展实现（各 LLM、数据源、向量库、可视化）</td><td><span class="badge ext">ext</span></td></tr>
+      <tr><td><code>dbgpt-serve</code></td><td>REST 服务层（agent/conversation/flow/model/rag/...）</td><td><span class="badge serve">serve</span></td></tr>
+      <tr><td><code>dbgpt-app</code></td><td>应用编排层（FastAPI 主入口 + Scene + openapi）</td><td><span class="badge app">app</span></td></tr>
+      <tr><td><code>dbgpt-client</code></td><td>Python SDK（外部系统集成）</td><td><span class="badge app">app</span></td></tr>
+      <tr><td><code>dbgpt-sandbox</code></td><td>代码沙箱执行</td><td><span class="badge ext">ext</span></td></tr>
+      <tr><td><code>dbgpt-accelerator</code></td><td>推理加速（dbgpt-acc-auto / dbgpt-acc-flash-attn）</td><td><span class="badge ext">ext</span></td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="deps">三、包依赖图与依赖倒置</h2>
+  <div class="mermaid">
+flowchart TD
+    APP["dbgpt-app<br/>应用编排层<br/>(FastAPI/Scene)"]
+    SERVE["dbgpt-serve<br/>REST 服务"]
+    EXT["dbgpt-ext<br/>扩展实现"]
+    CORE["dbgpt-core<br/>核心抽象/接口"]
+    CLIENT["dbgpt-client<br/>外部 SDK"]
+    ACC["dbgpt-accelerator<br/>推理加速"]
+    SANDBOX["dbgpt-sandbox<br/>代码隔离执行"]
+
+    APP --> SERVE
+    APP --> EXT
+    APP --> CORE
+    SERVE --> EXT
+    SERVE --> CORE
+    EXT --> CORE
+    CLIENT -.-> SERVE
+    ACC -.-> CORE
+    SANDBOX -.-> CORE
+  </div>
+
+  <div class="callout">
+    <strong>依赖倒置原则：</strong>app/serve 依赖 core 的<em>抽象</em>，ext 提供<em>实现</em>，
+    运行期由 <code>component_configs.py</code> 把实现注入 <code>SystemApp</code> 容器。
+    这就避免了高层模块直接依赖低层实现，破解了循环依赖。
+  </div>
+
+  <h2 id="route">四、推荐阅读路径（4 周）</h2>
+  <table>
+    <thead><tr><th>周</th><th>主题</th><th>对应章节</th></tr></thead>
+    <tbody>
+      <tr><td>Week 1</td><td>地基：core/interface + 启动链路</td><td>01 + 02</td></tr>
+      <tr><td>Week 2</td><td>五大子系统横向深入</td><td>03 / 04 / 05 / 06 / 07</td></tr>
+      <tr><td>Week 3</td><td>服务层 + 扩展层 + 沙箱 + 加速器</td><td>08 / 09 / 10</td></tr>
+      <tr><td>Week 4</td><td>前端 + 实战 + 端到端追踪</td><td>11</td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="modules">五、11 个章节导览</h2>
+  <div class="card-grid">
+    <a class="card" href="01-architecture.html">
+      <div class="num">CHAPTER 01</div>
+      <div class="title">整体架构</div>
+      <div class="desc">6 大包的角色、依赖倒置、组件系统、Monorepo 设计哲学</div>
+    </a>
+    <a class="card" href="02-startup.html">
+      <div class="num">CHAPTER 02</div>
+      <div class="title">启动流程</div>
+      <div class="desc">dbgpt_server.py 主入口、SystemApp、component_configs 依赖注入、初始化时序</div>
+    </a>
+    <a class="card" href="03-awel.html">
+      <div class="num">CHAPTER 03</div>
+      <div class="title">AWEL 工作流 ⭐</div>
+      <div class="desc">DB-GPT 灵魂。DAG / Operator / Trigger / Flow / Task 全套精读</div>
+    </a>
+    <a class="card" href="04-agent.html">
+      <div class="num">CHAPTER 04</div>
+      <div class="title">Agent 系统</div>
+      <div class="desc">Agent 基类、AgentContext、Resource、Middleware、ReAct 推理循环</div>
+    </a>
+    <a class="card" href="05-rag.html">
+      <div class="num">CHAPTER 05</div>
+      <div class="title">RAG 检索</div>
+      <div class="desc">Knowledge/Embedding/VectorStore/Retriever/Reranker 五层 + Operator 化</div>
+    </a>
+    <a class="card" href="06-model.html">
+      <div class="num">CHAPTER 06</div>
+      <div class="title">模型层</div>
+      <div class="desc">ModelAdapter/Proxy/Cluster/Operators，三种部署模式与多 worker 调度</div>
+    </a>
+    <a class="card" href="07-datasource.html">
+      <div class="num">CHAPTER 07</div>
+      <div class="title">数据源</div>
+      <div class="desc">RDBMS/NoSQL 抽象、SQLAlchemy 封装、Operator 化执行</div>
+    </a>
+    <a class="card" href="08-scene.html">
+      <div class="num">CHAPTER 08</div>
+      <div class="title">Scene 场景</div>
+      <div class="desc">chat_normal / chat_db / chat_data / chat_dashboard / chat_knowledge</div>
+    </a>
+    <a class="card" href="09-serve.html">
+      <div class="num">CHAPTER 09</div>
+      <div class="title">Serve 服务层</div>
+      <div class="desc">REST API 标准化、CRUD、与子系统的对应关系</div>
+    </a>
+    <a class="card" href="10-ext.html">
+      <div class="num">CHAPTER 10</div>
+      <div class="title">Ext 扩展层</div>
+      <div class="desc">datasource/storage/llms/vis 各厂商实现 + 插件机制</div>
+    </a>
+    <a class="card" href="11-trace.html">
+      <div class="num">CHAPTER 11</div>
+      <div class="title">端到端链路追踪</div>
+      <div class="desc">"查询 Top10 客户" 一条请求从前端到 SQL 结果的 16 步旅程</div>
+    </a>
+  </div>
+
+  <h2 id="questions">六、核心技术问题清单</h2>
+  <p>读每个模块时，带着下面的问题去源码里找答案：</p>
+  <div class="quiz">
+    <h4>AWEL（必答）</h4>
+    <ul>
+      <li>DAG 怎么编译？拓扑排序在哪？</li>
+      <li>流式输出（streaming）怎么在 DAG 节点之间传递？</li>
+      <li>Operator 之间的数据契约是什么？</li>
+      <li>UI 编排的 JSON 怎么反序列化成 DAG 对象？</li>
+    </ul>
+  </div>
+  <div class="quiz">
+    <h4>Agent</h4>
+    <ul>
+      <li>ReAct 推理循环在哪？怎么终止？</li>
+      <li>工具调用（function call）是怎么发起和解析的？</li>
+      <li>多 Agent 协作（multi-agent）怎么编排？</li>
+      <li>Memory 怎么存？短期 vs 长期？</li>
+    </ul>
+  </div>
+  <div class="quiz">
+    <h4>RAG</h4>
+    <ul>
+      <li>Knowledge 怎么分块（chunk）？有哪些策略？</li>
+      <li>不同 Embedding 模型怎么热插拔？</li>
+      <li>Retriever 怎么和 Agent 联动？</li>
+    </ul>
+  </div>
+  <div class="quiz">
+    <h4>Model / DataSource</h4>
+    <ul>
+      <li>proxy 模式 vs local 模式有什么本质区别？</li>
+      <li>多 worker 怎么负载均衡？</li>
+      <li>不同数据库方言怎么抽象？schema 怎么缓存给 LLM？</li>
+    </ul>
+  </div>
+
+  <div class="callout warn">
+    <strong>说明：</strong>本手册采用<strong>精读关键文件 + 概览全貌</strong>的方式。
+    DB-GPT 工程代码量巨大（数百文件、数万行），不可能"逐行"全部解读。
+    每章会精选 5~15 个核心文件，对关键代码段做逐行/逐段精读，其余文件给出概览和定位说明。
+  </div>
+
+  <div class="pager">
+    <span></span>
+    <a href="01-architecture.html">开始阅读 → 01 整体架构</a>
+  </div>
+
+</main>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: 'base',
+    themeVariables: {
+      primaryColor: '#1a2029',
+      primaryTextColor: '#e6e6e6',
+      primaryBorderColor: '#4ec9b0',
+      lineColor: '#569cd6',
+      secondaryColor: '#232b37',
+      tertiaryColor: '#0f1419',
+      textColor: '#e6e6e6',
+      fontFamily: 'JetBrains Mono, Consolas, monospace',
+      fontSize: '16px'
+    },
+    flowchart: { curve: 'basis', padding: 20, useMaxWidth: true }
+  });
+</script>
+</body>
+</html>

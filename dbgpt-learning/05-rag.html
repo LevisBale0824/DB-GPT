@@ -1,0 +1,973 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>05 · RAG 检索系统 · DB-GPT 源码精读</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="layout">
+
+<aside class="sidebar">
+  <h2>DBGPT 精读</h2>
+  <ul><li><a href="index.html">总览</a></li></ul>
+  <div class="group-title">入门</div>
+  <ul>
+    <li><a href="01-architecture.html">01 · 整体架构</a></li>
+    <li><a href="02-startup.html">02 · 启动流程</a></li>
+  </ul>
+  <div class="group-title">核心子系统</div>
+  <ul>
+    <li><a href="03-awel.html">03 · AWEL 工作流</a></li>
+    <li><a href="04-agent.html">04 · Agent 系统</a></li>
+    <li><a href="05-rag.html" class="active">05 · RAG 检索</a></li>
+    <li><a href="06-model.html">06 · 模型层</a></li>
+    <li><a href="07-datasource.html">07 · 数据源</a></li>
+  </ul>
+  <div class="group-title">应用层</div>
+  <ul>
+    <li><a href="08-scene.html">08 · Scene 场景</a></li>
+    <li><a href="09-serve.html">09 · Serve 服务</a></li>
+    <li><a href="10-ext.html">10 · Ext 扩展</a></li>
+  </ul>
+  <div class="group-title">实战</div>
+  <ul><li><a href="11-trace.html">11 · 链路追踪</a></li></ul>
+</aside>
+
+<main class="main">
+  <h1>05 · RAG 检索系统 <span class="tag">Core</span></h1>
+  <p class="subtitle">五层架构、九大 Knowledge、AWEL Operator 化 —— DB-GPT 如何把"检索增强生成"拆成可编排的积木</p>
+
+  <div class="toc">
+    <div class="toc-title">本章导览</div>
+    <ol>
+      <li><a href="#overview">RAG 全景：五层架构一览</a></li>
+      <li><a href="#knowledge">第一层：Knowledge —— 知识源抽象</a></li>
+      <li><a href="#chunking">分块策略：ChunkStrategy 与 TextSplitter</a></li>
+      <li><a href="#embedding">第二层：Embedding —— 向量化</a></li>
+      <li><a href="#vectorstore">第三层：VectorStore —— 向量存储</a></li>
+      <li><a href="#retriever">第四层：Retriever —— 召回与打分</a></li>
+      <li><a href="#reranker">第五层：Reranker —— 重排</a></li>
+      <li><a href="#operators">AWEL Operator 化：把 RAG 拼成 DAG</a></li>
+      <li><a href="#evaluation">评估器：RetrieverEvaluator</a></li>
+      <li><a href="#e2e">端到端：一条 RAG Pipeline 长什么样</a></li>
+      <li><a href="#quiz">本章测验</a></li>
+    </ol>
+  </div>
+
+  <div class="callout tip">
+    <strong>一句话定位：</strong>DB-GPT 的 RAG 子系统把"文档 → 向量 → 检索 → 重排 → 拼上下文"这条链路，
+    拆成 <em>五层抽象</em>（Knowledge / Embedding / VectorStore / Retriever / Reranker），
+    再用 <em>AWEL Operator</em> 把每一层封装成可拖拽的 DAG 节点。
+    这让"换一个 Embedding 模型"或"加一个 Reranker"变成只改一行 Operator 配置。
+  </div>
+
+  <!-- ===================== 1. 五层架构 ===================== -->
+  <h2 id="overview">一、RAG 全景：五层架构一览</h2>
+  <p>DB-GPT 的 RAG 子系统源码横跨两个包：<code>dbgpt-core</code> 提供抽象，
+    <code>dbgpt-ext</code> 提供具体实现。核心目录如下：</p>
+  <table>
+    <thead><tr><th>层</th><th>core 位置</th><th>ext 实现</th></tr></thead>
+    <tbody>
+      <tr><td>Knowledge</td><td><code>dbgpt/rag/knowledge/base.py</code></td><td><code>dbgpt_ext/rag/knowledge/{csv,pdf,docx,...}.py</code></td></tr>
+      <tr><td>Embedding</td><td><code>dbgpt/core/interface/embeddings.py</code></td><td><code>dbgpt/rag/embedding/embeddings.py</code> + ext 厂商</td></tr>
+      <tr><td>VectorStore</td><td><code>dbgpt/storage/base.py</code> (IndexStoreBase)</td><td><code>dbgpt_ext/storage/vector_store/{chroma,milvus,pg,...}.py</code></td></tr>
+      <tr><td>Retriever</td><td><code>dbgpt/rag/retriever/base.py</code></td><td><code>dbgpt/rag/retriever/embedding.py</code> + ext</td></tr>
+      <tr><td>Reranker</td><td><code>dbgpt/rag/retriever/rerank.py</code></td><td>—（与 Retriever 同包）</td></tr>
+    </tbody>
+  </table>
+
+  <p>五层之间的数据流（写入阶段 + 查询阶段）：</p>
+  <div class="rag-pipeline" aria-label="RAG 写入阶段和查询阶段数据流">
+    <section class="rag-stage write">
+      <h3>写入阶段（离线）</h3>
+      <div class="rag-row">
+        <div class="rag-node">Knowledge<span>CSV / PDF / URL</span></div>
+        <div class="rag-arrow"><span>load</span></div>
+        <div class="rag-node">Document<span>List Doc</span></div>
+        <div class="rag-arrow"><span>split<br>ChunkManager</span></div>
+        <div class="rag-node">Chunk<span>分块后的片段</span></div>
+        <div class="rag-arrow"><span>embed_documents</span></div>
+        <div class="rag-node">Embedding<span>HF / OpenAPI</span></div>
+        <div class="rag-arrow"><span>load_doc</span></div>
+        <div class="rag-node rag-store">VectorStore<span>Chroma / Milvus</span></div>
+      </div>
+    </section>
+
+    <div class="rag-downlink">
+      <span>similar_search · top_k score</span>
+    </div>
+
+    <section class="rag-stage query">
+      <h3>查询阶段（在线）</h3>
+      <div class="rag-row">
+        <div class="rag-node">Retriever<span>Embedding / Hybrid</span></div>
+        <div class="rag-arrow"><span>candidates_with_scores</span></div>
+        <div class="rag-node">Reranker<span>Default / CE</span></div>
+        <div class="rag-arrow"><span>rank 重排 去重</span></div>
+        <div class="rag-node">Top-K Chunk<span>带分数</span></div>
+        <div class="rag-arrow"><span>拼入</span></div>
+        <div class="rag-node rag-output">LLM Prompt</div>
+      </div>
+    </section>
+  </div>
+
+  <div class="callout">
+    <strong>设计哲学：</strong>每一层都是"抽象 + 实现"的模板方法模式。
+    <code>Knowledge</code> / <code>Embeddings</code> / <code>IndexStoreBase</code> /
+    <code>BaseRetriever</code> / <code>Ranker</code> 五个抽象类，
+    圈定了每一层的<em>契约边界</em>。替换任何一层不影响其它层 —— 这是 DB-GPT RAG 可扩展的根基。
+  </div>
+
+  <p>对比业界其它 RAG 框架（如 LangChain 的 RetrievalQA、LlamaIndex 的 QueryEngine），
+    DB-GPT 的独特之处在于<strong>把每一层都 AWEL Operator 化</strong>。
+    在 LangChain 中，RAG 是一条写死的 Chain（RetrievalQA.from_chain_type）；
+    而在 DB-GPT 中，RAG 是一组可自由编排的 Operator 节点。
+    你可以在检索前插入 Query Rewrite，在检索后追加 Reranker，
+    甚至并行跑两个不同参数的 Retriever 再合并结果 —— 这些都只需改 DAG 拓扑，无需改业务代码。</p>
+
+  <p>此外，DB-GPT 的 RAG 子系统还承担了一个特殊职责：<strong>为 Agent 提供知识工具</strong>。
+    在 Agent 章节我们会看到，<code>KnowledgeSpaceRetrievalTool</code> 就是把 RAG 封装成一个 Agent 可调用的工具。
+    Agent 在推理循环中决定"是否需要检索知识库"，如果需要，就调用这个工具，
+    背后执行的正是本章讨论的 EmbeddingRetrieverOperator 链路。
+    所以理解 RAG 五层架构，也是理解 Agent 知识增强能力的基础。</p>
+
+  <!-- ===================== 2. Knowledge ===================== -->
+  <h2 id="knowledge">二、第一层：Knowledge —— 知识源抽象</h2>
+  <p>文件：<code>dbgpt-core/src/dbgpt/rag/knowledge/base.py</code></p>
+  <p><code>Knowledge</code> 是所有知识源的基类。它定义了"从某种数据源加载文档"的统一接口：</p>
+  <pre><code><span class="k">class</span> <span class="type">Knowledge</span>(ABC):
+    <span class="com">"""Knowledge Base Class."""</span>
+
+    <span class="k">def</span> <span class="fn">__init__</span>(<span class="kw">self</span>, path, knowledge_type, knowledge_type, loader, metadata, **kwargs):
+        <span class="kw">self</span>._path = path
+        <span class="kw">self</span>._type = knowledge_type
+        <span class="kw">self</span>._loader = loader
+        <span class="kw">self</span>._metadata = metadata
+
+    <span class="k">def</span> <span class="fn">load</span>(<span class="kw">self</span>) -> List[Document]:
+        <span class="com">"""Load knowledge from data loader."""</span>
+        documents = <span class="kw">self</span>._load()        <span class="com"># 子类实现：真正的解析逻辑</span>
+        <span class="kw">return</span> <span class="kw">self</span>._postprocess(documents)  <span class="com"># 钩子：后处理</span>
+
+    <span class="kw">@classmethod</span>
+    <span class="kw">@abstractmethod</span>
+    <span class="k">def</span> <span class="fn">type</span>(cls) -> KnowledgeType:
+        <span class="com">"""Get knowledge type."""</span>
+
+    <span class="kw">@abstractmethod</span>
+    <span class="k">def</span> <span class="fn">_load</span>(<span class="kw">self</span>) -> List[Document]:
+        <span class="com">"""子类必须实现：真正加载文档的逻辑"""</span>
+
+    <span class="kw">@classmethod</span>
+    <span class="k">def</span> <span class="fn">support_chunk_strategy</span>(cls) -> List[ChunkStrategy]:
+        <span class="kw">return</span> ChunkStrategy.CHUNK_BY_SIZE  <span class="com"># 默认只支持按大小切</span>
+
+    <span class="kw">@classmethod</span>
+    <span class="k">def</span> <span class="fn">default_chunk_strategy</span>(cls) -> ChunkStrategy:
+        <span class="kw">return</span> ChunkStrategy.CHUNK_BY_SIZE</code></pre>
+
+  <p>这里有一个标准的<strong>模板方法模式</strong>：<code>load()</code> 是 final 方法，它先调子类的 <code>_load()</code>，
+    再调 <code>_postprocess()</code> 做后处理。子类只需实现 <code>_load()</code> 即可。</p>
+
+  <h3>Knowledge 类型家族</h3>
+  <p><code>KnowledgeType</code> 把知识源分成三大类，<code>DocumentType</code> 进一步细分文档格式：</p>
+  <table>
+    <thead><tr><th>KnowledgeType</th><th>说明</th><th>典型子类</th></tr></thead>
+    <tbody>
+      <tr><td><code>DOCUMENT</code></td><td>文件型知识</td><td>CSV / PDF / DOCX / Markdown / HTML / PPTX / Excel / TXT / DOC</td></tr>
+      <tr><td><code>URL</code></td><td>网页知识</td><td>URLKnowledge（requests + BeautifulSoup 抓取）</td></tr>
+      <tr><td><code>TEXT</code></td><td>纯文本知识</td><td>StringKnowledge（直接传入字符串）</td></tr>
+    </tbody>
+  </table>
+
+  <p>具体实现位于 <code>dbgpt-ext/src/dbgpt_ext/rag/knowledge/</code>，由 <code>KnowledgeFactory</code> 统一创建：</p>
+  <table>
+    <thead><tr><th>实现类</th><th>DocumentType</th><th>解析方式</th><th>默认分块策略</th></tr></thead>
+    <tbody>
+      <tr><td><code>CSVKnowledge</code></td><td>csv</td><td>csv.DictReader，每行拼成 "key: value"</td><td>CHUNK_BY_SIZE</td></tr>
+      <tr><td><code>PDFKnowledge</code></td><td>pdf</td><td>pdfplumber + 自研标题/表格提取</td><td>CHUNK_BY_SIZE</td></tr>
+      <tr><td><code>DocxKnowledge</code></td><td>docx</td><td>python-docx</td><td>CHUNK_BY_SIZE</td></tr>
+      <tr><td><code>MarkdownKnowledge</code></td><td>md</td><td>按 markdown 文本读入</td><td>CHUNK_BY_SIZE</td></tr>
+      <tr><td><code>HTMLKnowledge</code></td><td>html</td><td>BeautifulSoup 提取正文</td><td>CHUNK_BY_SIZE</td></tr>
+      <tr><td><code>PPTXKnowledge</code></td><td>pptx</td><td>python-pptx 提取每页文本</td><td>CHUNK_BY_SIZE</td></tr>
+      <tr><td><code>ExcelKnowledge</code></td><td>xlsx</td><td>openpyxl/pandas 按 sheet 读取</td><td>CHUNK_BY_SIZE</td></tr>
+      <tr><td><code>TXTKnowledge</code></td><td>txt</td><td>直接读文件</td><td>CHUNK_BY_SIZE</td></tr>
+      <tr><td><code>URLKnowledge</code></td><td>—</td><td>requests + BeautifulSoup 抓取网页</td><td>CHUNK_BY_SIZE</td></tr>
+      <tr><td><code>DatasourceKnowledge</code></td><td>datasource</td><td>从 RDBMS 元数据生成 schema 文档</td><td>CHUNK_BY_SIZE</td></tr>
+    </tbody>
+  </table>
+
+  <h3>CSVKnowledge 示例（精读）</h3>
+  <p>文件：<code>dbgpt-ext/src/dbgpt_ext/rag/knowledge/csv.py</code></p>
+  <pre><code><span class="k">class</span> <span class="type">CSVKnowledge</span>(Knowledge):
+    <span class="com">"""CSV Knowledge."""</span>
+
+    <span class="k">def</span> <span class="fn">_load</span>(<span class="kw">self</span>) -> List[Document]:
+        <span class="com">"""Load csv document from loader."""</span>
+        <span class="k">if</span> <span class="kw">self</span>._loader:
+            documents = <span class="kw">self</span>._loader.load()
+        <span class="k">else</span>:
+            docs = []
+            <span class="k">with</span> <span class="fn">open</span>(<span class="kw">self</span>._path, newline=<span class="s">""</span>, encoding=<span class="kw">self</span>._encoding) <span class="k">as</span> csvfile:
+                csv_reader = csv.<span class="fn">DictReader</span>(csvfile)
+                <span class="k">for</span> i, row <span class="k">in</span> <span class="fn">enumerate</span>(csv_reader):
+                    strs = []
+                    <span class="k">for</span> k, v <span class="k">in</span> row.<span class="fn">items</span>():
+                        <span class="k">if</span> k <span class="kw">is</span> <span class="kw">None</span> <span class="kw">or</span> v <span class="kw">is</span> <span class="kw">None</span>:
+                            <span class="k">continue</span>
+                        strs.<span class="fn">append</span>(<span class="s">f"{k.strip()}: {v.strip()}"</span>)
+                    content = <span class="s">"\n"</span>.<span class="fn">join</span>(strs)  <span class="com"># 每行变成 "列名: 值" 的文本</span>
+                    metadata = {<span class="s">"source"</span>: <span class="kw">self</span>._path, <span class="s">"row"</span>: i}
+                    docs.<span class="fn">append</span>(<span class="fn">Document</span>(content=content, metadata=metadata))
+            <span class="k">return</span> docs
+
+    <span class="kw">@classmethod</span>
+    <span class="k">def</span> <span class="fn">support_chunk_strategy</span>(cls) -> List[ChunkStrategy]:
+        <span class="kw">return</span> [ChunkStrategy.CHUNK_BY_SIZE, ChunkStrategy.CHUNK_BY_SEPARATOR]
+
+    <span class="kw">@classmethod</span>
+    <span class="k">def</span> <span class="fn">document_type</span>(cls) -> DocumentType:
+        <span class="kw">return</span> DocumentType.CSV</code></pre>
+
+  <div class="callout">
+    <strong>关键设计：</strong>CSV 每一行被拼成 <code>"列名: 值\n列名: 值\n..."</code> 的文本，
+    而不是保留表格结构。这让 Embedding 模型能更好地理解语义。
+    <code>support_chunk_strategy()</code> 允许子类<em>收敛</em>支持的分块策略（CSV 额外支持按分隔符切）。
+  </div>
+
+  <p>再来看 <strong>URLKnowledge</strong>（文件 <code>dbgpt_ext/rag/knowledge/url.py</code>）。
+    它的 <code>_load()</code> 方法用 <code>requests</code> 抓取网页，再用 <code>BeautifulSoup</code> 解析 HTML，
+    去掉 <code>&lt;script&gt;</code> 和 <code>&lt;style&gt;</code> 标签，提取纯文本。
+    同时还会提取 <code>&lt;title&gt;</code> 和 <code>&lt;meta name="description"&gt;</code> 作为 metadata。
+    文本清洗逻辑（<code>clean_text</code>）会去除零宽字符（<code>\u200b</code> 等）、控制字符，
+    并做 Unicode NFKC 归一化。这些细节决定了网页类知识源的检索质量。</p>
+
+  <p>而 <strong>PDFKnowledge</strong> 是最复杂的 Knowledge 实现，包含一个完整的 <code>PDFProcessor</code> 类。
+    它用 <code>pdfplumber</code> 解析 PDF，不仅提取文本，还能识别表格（excel 类型），
+    把表格转成 Markdown 格式拼入正文。还有正则匹配一级/二级标题的 <code>process_text_data</code> 逻辑，
+    以及页眉页脚检测。这说明 DB-GPT 对 PDF 这类复杂格式做了深度适配，
+    不是简单调用 <code>pdfplumber.extract_text()</code> 就完事。</p>
+
+  <h3>KnowledgeFactory：根据扩展名自动分发</h3>
+  <p>文件：<code>dbgpt-ext/src/dbgpt_ext/rag/knowledge/factory.py</code></p>
+  <pre><code><span class="k">class</span> <span class="type">KnowledgeFactory</span>:
+    <span class="kw">@classmethod</span>
+    <span class="k">def</span> <span class="fn">from_file_path</span>(cls, file_path, knowledge_type=KnowledgeType.DOCUMENT, ...) -> Knowledge:
+        factory = <span class="fn">cls</span>(file_path=file_path, ...)
+        <span class="kw">return</span> factory._select_document_knowledge(file_path=file_path, ...)
+
+    <span class="k">def</span> <span class="fn">_select_document_knowledge</span>(<span class="kw">self</span>, **kwargs):
+        extension = <span class="kw">self</span>._file_path.<span class="fn">rsplit</span>(<span class="s">"."</span>, <span class="n">1</span>)[-<span class="n">1</span>]  <span class="com"># 取扩展名</span>
+        knowledge_classes = <span class="kw">self</span>._get_knowledge_subclasses()  <span class="com"># 扫描所有子类</span>
+        <span class="k">for</span> cls <span class="k">in</span> knowledge_classes:
+            <span class="k">if</span> cls.<span class="fn">document_type</span>() <span class="kw">and</span> cls.<span class="fn">document_type</span>().<span class="fn">value</span>() == extension:
+                <span class="kw">return</span> <span class="fn">cls</span>(**kwargs)  <span class="com"># 匹配扩展名，实例化</span>
+        <span class="k">raise</span> <span class="fn">Exception</span>(<span class="s">f"Unsupported knowledge document type '{extension}'"</span>)</code></pre>
+  <p>这里用了一个"<strong>注册表模式</strong>"：<code>Knowledge.__subclasses__()</code> 自动收集所有子类，
+    再按 <code>document_type()</code> 匹配扩展名。新增一种文档类型只需写一个子类，无需修改 Factory。</p>
+
+  <!-- ===================== 3. 分块策略 ===================== -->
+  <h2 id="chunking">三、分块策略：ChunkStrategy 与 TextSplitter</h2>
+  <p>分块（Chunking）是 RAG 中最影响检索质量的环节。DB-GPT 把分块策略定义为枚举：</p>
+  <pre><code><span class="k">class</span> <span class="type">ChunkStrategy</span>(Enum):
+    CHUNK_BY_SIZE = (RecursiveCharacterTextSplitter, [...], <span class="s">"chunk size"</span>, ...)
+    CHUNK_BY_PAGE = (PageTextSplitter, [], <span class="s">"page"</span>, ...)
+    CHUNK_BY_PARAGRAPH = (ParagraphTextSplitter, [...], <span class="s">"paragraph"</span>, ...)
+    CHUNK_BY_SEPARATOR = (SeparatorTextSplitter, [...], <span class="s">"separator"</span>, ...)
+    CHUNK_BY_MARKDOWN_HEADER = (MarkdownHeaderTextSplitter, [], <span class="s">"markdown header"</span>, ...)
+
+    <span class="k">def</span> <span class="fn">__init__</span>(<span class="kw">self</span>, splitter_class, parameters, alias, description):
+        <span class="kw">self</span>.splitter_class = splitter_class  <span class="com"># 对应的 TextSplitter 类</span>
+        <span class="kw">self</span>.parameters = parameters          <span class="com"># 参数定义（chunk_size 等）</span>
+        <span class="kw">self</span>.alias = alias
+        <span class="kw">self</span>.description = description
+
+    <span class="k">def</span> <span class="fn">match</span>(<span class="kw">self</span>, *args, **kwargs) -> TextSplitter:
+        <span class="com">"""Match and build splitter."""</span>
+        <span class="kw">return</span> <span class="kw">self</span>.value[<span class="n">0</span>](*args, **kwargs)  <span class="com"># 实例化对应的 Splitter</span></code></pre>
+
+  <table>
+    <thead><tr><th>策略</th><th>Splitter 类</th><th>核心参数</th><th>适用场景</th></tr></thead>
+    <tbody>
+      <tr><td><code>CHUNK_BY_SIZE</code></td><td>RecursiveCharacterTextSplitter</td><td>chunk_size=512, chunk_overlap=50</td><td>通用默认，递归按分隔符切到指定大小</td></tr>
+      <tr><td><code>CHUNK_BY_PAGE</code></td><td>PageTextSplitter</td><td>—</td><td>PDF / PPT 按页切</td></tr>
+      <tr><td><code>CHUNK_BY_PARAGRAPH</code></td><td>ParagraphTextSplitter</td><td>separator="\n"</td><td>按段落切</td></tr>
+      <tr><td><code>CHUNK_BY_SEPARATOR</code></td><td>SeparatorTextSplitter</td><td>separator, enable_merge</td><td>CSV / JSON 按自定义分隔符切</td></tr>
+      <tr><td><code>CHUNK_BY_MARKDOWN_HEADER</code></td><td>MarkdownHeaderTextSplitter</td><td>—</td><td>Markdown 按标题层级切</td></tr>
+    </tbody>
+  </table>
+
+  <p><code>ChunkManager</code>（位于 <code>dbgpt-ext/src/dbgpt_ext/rag/chunk_manager.py</code>）是分块的协调器：</p>
+  <pre><code><span class="k">class</span> <span class="type">ChunkManager</span>:
+    <span class="k">def</span> <span class="fn">__init__</span>(<span class="kw">self</span>, knowledge, chunk_parameter, extractor=<span class="kw">None</span>):
+        <span class="kw">self</span>._knowledge = knowledge
+        <span class="kw">self</span>._chunk_strategy = (
+            chunk_parameter.chunk_strategy
+            <span class="k">or</span> knowledge.<span class="fn">default_chunk_strategy</span>().name  <span class="com"># 没指定就用默认</span>
+        )
+
+    <span class="k">def</span> <span class="fn">split</span>(<span class="kw">self</span>, documents: List[Document]) -> List[Chunk]:
+        text_splitter = <span class="kw">self</span>.<span class="fn">_select_text_splitter</span>()
+        <span class="k">if</span> <span class="kw">self</span>._splitter_type == SplitterType.LANGCHAIN:
+            documents = text_splitter.<span class="fn">split_documents</span>(documents)
+            <span class="k">return</span> [Chunk.<span class="fn">langchain2chunk</span>(d) <span class="k">for</span> d <span class="k">in</span> documents]
+        <span class="k">elif</span> <span class="kw">self</span>._splitter_type == SplitterType.LLAMA_INDEX:
+            nodes = text_splitter.<span class="fn">split_documents</span>(documents)
+            <span class="k">return</span> [Chunk.<span class="fn">llamaindex2chunk</span>(n) <span class="k">for</span> n <span class="k">in</span> nodes]
+        <span class="k">else</span>:
+            <span class="k">return</span> text_splitter.<span class="fn">split_documents</span>(documents)</code></pre>
+
+  <div class="callout">
+    <strong>三种 Splitter 生态：</strong>ChunkManager 支持三种后端 —— <code>LANGCHAIN</code>（LangChain splitter）、
+    <code>LLAMA_INDEX</code>（LlamaIndex splitter）、<code>USER_DEFINE</code>（DB-GPT 自带的 TextSplitter）。
+    默认用自带实现，但可以通过 <code>SplitterType</code> 切换到其它生态的分块器。
+  </div>
+
+  <p>分块参数通过 <code>ChunkParameters</code>（一个 Pydantic Model）统一管理。
+    它被注册为 AWEL 资源（<code>@register_resource("Chunk Parameters", "chunk_parameters", ...)</code>），
+    所以可以在可视化编排 UI 中作为参数面板使用。核心参数包括 <code>chunk_size</code>（默认 512）、
+    <code>chunk_overlap</code>（默认 50，表示相邻 chunk 的重叠字符数，用于避免在关键句子中间切断）。
+    <code>separator</code> 用于 CHUNK_BY_SEPARATOR 和 CHUNK_BY_PARAGRAPH 策略，
+    <code>enable_merge</code> 控制按分隔符切完后是否要再按 chunk_size 合并小片段。</p>
+
+  <p>选对分块策略对 RAG 效果影响巨大。经验法则：长文档（PDF/Word）用 CHUNK_BY_SIZE 递归切；
+    结构化数据（CSV/JSON）用 CHUNK_BY_SEPARATOR 按记录切；Markdown 用 CHUNK_BY_MARKDOWN_HEADER 按标题层级切；
+    页面清晰的 PDF 可以用 CHUNK_BY_PAGE。如果不确定，用默认的 CHUNK_BY_SIZE 是最安全的选择。</p>
+
+  <!-- ===================== 4. Embedding ===================== -->
+  <h2 id="embedding">四、第二层：Embedding —— 向量化</h2>
+  <p>文件：<code>dbgpt-core/src/dbgpt/core/interface/embeddings.py</code></p>
+  <p><code>Embeddings</code> 是 Embedding 模型的核心抽象，只有两个必须实现的方法：</p>
+  <pre><code><span class="k">class</span> <span class="type">Embeddings</span>(ABC):
+    <span class="com">"""Interface for embedding models."""</span>
+
+    <span class="kw">@abstractmethod</span>
+    <span class="k">def</span> <span class="fn">embed_documents</span>(<span class="kw">self</span>, texts: List[str]) -> List[List[float]]:
+        <span class="com">"""Embed search docs."""</span>
+
+    <span class="kw">@abstractmethod</span>
+    <span class="k">def</span> <span class="fn">embed_query</span>(<span class="kw">self</span>, text: str) -> List[float]:
+        <span class="com">"""Embed query text."""</span>
+
+    <span class="com"># 异步默认实现：用线程池包装同步方法</span>
+    <span class="k">async</span> <span class="k">def</span> <span class="fn">aembed_documents</span>(<span class="kw">self</span>, texts):
+        <span class="kw">return await</span> asyncio.<span class="fn">get_running_loop</span>().<span class="fn">run_in_executor</span>(
+            <span class="kw">None</span>, <span class="kw">self</span>.embed_documents, texts
+        )</code></pre>
+
+  <p>接口极度简洁：<code>embed_documents</code> 用于批量向量化文档，<code>embed_query</code> 用于向量化查询语句。
+    两者可能用不同的 instruction（如 BGE 模型查询时要加前缀）。</p>
+
+  <h3>Embedding 实现家族</h3>
+  <p>文件：<code>dbgpt-core/src/dbgpt/rag/embedding/embeddings.py</code></p>
+  <table>
+    <thead><tr><th>实现类</th><th>provider</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>HuggingFaceEmbeddings</code></td><td>hf</td><td>基于 sentence_transformers，默认 all-mpnet-base-v2</td></tr>
+      <tr><td><code>HuggingFaceInstructEmbeddings</code></td><td>hf (instructor)</td><td>Instructor 模型，支持自定义 instruction</td></tr>
+      <tr><td><code>HuggingFaceBgeEmbeddings</code></td><td>hf (bge)</td><td>BGE 模型，中英文自动切换 query instruction</td></tr>
+      <tr><td><code>HuggingFaceInferenceAPIEmbeddings</code></td><td>hf (api)</td><td>调 HuggingFace Inference API</td></tr>
+      <tr><td><code>OpenAPIEmbeddings</code></td><td>proxy/openai</td><td>OpenAI 兼容 API（含 DB-GPT 自建 APIServer）</td></tr>
+    </tbody>
+  </table>
+  <p>ext 层还提供了 <code>JinaEmbeddings</code> / <code>OllamaEmbeddings</code> / <code>QianfanEmbeddings</code> /
+    <code>SiliconFlowEmbeddings</code> / <code>TongyiEmbeddings</code> / <code>AimlApiEmbeddings</code> 等厂商实现。</p>
+
+  <p>以 <code>HuggingFaceBgeEmbeddings</code> 为例，看 query 与 document 的向量化差异：</p>
+  <pre><code><span class="k">class</span> <span class="type">HuggingFaceBgeEmbeddings</span>(BaseModel, Embeddings):
+    query_instruction: str = DEFAULT_QUERY_BGE_INSTRUCTION_EN
+    <span class="com"># "Represent this question for searching relevant passages: "</span>
+
+    <span class="k">def</span> <span class="fn">embed_documents</span>(<span class="kw">self</span>, texts):
+        texts = [t.<span class="fn">replace</span>(<span class="s">"\n"</span>, <span class="s">" "</span>) <span class="k">for</span> t <span class="k">in</span> texts]
+        embeddings = <span class="kw">self</span>.client.<span class="fn">encode</span>(texts, **<span class="kw">self</span>.encode_kwargs)
+        <span class="kw">return</span> embeddings.<span class="fn">tolist</span>()
+
+    <span class="k">def</span> <span class="fn">embed_query</span>(<span class="kw">self</span>, text):
+        text = text.<span class="fn">replace</span>(<span class="s">"\n"</span>, <span class="s">" "</span>)
+        embedding = <span class="kw">self</span>.client.<span class="fn">encode</span>(
+            <span class="kw">self</span>.query_instruction + text,  <span class="com"># 查询时加 instruction 前缀！</span>
+            **<span class="kw">self</span>.encode_kwargs
+        )
+        <span class="kw">return</span> embedding.<span class="fn">tolist</span>()</code></pre>
+
+  <div class="callout warn">
+    <strong>易错点：</strong>BGE 模型的查询和文档用不同 instruction。如果忘了给 query 加前缀，
+    会导致相似度分数偏低、检索效果差。DB-GPT 还会根据 <code>-zh</code> 后缀自动切换中文 instruction。
+  </div>
+
+  <p>Embedding 层还有一个<strong>配套的抽象</strong>：<code>RerankEmbeddings</code>（同样在 <code>embeddings.py</code> 中）。
+    它只有一个方法 <code>predict(query, candidates) -> List[float]</code>，用于给 query-candidate 对打分。
+    这和 <code>Embeddings</code> 的区别是：<code>Embeddings</code> 把文本变成向量（向量之间算余弦相似度），
+    而 <code>RerankEmbeddings</code> 直接接收 query 和 candidates，内部做交叉编码，输出原始分数。
+    前者是双塔模型（Bi-Encoder），后者是交叉模型（Cross-Encoder）。
+    交叉模型精度更高但速度更慢，所以通常只用于对小批量候选做精排。</p>
+
+  <p>所有 Embedding 实现都通过 <code>register_embedding_adapter</code> 注册到全局适配器注册表。
+    注册时需要提供 <code>EmbeddingModelMetadata</code>（模型名、维度、上下文长度、支持语言等），
+    这让 DB-GPT 能在启动时自动发现可用的 Embedding 模型，并在 APIServer 中暴露它们。
+    用户通过 <code>DefaultEmbeddingFactory</code> 可以根据模型名自动创建对应的 Embeddings 实例。</p>
+
+  <!-- ===================== 5. VectorStore ===================== -->
+  <h2 id="vectorstore">五、第三层：VectorStore —— 向量存储</h2>
+  <p>文件：<code>dbgpt-core/src/dbgpt/storage/base.py</code></p>
+  <p><code>IndexStoreBase</code> 是向量存储的抽象基类。它定义了写入、检索、删除的核心契约：</p>
+  <pre><code><span class="k">class</span> <span class="type">IndexStoreBase</span>(ABC):
+    <span class="com">"""Index store base class."""</span>
+
+    <span class="kw">@abstractmethod</span>
+    <span class="k">def</span> <span class="fn">load_document</span>(<span class="kw">self</span>, chunks: List[Chunk]) -> List[str]:
+        <span class="com">"""写入文档到向量库，返回 chunk ids"""</span>
+
+    <span class="kw">@abstractmethod</span>
+    <span class="k">async</span> <span class="k">def</span> <span class="fn">aload_document</span>(<span class="kw">self</span>, chunks, file_id=<span class="kw">None</span>) -> List[str]:
+        <span class="com">"""异步写入"""</span>
+
+    <span class="kw">@abstractmethod</span>
+    <span class="k">def</span> <span class="fn">similar_search_with_scores</span>(<span class="kw">self</span>, text, topk, score_threshold, filters=<span class="kw">None</span>) -> List[Chunk]:
+        <span class="com">"""带分数的相似度检索"""</span>
+
+    <span class="kw">@abstractmethod</span>
+    <span class="k">def</span> <span class="fn">delete_by_ids</span>(<span class="kw">self</span>, ids: str) -> List[str]:
+        <span class="com">"""按 id 删除"""</span>
+
+    <span class="k">def</span> <span class="fn">similar_search</span>(<span class="kw">self</span>, text, topk, filters=<span class="kw">None</span>) -> List[Chunk]:
+        <span class="com">"""不带分数的检索 = similar_search_with_scores(threshold=1.0)"""</span>
+        <span class="kw">return</span> <span class="kw">self</span>.<span class="fn">similar_search_with_scores</span>(text, topk, <span class="n">1.0</span>, filters)
+
+    <span class="k">def</span> <span class="fn">full_text_search</span>(<span class="kw">self</span>, text, topk, filters=<span class="kw">None</span>) -> List[Chunk]:
+        <span class="com">"""全文检索（可选实现）"""</span>
+        <span class="k">raise</span> <span class="fn">NotImplementedError</span>(...)  <span class="com"># 不是所有向量库都支持</span></code></pre>
+
+  <p><code>IndexStoreBase</code> 还内置了<strong>分批写入</strong>和<strong>容错</strong>能力：</p>
+  <pre><code><span class="k">def</span> <span class="fn">load_document_with_limit</span>(<span class="kw">self</span>, chunks, max_chunks_once_load=<span class="kw">None</span>, max_threads=<span class="kw">None</span>):
+    <span class="com"># 把 chunks 按 max_chunks_once_load 分组</span>
+    chunk_groups = [chunks[i:i+max_chunks_once_load]
+                    <span class="k">for</span> i <span class="k">in</span> <span class="fn">range</span>(<span class="n">0</span>, <span class="fn">len</span>(chunks), max_chunks_once_load)]
+    <span class="k">with</span> <span class="fn">ThreadPoolExecutor</span>(max_workers=max_threads) <span class="k">as</span> executor:
+        tasks = [executor.<span class="fn">submit</span>(<span class="kw">self</span>._safe_load_group, group) <span class="k">for</span> group <span class="k">in</span> chunk_groups]
+        <span class="k">for</span> future <span class="k">in</span> tasks:
+            ids.<span class="fn">extend</span>(future.<span class="fn">result</span>())
+    <span class="kw">return</span> ids
+
+<span class="k">def</span> <span class="fn">_safe_load_group</span>(<span class="kw">self</span>, chunk_group):
+    <span class="com"># 先整组写入，失败则逐条重试，跳过真正的坏数据</span>
+    <span class="k">try</span>:
+        <span class="kw">return</span> <span class="kw">self</span>.<span class="fn">load_document</span>(chunk_group)
+    <span class="k">except</span> Exception:
+        ids = []
+        <span class="k">for</span> chunk <span class="k">in</span> chunk_group:
+            <span class="k">try</span>:
+                ids.<span class="fn">extend</span>(<span class="kw">self</span>.<span class="fn">load_document</span>([chunk]))
+            <span class="k">except</span> Exception:
+                <span class="fn">logger</span>.<span class="fn">warning</span>(<span class="s">f"Skipping bad chunk"</span>)
+        <span class="kw">return</span> ids</code></pre>
+
+  <div class="callout">
+    <strong>生产级容错：</strong>FP16 量化模型在个别 chunk 上可能产生 NaN，导致整批写入失败。
+    <code>_safe_load_group</code> 先整组试，失败后退化为逐条写入，只丢弃真正有问题的 chunk，
+    而不是让整个索引任务失败。这是工程上非常实用的防御策略。
+  </div>
+
+  <p>值得注意的是，<code>IndexStoreBase</code> 还提供了 <code>full_text_search</code> 和
+    <code>is_support_full_text_search</code> 两个方法。全文检索（BM25 / TF-IDF）是向量检索的补充，
+    适合精确关键词匹配场景（如产品编号、人名）。不是所有向量库都内置了全文检索能力，
+    所以基类默认抛 <code>NotImplementedError</code>，由具体实现按需覆盖。
+    这为 <strong>Hybrid Retrieval</strong>（混合检索）提供了基础设施 ——
+    同时跑向量检索和全文检索，再用 RRF 或加权融合结果，兼顾语义相似和关键词精确匹配。</p>
+
+  <h3>ext 层 VectorStore 实现</h3>
+  <table>
+    <thead><tr><th>实现类</th><th>__type__</th><th>特点</th></tr></thead>
+    <tbody>
+      <tr><td><code>ChromaStore</code></td><td>chroma</td><td>默认轻量级，嵌入式 SQLite + DuckDB，开发首选</td></tr>
+      <tr><td><code>MilvusStore</code></td><td>milvus</td><td>分布式向量库，生产推荐</td></tr>
+      <tr><td><code>PGVectorStore</code></td><td>pgvector</td><td>PostgreSQL + pgvector 扩展</td></tr>
+      <tr><td><code>FaissStore</code></td><td>faiss</td><td>Facebook 高性能向量检索</td></tr>
+      <tr><td><code>WeaviateStore</code></td><td>weaviate</td><td>支持 GraphQL 的向量搜索引擎</td></tr>
+      <tr><td><code>OceanBaseStore</code></td><td>oceanbase</td><td>OceanBase 向量能力</td></tr>
+      <tr><td><code>ElasticSearchStore</code></td><td>elasticsearch</td><td>ES 8.x 向量检索</td></tr>
+      <tr><td><code>QdrantStore</code></td><td>qdrant</td><td>Qdrant 向量数据库</td></tr>
+      <tr><td><code>ValkeyStore</code></td><td>valkey</td><td>Valkey/Redis 向量存储</td></tr>
+    </tbody>
+  </table>
+
+  <p>ChromaStore 构造示例（ext 层）：</p>
+  <pre><code><span class="kw">@register_resource</span>(<span class="s">_("Chroma Vector Store")</span>, <span class="s">"chroma_vector_store"</span>,
+                   category=ResourceCategory.VECTOR_STORE)
+<span class="k">class</span> <span class="type">ChromaStore</span>(VectorStoreBase):
+    <span class="com">"""Chroma vector store."""</span>
+
+    <span class="k">def</span> <span class="fn">__init__</span>(<span class="kw">self</span>, vector_store_config: ChromaVectorConfig, name, embedding_fn=<span class="kw">None</span>, ...):
+        <span class="fn">super</span>().<span class="fn">__init__</span>(max_chunks_once_load=max_chunks_once_load, ...)
+        <span class="k">from</span> chromadb <span class="k">import</span> PersistentClient, Settings
+        chroma_path = vector_store_config.<span class="fn">to_dict</span>().<span class="fn">get</span>(<span class="s">"persist_path"</span>, ...)
+        <span class="kw">self</span>.persist_dir = <span class="fn">os</span>.path.<span class="fn">join</span>(resolve_root_path(chroma_path) + <span class="s">"/chromadb"</span>)
+        <span class="kw">self</span>.collection = chroma_client.<span class="fn">get_or_create_collection</span>(name=name, ...)</code></pre>
+
+  <!-- ===================== 6. Retriever ===================== -->
+  <h2 id="retriever">六、第四层：Retriever —— 召回与打分</h2>
+  <p>文件：<code>dbgpt-core/src/dbgpt/rag/retriever/base.py</code></p>
+  <p><code>BaseRetriever</code> 定义了检索的模板方法：<code>retrieve()</code> 是公开 API，
+    <code>_retrieve()</code> 是子类实现的私有方法。</p>
+  <pre><code><span class="k">class</span> <span class="type">BaseRetriever</span>(ABC):
+    <span class="com">"""Base retriever."""</span>
+
+    <span class="k">def</span> <span class="fn">retrieve</span>(<span class="kw">self</span>, query: str, filters=<span class="kw">None</span>) -> List[Chunk]:
+        <span class="com">"""公开 API：检索（不带分数）"""</span>
+        <span class="kw">return</span> <span class="kw">self</span>.<span class="fn">_retrieve</span>(query, filters)
+
+    <span class="k">def</span> <span class="fn">retrieve_with_scores</span>(<span class="kw">self</span>, query, score_threshold, filters=<span class="kw">None</span>):
+        <span class="com">"""公开 API：检索（带分数 + 阈值过滤）"""</span>
+        <span class="kw">return</span> <span class="kw">self</span>.<span class="fn">_retrieve_with_score</span>(query, score_threshold, filters)
+
+    <span class="kw">@abstractmethod</span>
+    <span class="k">def</span> <span class="fn">_retrieve</span>(<span class="kw">self</span>, query, filters=<span class="kw">None</span>) -> List[Chunk]:
+        <span class="com">"""子类实现"""</span>
+
+    <span class="kw">@abstractmethod</span>
+    <span class="k">def</span> <span class="fn">_retrieve_with_score</span>(<span class="kw">self</span>, query, score_threshold, filters=<span class="kw">None</span>) -> List[Chunk]:
+        <span class="com">"""子类实现：带分数 + 阈值过滤"""</span></code></pre>
+
+  <p>检索策略通过 <code>RetrieverStrategy</code> 枚举管理：</p>
+  <pre><code><span class="k">class</span> <span class="type">RetrieverStrategy</span>(str, Enum):
+    EMBEDDING = <span class="s">"embedding"</span>  <span class="com"># 语义向量检索</span>
+    SEMANTIC = <span class="s">"semantic"</span>
+    GRAPH = <span class="s">"graph"</span>       <span class="com"># 知识图谱检索</span>
+    Tree = <span class="s">"tree"</span>           <span class="com"># 树状层级检索</span>
+    KEYWORD = <span class="s">"keyword"</span>     <span class="com"># 关键词检索（BM25）</span>
+    HYBRID = <span class="s">"hybrid"</span>       <span class="com"># 混合检索</span></code></pre>
+
+  <h3>EmbeddingRetriever 精读</h3>
+  <p>文件：<code>dbgpt-core/src/dbgpt/rag/retriever/embedding.py</code></p>
+  <pre><code><span class="k">class</span> <span class="type">EmbeddingRetriever</span>(BaseRetriever):
+    <span class="k">def</span> <span class="fn">__init__</span>(<span class="kw">self</span>, index_store, top_k=<span class="n">4</span>, query_rewrite=<span class="kw">None</span>, rerank=<span class="kw">None</span>,
+                 retrieve_strategy=RetrieverStrategy.EMBEDDING):
+        <span class="kw">self</span>._top_k = top_k
+        <span class="kw">self</span>._query_rewrite = query_rewrite
+        <span class="kw">self</span>._index_store = index_store
+        <span class="kw">self</span>._rerank = rerank <span class="kw">or</span> <span class="fn">DefaultRanker</span>(<span class="kw">self</span>._top_k)
+
+    <span class="k">def</span> <span class="fn">_retrieve_with_score</span>(<span class="kw">self</span>, query, score_threshold, filters=<span class="kw">None</span>):
+        queries = [query]
+        <span class="com"># 1. 多查询召回（如果有 query_rewrite 会先改写再搜索）</span>
+        candidates_with_score = [
+            <span class="kw">self</span>._index_store.<span class="fn">similar_search_with_scores</span>(
+                query, <span class="kw">self</span>._top_k, score_threshold, filters
+            )
+            <span class="k">for</span> query <span class="k">in</span> queries
+        ]
+        <span class="com"># 2. 合并多个查询的召回结果</span>
+        new_candidates = <span class="fn">reduce</span>(<span class="k">lambda</span> x, y: x + y, candidates_with_score)
+        <span class="com"># 3. 重排（去重 + 按分数排序 + 取 top_k）</span>
+        new_candidates = <span class="kw">self</span>._rerank.<span class="fn">rank</span>(new_candidates, query)
+        <span class="kw">return</span> new_candidates</code></pre>
+
+  <div class="callout tip">
+    <strong>score_threshold 的语义：</strong>分数小于阈值的 chunk 会被<em>过滤掉</em>。
+    默认阈值 <code>0.3</code>（在 Operator 层定义）。不同向量库的分数含义不同 ——
+    Chroma 返回的是距离（越小越相似），Milvus 返回的是相似度（越大越相似）。
+    DB-GPT 在各 VectorStore 实现内部做了统一化处理。
+  </div>
+
+  <p><code>EmbeddingRetriever</code> 默认使用 <code>DefaultRanker</code> 做重排（如果不显式传 rerank 参数）。
+    这意味着<em>即使你不配置 Reranker，检索结果也会经过去重和按分数排序</em>。
+    如果你想要更强的重排效果，可以传入 <code>CrossEncoderRanker</code> 或 <code>RerankEmbeddingsRanker</code>。
+    <code>top_k</code> 参数控制<em>召回</em>数量（从向量库取多少条），而 Ranker 的 <code>topk</code> 控制<em>输出</em>数量
+    （重排后保留多少条）。典型配置是召回 top-20、重排后取 top-3。</p>
+
+  <h3>异步检索与 Query Rewrite</h3>
+  <p><code>_aretrieve_with_score</code> 支持先做一次检索拿 context，再用 LLM 改写查询，然后重新检索：</p>
+  <pre><code><span class="k">async</span> <span class="k">def</span> <span class="fn">_aretrieve_with_score</span>(<span class="kw">self</span>, query, score_threshold, filters=<span class="kw">None</span>):
+    queries = [query]
+    <span class="k">if</span> <span class="kw">self</span>._query_rewrite:
+        <span class="com"># 先用原查询检索，拿到 context</span>
+        chunks = <span class="k">await</span> <span class="kw">self</span>.<span class="fn">_run_async_tasks</span>([...])
+        context = <span class="s">"\n"</span>.<span class="fn">join</span>([chunk.content <span class="k">for</span> chunk <span class="k">in</span> chunks])
+        <span class="com"># 让 LLM 根据上下文改写查询</span>
+        new_queries = <span class="k">await</span> <span class="kw">self</span>._query_rewrite.<span class="fn">rewrite</span>(
+            origin_query=query, context=context, nums=<span class="n">1</span>
+        )
+        queries.<span class="fn">extend</span>(new_queries)  <span class="com"># 改写后的查询加入列表</span>
+
+    <span class="com"># 多查询并行检索，合并结果</span>
+    candidates = [<span class="kw">self</span>.<span class="fn">_similarity_search_with_score</span>(q, ...) <span class="k">for</span> q <span class="k">in</span> queries]
+    <span class="com"># 重排</span>
+    <span class="kw">return await</span> <span class="kw">self</span>._rerank.<span class="fn">arank</span>(merged_candidates, query)</code></pre>
+
+  <!-- ===================== 7. Reranker ===================== -->
+  <h2 id="reranker">七、第五层：Reranker —— 重排</h2>
+  <p>文件：<code>dbgpt-core/src/dbgpt/rag/retriever/rerank.py</code></p>
+  <p><code>Ranker</code> 是重排的抽象基类：</p>
+  <pre><code><span class="k">class</span> <span class="type">Ranker</span>(ABC):
+    <span class="k">def</span> <span class="fn">__init__</span>(<span class="kw">self</span>, topk: int, rank_fn=<span class="kw">None</span>):
+        <span class="kw">self</span>.topk = topk
+        <span class="kw">self</span>.rank_fn = rank_fn
+
+    <span class="kw">@abstractmethod</span>
+    <span class="k">def</span> <span class="fn">rank</span>(<span class="kw">self</span>, candidates_with_scores, query=<span class="kw">None</span>) -> List[Chunk]:
+        <span class="com">"""返回 top k chunks"""</span>
+
+    <span class="k">def</span> <span class="fn">_filter</span>(<span class="kw">self</span>, candidates_with_scores) -> List[Chunk]:
+        <span class="com">"""去重：按 content 去重，按 score 降序"""</span>
+        candidates = <span class="fn">sorted</span>(candidates_with_scores, key=<span class="k">lambda</span> x: x.score, reverse=<span class="kw">True</span>)
+        visited_docs = <span class="fn">set</span>()
+        new_candidates = []
+        <span class="k">for</span> c <span class="k">in</span> candidates:
+            <span class="k">if</span> c.content <span class="kw">not in</span> visited_docs:
+                new_candidates.<span class="fn">append</span>(c)
+                visited_docs.<span class="fn">add</span>(c.content)
+        <span class="kw">return</span> new_candidates</code></pre>
+
+  <h3>Ranker 实现家族</h3>
+  <table>
+    <thead><tr><th>Ranker</th><th>算法</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td><code>DefaultRanker</code></td><td>按 score 降序 + 去重</td><td>最简单，不需要额外模型</td></tr>
+      <tr><td><code>RRFRanker</code></td><td>Reciprocal Rank Fusion</td><td>多路召回融合（预留实现）</td></tr>
+      <tr><td><code>CrossEncoderRanker</code></td><td>CrossEncoder（如 BAAI/bge-reranker-base）</td><td>用 query-doc 对做交叉编码，效果最好但慢</td></tr>
+      <tr><td><code>RerankEmbeddingsRanker</code></td><td>RerankEmbeddings 接口</td><td>抽象的 rerank 模型接口，支持 API 调用</td></tr>
+      <tr><td><code>RetrieverNameRanker</code></td><td>按 retriever 名过滤</td><td>多路召回时只保留指定 retriever 的结果</td></tr>
+    </tbody>
+  </table>
+
+  <p>CrossEncoderRanker 的核心逻辑：</p>
+  <pre><code><span class="k">class</span> <span class="type">CrossEncoderRanker</span>(Ranker):
+    <span class="k">def</span> <span class="fn">__init__</span>(<span class="kw">self</span>, topk=<span class="n">4</span>, model=<span class="s">"BAAI/bge-reranker-base"</span>, device=<span class="s">"cpu"</span>, ...):
+        <span class="k">from</span> sentence_transformers <span class="k">import</span> CrossEncoder
+        <span class="kw">self</span>._model = <span class="fn">CrossEncoder</span>(model, max_length=<span class="n">512</span>, device=device)
+
+    <span class="k">def</span> <span class="fn">rank</span>(<span class="kw">self</span>, candidates_with_scores, query=<span class="kw">None</span>) -> List[Chunk]:
+        <span class="k">if</span> <span class="fn">len</span>(candidates_with_scores) <= <span class="n">1</span>:
+            <span class="kw">return</span> candidates_with_scores
+        <span class="com"># 把 query 和每个 chunk 拼成 [query, doc] 对</span>
+        query_content_pairs = [[query, c.content] <span class="k">for</span> c <span class="k">in</span> candidates_with_scores]
+        <span class="com"># CrossEncoder 打分</span>
+        rank_scores = <span class="kw">self</span>._model.<span class="fn">predict</span>(sentences=query_content_pairs)
+        <span class="com"># 用新分数覆盖，排序，取 top_k</span>
+        <span class="k">for</span> candidate, score <span class="k">in</span> <span class="fn">zip</span>(candidates_with_scores, rank_scores):
+            candidate.score = <span class="fn">float</span>(score)
+        new_candidates = <span class="fn">sorted</span>(candidates_with_scores, key=<span class="k">lambda</span> x: x.score, reverse=<span class="kw">True</span>)
+        <span class="kw">return</span> new_candidates[:<span class="kw">self</span>.topk]</code></pre>
+
+  <div class="callout">
+    <strong>双阶段检索：</strong>Embedding 检索是"双塔模型"（query 和 doc 独立编码，用余弦相似度），
+    速度快但精度有限。CrossEncoder 是"交互模型"（query 和 doc 拼在一起送入模型），
+    精度高但慢。所以典型流程是：先用 Embedding 粗召 top-20，再用 CrossEncoder 精排取 top-3。
+  </div>
+
+  <p>除了重排算法，DB-GPT 还提供了 <strong>Query Rewrite</strong>（查询改写）机制。
+    <code>QueryRewrite</code> 类（<code>dbgpt/rag/retriever/rewrite.py</code>）用 LLM 根据上下文改写原始查询，
+    生成 N 个相关的新查询。这些新查询会被分别用于检索，结果合并后再重排。
+    这对于<strong>多轮对话</strong>场景特别重要 —— 用户可能在第二轮说"那它的价格呢？"，
+    这时需要根据上下文把"它"指代消解，改写成完整查询再检索。
+    中英文 prompt 模板都已内置（<code>REWRITE_PROMPT_TEMPLATE_EN/ZH</code>）。</p>
+
+  <!-- ===================== 8. AWEL Operators ===================== -->
+  <h2 id="operators">八、AWEL Operator 化：把 RAG 拼成 DAG</h2>
+  <p>这是 DB-GPT RAG 设计中<strong>最关键</strong>的一步。每一层都被封装成 AWEL Operator，
+    可以在 DAG 中自由编排。</p>
+
+  <h3>核心 RAG Operator 清单</h3>
+  <table>
+    <thead><tr><th>Operator</th><th>继承自</th><th>输入 → 输出</th><th>作用</th></tr></thead>
+    <tbody>
+      <tr><td><code>KnowledgeOperator</code></td><td>MapOperator</td><td>dict → Knowledge</td><td>根据 datasource 创建 Knowledge 对象</td></tr>
+      <tr><td><code>ChunkManagerOperator</code></td><td>MapOperator</td><td>Knowledge → List[Chunk]</td><td>加载文档 + 分块</td></tr>
+      <tr><td><code>VectorStorageOperator</code></td><td>MapOperator</td><td>List[Chunk] → List[Chunk]</td><td>写入向量库（返回带 id 的 chunks）</td></tr>
+      <tr><td><code>EmbeddingAssemblerOperator</code></td><td>AssemblerOperator</td><td>Knowledge → List[Chunk]</td><td>一步完成 加载+分块+写入向量库</td></tr>
+      <tr><td><code>EmbeddingRetrieverOperator</code></td><td>RetrieverOperator</td><td>str → List[Chunk]</td><td>从向量库检索候选</td></tr>
+      <tr><td><code>RerankOperator</code></td><td>MapOperator</td><td>List[Chunk] → List[Chunk]</td><td>重排候选</td></tr>
+      <tr><td><code>QueryRewriteOperator</code></td><td>MapOperator</td><td>dict → List[str]</td><td>用 LLM 改写查询</td></tr>
+      <tr><td><code>ChunksToStringOperator</code></td><td>MapOperator</td><td>List[Chunk] → str</td><td>把 chunks 拼成 prompt 文本</td></tr>
+      <tr><td><code>RetrieverEvaluatorOperator</code></td><td>JoinOperator</td><td>(query, chunks, contexts) → 评估结果</td><td>评估检索质量</td></tr>
+    </tbody>
+  </table>
+
+  <h3>EmbeddingRetrieverOperator 精读</h3>
+  <p>文件：<code>dbgpt-ext/src/dbgpt_ext/rag/operators/embedding.py</code></p>
+  <pre><code><span class="k">class</span> <span class="type">EmbeddingRetrieverOperator</span>(RetrieverOperator[Union[str, List[str]], List[Chunk]]):
+    <span class="com">"""The Embedding Retriever Operator."""</span>
+
+    metadata = <span class="fn">ViewMetadata</span>(
+        label=<span class="s">"Embedding Retriever Operator"</span>,
+        name=<span class="s">"embedding_retriever_operator"</span>,
+        category=OperatorCategory.RAG,
+        parameters=[
+            <span class="fn">Parameter</span>.<span class="fn">build_from</span>(<span class="s">"Storage Index Store"</span>, <span class="s">"index_store"</span>, IndexStoreBase, ...),
+            <span class="fn">Parameter</span>.<span class="fn">build_from</span>(<span class="s">"Top K"</span>, <span class="s">"top_k"</span>, <span class="fn">int</span>, ...),
+            <span class="fn">Parameter</span>.<span class="fn">build_from</span>(<span class="s">"Score Threshold"</span>, <span class="s">"score_threshold"</span>, <span class="fn">float</span>,
+                            default=<span class="n">0.3</span>, ...),
+            <span class="fn">Parameter</span>.<span class="fn">build_from</span>(<span class="s">"Query Rewrite"</span>, <span class="s">"query_rewrite"</span>, QueryRewrite, optional=<span class="kw">True</span>, ...),
+            <span class="fn">Parameter</span>.<span class="fn">build_from</span>(<span class="s">"Rerank"</span>, <span class="s">"rerank"</span>, Ranker, optional=<span class="kw">True</span>, ...),
+        ],
+        inputs=[<span class="fn">IOField</span>.<span class="fn">build_from</span>(<span class="s">"Query"</span>, <span class="s">"query"</span>, <span class="fn">str</span>, ...)],
+        outputs=[<span class="fn">IOField</span>.<span class="fn">build_from</span>(<span class="s">"Candidates"</span>, <span class="s">"candidates"</span>, Chunk, is_list=<span class="kw">True</span>, ...)],
+    )
+
+    <span class="k">def</span> <span class="fn">__init__</span>(<span class="kw">self</span>, index_store, top_k, score_threshold=<span class="n">0.3</span>,
+                 query_rewrite=<span class="kw">None</span>, rerank=<span class="kw">None</span>, **kwargs):
+        <span class="fn">super</span>().<span class="fn">__init__</span>(**kwargs)
+        <span class="kw">self</span>._score_threshold = score_threshold
+        <span class="kw">self</span>._retriever = <span class="fn">EmbeddingRetriever</span>(
+            index_store=index_store, top_k=top_k,
+            query_rewrite=query_rewrite, rerank=rerank,
+        )
+
+    <span class="k">def</span> <span class="fn">retrieve</span>(<span class="kw">self</span>, query):
+        <span class="k">if</span> <span class="fn">isinstance</span>(query, <span class="fn">str</span>):
+            <span class="kw">return</span> <span class="kw">self</span>._retriever.<span class="fn">retrieve_with_scores</span>(query, <span class="kw">self</span>._score_threshold)
+        <span class="k">elif</span> <span class="fn">isinstance</span>(query, list):
+            <span class="com"># 多查询并行检索，结果合并</span>
+            candidates = [<span class="kw">self</span>._retriever.<span class="fn">retrieve_with_scores</span>(q, <span class="kw">self</span>._score_threshold)
+                          <span class="k">for</span> q <span class="k">in</span> query]
+            <span class="kw">return</span> <span class="fn">reduce</span>(<span class="k">lambda</span> x, y: x + y, candidates)</code></pre>
+
+  <div class="callout">
+    <strong>ViewMetadata 的意义：</strong>每个 Operator 都携带 <code>metadata</code>（标签、参数定义、输入输出类型）。
+    这让可视化编排 UI 能自动渲染节点和连线。AWEL DAG 不只是 Python 代码，它是可序列化、可拖拽的。
+  </div>
+
+  <h3>RerankOperator：最简单的 Operator</h3>
+  <pre><code><span class="k">class</span> <span class="type">RerankOperator</span>(MapOperator[List[Chunk], List[Chunk]]):
+    <span class="com">"""The Rerank Operator."""</span>
+
+    <span class="k">def</span> <span class="fn">__init__</span>(<span class="kw">self</span>, topk=<span class="n">3</span>, algorithm=<span class="s">"default"</span>, rank_fn=<span class="kw">None</span>, **kwargs):
+        <span class="fn">super</span>().<span class="fn">__init__</span>(**kwargs)
+        <span class="kw">self</span>._rerank = <span class="fn">DefaultRanker</span>(topk=topk, rank_fn=rank_fn)
+
+    <span class="k">async</span> <span class="k">def</span> <span class="fn">map</span>(<span class="kw">self</span>, candidates_with_scores: List[Chunk]) -> List[Chunk]:
+        <span class="k">return await</span> <span class="kw">self</span>.<span class="fn">blocking_func_to_async</span>(
+            <span class="kw">self</span>._rerank.<span class="fn">rank</span>, candidates_with_scores
+        )</code></pre>
+
+  <!-- ===================== 9. 评估 ===================== -->
+  <h2 id="evaluation">九、评估器：RetrieverEvaluator</h2>
+  <p>文件：<code>dbgpt-core/src/dbgpt/rag/evaluation/retriever.py</code></p>
+  <p>DB-GPT 内置了三种检索质量评估指标：</p>
+  <table>
+    <thead><tr><th>指标</th><th>含义</th><th>计算方式</th></tr></thead>
+    <tbody>
+      <tr><td><code>RetrieverSimilarityMetric</code></td><td>余弦相似度</td><td>用 Embedding 计算预测与标准答案的余弦相似度均值</td></tr>
+      <tr><td><code>RetrieverMRRMetric</code></td><td>MRR（Mean Reciprocal Rank）</td><td>1/rank，第一个相关文档的位置倒数</td></tr>
+      <tr><td><code>RetrieverHitRateMetric</code></td><td>命中率</td><td>top-k 中是否包含正确答案（0 或 1）</td></tr>
+    </tbody>
+  </table>
+
+  <p>评估器本身就是一条 AWEL DAG：</p>
+  <pre><code><span class="k">async</span> <span class="k">def</span> <span class="fn">evaluate</span>(<span class="kw">self</span>, dataset, metrics=<span class="kw">None</span>, ...):
+    <span class="k">with</span> <span class="fn">DAG</span>(<span class="s">"relevancy_evaluation_dag"</span>):
+        input_task = <span class="fn">IteratorTrigger</span>(dataset)
+        query_task = <span class="fn">MapOperator</span>(<span class="k">lambda</span> x: x[<span class="s">"query"</span>])
+        retriever_task = <span class="kw">self</span>._operator_cls(**<span class="kw">self</span>._operator_kwargs)
+        retriever_eva_task = <span class="fn">RetrieverEvaluatorOperator</span>(
+            evaluation_metrics=metrics, llm_client=<span class="kw">self</span>.llm_client
+        )
+        <span class="com"># 构建 DAG 连线</span>
+        input_task >> query_task
+        query_task >> retriever_eva_task        <span class="com"># query 送入评估器</span>
+        query_task >> retriever_task >> retriever_eva_task  <span class="com"># query → 检索 → 评估器</span>
+        input_task >> <span class="fn">MapOperator</span>(<span class="k">lambda</span> x: x[<span class="s">"contexts"</span>]) >> retriever_eva_task
+        input_task >> retriever_eva_task        <span class="com"># 原始数据也送入</span>
+
+    results = <span class="k">await</span> input_task.<span class="fn">trigger</span>(parallel_num=parallel_num)
+    <span class="kw">return</span> [item <span class="k">for</span> _, item <span class="k">in</span> results]</code></pre>
+
+  <div class="callout tip">
+    <strong>评估也是 DAG：</strong><code>RetrieverEvaluatorOperator</code> 是一个 <code>JoinOperator</code>，
+    它同时接收 query、检索结果（prediction）、标准答案（contexts），然后并行计算多个指标。
+    整个评估过程通过 <code>IteratorTrigger</code> 流式触发数据集。
+  </div>
+
+  <p>评估器的用法非常直观：你只需要准备一个数据集（包含 query 和标准答案 contexts），
+    传入 <code>RetrieverEvaluator</code>，它就会自动构建一条 DAG 来并行评估。
+    默认指标是 <code>RetrieverSimilarityMetric</code>（余弦相似度），
+    你也可以传入自定义指标列表（比如同时跑 MRR + HitRate + Similarity）。
+    <code>parallel_num</code> 参数控制并发评估数。这种"评估即 DAG"的设计，
+    让你可以把评估<em>嵌入</em>到 CI/CD 流程中 —— 每次切换 Embedding 模型或调整 chunk 策略后，
+    自动跑一遍评估集，确保检索质量没有退化。</p>
+
+  <p>除了检索评估，DB-GPT 在 <code>dbgpt/rag/evaluation/answer.py</code> 中还提供了
+    <strong>答案评估</strong>能力（<code>AnswerRelevancyMetric</code>），
+    用于评估最终生成的回答与问题的相关性。这需要 LLM 参与（让 LLM 判断答案是否切题），
+    属于更高级的 RAG 端到端评估。</p>
+
+  <!-- ===================== 10. 端到端 ===================== -->
+  <h2 id="e2e">十、端到端：一条 RAG Pipeline 长什么样</h2>
+  <p>把前面的 Operator 串起来，一条完整的"知识库写入 + 检索"Pipeline 如下：</p>
+  <div class="mermaid">
+flowchart TD
+    KO["KnowledgeOperator\nfile_path 转 Knowledge"]
+    CMO["ChunkManagerOperator\nKnowledge 转 Chunks"]
+    VSO["VectorStorageOperator\nChunks 写入向量库"]
+    RT["RequestTrigger\n用户 query"]
+    ERO["EmbeddingRetrieverOperator\nquery 转 Chunk 列表"]
+    RR["RerankOperator\nChunks 精排 TopK"]
+    CTS["ChunksToStringOperator\nChunks 转 prompt 文本"]
+    LLM["LLMOperator\nprompt 生成回答"]
+
+    KO --> CMO
+    CMO --> VSO
+    RT --> ERO
+    ERO --> RR
+    RR --> CTS
+    CTS --> LLM
+    VSO -. 向量库就绪 .-> ERO
+
+    classDef offline fill:#1a2029,stroke:#4ec9b0,color:#e6e6e6
+    classDef online fill:#232b37,stroke:#569cd6,color:#e6e6e6
+    class KO,CMO,VSO offline
+    class RT,ERO,RR,CTS,LLM online
+  </div>
+
+  <p>对应的 Python 伪代码：</p>
+  <pre><code><span class="k">from</span> dbgpt.core.awel <span class="k">import</span> DAG, MapOperator
+<span class="k">from</span> dbgpt_ext.rag.operators.knowledge <span class="k">import</span> KnowledgeOperator, ChunksToStringOperator
+<span class="k">from</span> dbgpt_ext.rag.operators.embedding <span class="k">import</span> EmbeddingAssemblerOperator, EmbeddingRetrieverOperator
+<span class="k">from</span> dbgpt.rag.operators <span class="k">import</span> RerankOperator
+
+<span class="com"># ---- 离线：构建知识库 ----</span>
+<span class="k">with</span> <span class="fn">DAG</span>(<span class="s">"build_kb"</span>):
+    knowledge_task = <span class="fn">KnowledgeOperator</span>(datasource=<span class="s">"data/report.pdf"</span>)
+    assembler_task = <span class="fn">EmbeddingAssemblerOperator</span>(
+        index_store=chroma_store,
+        chunk_parameters=<span class="fn">ChunkParameters</span>(chunk_strategy=<span class="s">"CHUNK_BY_SIZE"</span>)
+    )
+    knowledge_task >> assembler_task  <span class="com"># 执行后 chunks 已写入 Chroma</span>
+
+<span class="com"># ---- 在线：查询检索 ----</span>
+<span class="k">with</span> <span class="fn">DAG</span>(<span class="s">"rag_query"</span>):
+    <span class="com"># 用户 query 直接进入检索</span>
+    retriever_task = <span class="fn">EmbeddingRetrieverOperator</span>(
+        index_store=chroma_store,
+        top_k=<span class="n">10</span>,
+        score_threshold=<span class="n">0.3</span>,
+        rerank=<span class="fn">CrossEncoderRanker</span>(topk=<span class="n">3</span>)  <span class="com"># 内置 reranker</span>
+    )
+    rerank_task = <span class="fn">RerankOperator</span>(topk=<span class="n">3</span>)
+    to_string_task = <span class="fn">ChunksToStringOperator</span>(separator=<span class="s">"\n\n"</span>)
+
+    retriever_task >> rerank_task >> to_string_task
+    <span class="com"># to_string_task 的输出直接拼入 LLM prompt</span></code></pre>
+
+  <div class="callout">
+    <strong>两阶段合一：</strong><code>EmbeddingRetrieverOperator</code> 已经内置了 reranker（通过 <code>rerank</code> 参数），
+    外面再套 <code>RerankOperator</code> 是二次重排。实际使用时二选一即可。
+    如果检索效果不够好，可以先加 <code>QueryRewriteOperator</code> 改写查询，再检索。
+  </div>
+
+  <p>除了通用的文档 RAG，DB-GPT 还为 <strong>Text-to-SQL 场景</strong>提供了专用的 Assembler 和 Retriever：
+    <code>DBSchemaAssembler</code> 和 <code>DBSchemaRetriever</code>（位于 <code>dbgpt_ext/rag/assembler/db_schema.py</code>）。
+    它们不是检索文档内容，而是检索数据库的<strong>表结构信息</strong>（表名、列名、注释、外键关系）。
+    当用户问"查询销售额前十的客户"时，LLM 需要知道有哪些表、列叫什么、怎么 JOIN，
+    这些 schema 信息通过 RAG 的方式检索最相关的部分送入 prompt，
+    而不是把整个数据库 schema 都塞进去。这是 DB-GPT 作为"数据助理"平台的核心 RAG 应用之一。</p>
+
+  <p>类似地，<code>SummaryAssembler</code>（<code>dbgpt_ext/rag/assembler/summary.py</code>）用于
+    <strong>文档摘要检索</strong> —— 先用 LLM 为每篇文档生成摘要，再把摘要向量化。
+    检索时先匹配摘要，命中后再返回完整文档。这对于长文档库特别有效，
+    因为摘要比全文更紧凑，向量匹配更准确。</p>
+
+  <h3>Assembler：Knowledge 到 VectorStore 的桥梁</h3>
+  <p>如果不想手写多步 DAG，可以用 <code>EmbeddingAssembler</code> 一步到位：</p>
+  <pre><code><span class="k">class</span> <span class="type">EmbeddingAssembler</span>(BaseAssembler):
+    <span class="com">"""Embedding Assembler."""</span>
+
+    <span class="kw">@classmethod</span>
+    <span class="k">def</span> <span class="fn">load_from_knowledge</span>(cls, knowledge, index_store, chunk_parameters=<span class="kw">None</span>,
+                            embedding_model=<span class="kw">None</span>, ...):
+        <span class="kw">return</span> <span class="fn">cls</span>(knowledge=knowledge, index_store=index_store,
+                   chunk_parameters=chunk_parameters, ...)
+
+    <span class="k">def</span> <span class="fn">persist</span>(<span class="kw">self</span>, **kwargs) -> List[str]:
+        <span class="com"># 把 chunks 分批写入向量库</span>
+        <span class="kw">return</span> <span class="kw">self</span>._index_store.<span class="fn">load_document_with_limit</span>(
+            <span class="kw">self</span>._chunks, max_chunks_once_load, max_threads
+        )
+
+    <span class="k">def</span> <span class="fn">as_retriever</span>(<span class="kw">self</span>, top_k=<span class="n">4</span>, ...) -> BaseRetriever:
+        <span class="kw">return</span> <span class="fn">EmbeddingRetriever</span>(
+            top_k=top_k, index_store=<span class="kw">self</span>._index_store, ...
+        )</code></pre>
+
+  <p><code>BaseAssembler</code> 的构造函数自动完成了"加载文档 → 分块"两步：</p>
+  <pre><code><span class="k">class</span> <span class="type">BaseAssembler</span>(ABC):
+    <span class="k">def</span> <span class="fn">__init__</span>(<span class="kw">self</span>, knowledge, chunk_parameters=<span class="kw">None</span>, extractor=<span class="kw">None</span>, **kwargs):
+        <span class="kw">self</span>._knowledge = knowledge
+        <span class="kw">self</span>._chunk_manager = <span class="fn">ChunkManager</span>(
+            knowledge=knowledge, chunk_parameter=chunk_parameters
+        )
+        <span class="kw">self</span>._chunks: List[Chunk] = []
+        <span class="kw">self</span>.<span class="fn">load_knowledge</span>(knowledge)  <span class="com"># 自动加载</span>
+
+    <span class="k">def</span> <span class="fn">load_knowledge</span>(<span class="kw">self</span>, knowledge):
+        documents = knowledge.<span class="fn">load</span>()      <span class="com"># 1. 加载文档</span>
+        <span class="kw">self</span>._chunks = <span class="kw">self</span>._chunk_manager.<span class="fn">split</span>(documents)  <span class="com"># 2. 分块</span></code></pre>
+
+  <!-- ===================== Quiz ===================== -->
+  <h2 id="quiz">十一、本章测验</h2>
+  <div class="quiz">
+    <h4>基础题</h4>
+    <ol>
+      <li>RAG 的五层架构是什么？每一层的核心抽象类叫什么？</li>
+      <li><code>Knowledge.load()</code> 方法内部调用了哪两个方法？这叫什么设计模式？</li>
+      <li><code>KnowledgeFactory</code> 是如何根据文件扩展名自动选择 Knowledge 子类的？用了什么设计模式？</li>
+    </ol>
+  </div>
+  <div class="quiz">
+    <h4>进阶题</h4>
+    <ol start="4">
+      <li><code>ChunkStrategy</code> 枚举的每个成员除了名字外还携带了什么信息？<code>match()</code> 方法做什么？</li>
+      <li><code>EmbeddingRetriever._retrieve_with_score</code> 的三个步骤是什么？score_threshold 在哪一步生效？</li>
+      <li><code>IndexStoreBase._safe_load_group</code> 的容错策略是什么？为什么需要这样做？</li>
+    </ol>
+  </div>
+  <div class="quiz">
+    <h4>设计题</h4>
+    <ol start="7">
+      <li>如果要新增一种知识源类型（比如 YAML 文件），需要实现哪些类、哪些方法？</li>
+      <li>EmbeddingRetrieverOperator 和 RerankOperator 都可以做重排，它们有什么区别？应该怎么选？</li>
+      <li>画一条"带 Query Rewrite 的 RAG 检索"DAG，需要用到哪些 Operator？</li>
+    </ol>
+  </div>
+
+  <div class="callout warn">
+    <strong>小结：</strong>DB-GPT 的 RAG 子系统是一个教科书级的"抽象 + 实现 + 编排"三层设计。
+    <ul>
+      <li><strong>抽象层</strong>（core）：5 个抽象类定义了每一层的契约</li>
+      <li><strong>实现层</strong>（ext）：11 种 Knowledge、5+ 种 Embedding、9 种 VectorStore、5 种 Ranker</li>
+      <li><strong>编排层</strong>（AWEL Operator）：9+ 个 Operator 把每一层封装成 DAG 节点</li>
+    </ul>
+    这种设计让 RAG 从"一段写死的流程"变成了"可自由组装的积木"。
+  </div>
+
+  <div class="pager">
+    <a href="04-agent.html">← 04 · Agent 系统</a>
+    <a href="06-model.html">06 · 模型层 →</a>
+  </div>
+
+</main>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: 'base',
+    themeVariables: {
+      primaryColor: '#1a2029',
+      primaryTextColor: '#e6e6e6',
+      primaryBorderColor: '#4ec9b0',
+      lineColor: '#569cd6',
+      secondaryColor: '#232b37',
+      tertiaryColor: '#0f1419',
+      textColor: '#e6e6e6',
+      fontFamily: 'JetBrains Mono, Consolas, monospace',
+      fontSize: '16px'
+    },
+    flowchart: { curve: 'basis', padding: 20, useMaxWidth: true }
+  });
+</script>
+</body>
+</html>

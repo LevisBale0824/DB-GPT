@@ -1,0 +1,1049 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>10 · Ext 扩展层 + 沙箱 + 加速器 · DB-GPT 源码精读</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="layout">
+
+<aside class="sidebar">
+  <h2>DBGPT 精读</h2>
+  <ul><li><a href="index.html">总览</a></li></ul>
+  <div class="group-title">入门</div>
+  <ul>
+    <li><a href="01-architecture.html">01 · 整体架构</a></li>
+    <li><a href="02-startup.html">02 · 启动流程</a></li>
+  </ul>
+  <div class="group-title">核心子系统</div>
+  <ul>
+    <li><a href="03-awel.html">03 · AWEL 工作流</a></li>
+    <li><a href="04-agent.html">04 · Agent 系统</a></li>
+    <li><a href="05-rag.html">05 · RAG 检索</a></li>
+    <li><a href="06-model.html">06 · 模型层</a></li>
+    <li><a href="07-datasource.html">07 · 数据源</a></li>
+  </ul>
+  <div class="group-title">应用层</div>
+  <ul>
+    <li><a href="08-scene.html">08 · Scene 场景</a></li>
+    <li><a href="09-serve.html">09 · Serve 服务</a></li>
+    <li><a href="10-ext.html" class="active">10 · Ext 扩展</a></li>
+  </ul>
+  <div class="group-title">实战</div>
+  <ul><li><a href="11-trace.html">11 · 链路追踪</a></li></ul>
+</aside>
+
+<main class="main">
+  <h1>10 · Ext 扩展层 + 沙箱 + 加速器 <span class="tag">Ext</span></h1>
+  <p class="subtitle">按需安装、插件化、沙箱隔离、GPU 加速 —— DB-GPT 如何用 extras 机制把"大而全"变成"按需装"</p>
+
+  <div class="toc">
+    <div class="toc-title">本章导览</div>
+    <ol>
+      <li><a href="#positioning">Ext 层定位：core 抽象 → ext 实现</a></li>
+      <li><a href="#extras">optional-dependencies：按需安装机制</a></li>
+      <li><a href="#datasource">数据源实现概览（10+ 种）</a></li>
+      <li><a href="#vectorstore">向量库实现概览</a></li>
+      <li><a href="#llm">LLM 适配概览（10+ 厂商）</a></li>
+      <li><a href="#rag-ext">RAG 扩展：Assembler / Retriever / Knowledge</a></li>
+      <li><a href="#vis">可视化 vis 模块</a></li>
+      <li><a href="#sandbox">沙箱 dbgpt-sandbox：代码隔离执行</a></li>
+      <li><a href="#accelerator">加速器 dbgpt-accelerator</a></li>
+      <li><a href="#plugin-guide">插件机制：怎么加一个新扩展</a></li>
+      <li><a href="#quiz">本章测验</a></li>
+    </ol>
+  </div>
+
+  <div class="callout tip">
+    <strong>一句话定位：</strong>Ext 层是 DB-GPT 的"实现仓库"——core 只定义抽象接口
+   （<code>BaseConnector</code> / <code>VectorStoreBase</code> / <code>ProxyLLMClient</code>），
+    所有具体的数据源驱动、向量库适配、LLM 厂商 SDK 对接、RAG 知识源解析器，都放在 <code>dbgpt-ext</code> 包里。
+    通过 <strong>pyproject.toml 的 optional-dependencies</strong> 机制，用户只安装自己需要的那部分依赖，
+    避免"装一个包拉半个 PyPI"的问题。
+  </div>
+
+  <!-- ===================== 1. Ext 层定位 ===================== -->
+  <h2 id="positioning">一、Ext 层定位：core 抽象 → ext 实现</h2>
+  <p>DB-GPT 的代码分为三个层次：</p>
+  <table>
+    <thead><tr><th>包</th><th>角色</th><th>典型内容</th></tr></thead>
+    <tbody>
+      <tr><td><code>dbgpt-core</code></td><td>抽象层 + 核心引擎</td><td>Interface、AWEL、Agent、Scene、Serve、Model Adapter 基类</td></tr>
+      <tr><td><code>dbgpt-ext</code></td><td>扩展实现层</td><td>数据源驱动、向量库适配、LLM 厂商、RAG 知识源、Embedding 厂商</td></tr>
+      <tr><td><code>dbgpt-sandbox</code></td><td>沙箱隔离</td><td>本地进程 / Docker / Podman / Nerdctl 容器执行</td></tr>
+      <tr><td><code>dbgpt-accelerator</code></td><td>GPU/CPU 加速</td><td>PyTorch 自动检测、vLLM、Flash Attention、量化</td></tr>
+    </tbody>
+  </table>
+
+  <p>Ext 包的目录结构一目了然：</p>
+  <pre><code>dbgpt-ext/src/dbgpt_ext/
+├── datasource/          # 数据源（MySQL/DuckDB/Spark/ClickHouse...）
+│   ├── rdbms/           # 关系型数据库（13 种）
+│   ├── conn_spark.py    # Apache Spark
+│   ├── conn_neo4j.py    # Neo4j 图数据库
+│   └── conn_tugraph.py  # TuGraph 图数据库
+├── storage/
+│   ├── vector_store/    # 向量库（Chroma/Milvus/Weaviate/PG/Qdrant/OBVector/Valkey）
+│   ├── graph_store/     # 图存储（TuGraph/Neo4j）
+│   ├── full_text/       # 全文检索（Elasticsearch/OpenSearch）
+│   ├── cache/           # 缓存（Valkey）
+│   ├── file/            # 文件存储（OSS/S3）
+│   └── knowledge_graph/ # 知识图谱
+├── rag/
+│   ├── knowledge/       # 知识源（PDF/CSV/DOCX/Markdown/HTML/PPTX/JSON/URL...）
+│   ├── assembler/       # 组装器（Embedding/BM25/DBSchema/Summary）
+│   ├── retriever/       # 检索器（向量/BM25/图检索）
+│   ├── embeddings/      # Embedding 适配（通义/Jina/Ollama/千帆/SiliconFlow）
+│   └── operators/       # AWEL 算子（将 RAG 流程 DAG 化）
+├── llms/                # LLM 扩展（空目录，实际 LLM 适配在 core 的 proxy/llms 下）
+└── connector/           # 通用连接器</code></pre>
+
+  <p>关键设计原则：<strong>ext 包只依赖 core 的抽象，不依赖任何第三方驱动</strong>。
+  所有的 <code>pymysql</code>、<code>chromadb</code>、<code>pymilvus</code> 等重依赖，
+  都放进 optional-dependencies，由用户按需安装。</p>
+
+  <!-- ===================== 2. optional-dependencies ===================== -->
+  <h2 id="extras">二、optional-dependencies：按需安装机制</h2>
+  <p><code>dbgpt-ext/pyproject.toml</code> 的 <code>[project.optional-dependencies]</code>
+  是整个扩展层的核心设计。来看实际配置（节选）：</p>
+
+  <pre><code># dbgpt-ext/pyproject.toml
+[project]
+name = "dbgpt-ext"
+version = "0.8.1"
+dependencies = [
+    "dbgpt>=0.7.0",
+    "pymysql",           # 只有 pymysql 是默认依赖
+]
+
+[project.optional-dependencies]
+# —— RAG 相关 ——
+rag = ["spacy==3.7", "markdown", "bs4", "python-pptx", "python-docx",
+       "olefile", "pypdf", "pdfplumber"]
+graph_rag = ["networkx", "dbgpt-tugraph-plugins>=0.1.1", "neo4j"]
+
+# —— 数据源（按数据库拆分） ——
+datasource_mysql = ["mysqlclient==2.1.0"]
+datasource_oracle = ["oracledb==3.1.0"]
+datasource_postgres = ["psycopg2-binary"]
+datasource_clickhouse = ["clickhouse-connect"]
+datasource_spark = ["pyspark"]
+datasource_mssql = ["pymssql"]
+datasource_hive = ["pyhive", "thrift", "thrift_sasl"]
+datasource_vertica = ["vertica-python"]
+datasource_duckdb = ["duckdb", "duckdb-engine==0.9.1"]
+
+# —— 向量库 ——
+storage_milvus = ["pymilvus"]
+storage_weaviate = ["weaviate-client"]
+storage_chromadb = ["onnxruntime>=1.14.1,<=1.18.1", "chromadb>=0.4.22"]
+storage_elasticsearch = ["elasticsearch"]
+storage_qdrant = ["qdrant-client>=1.17.1; python_version < '3.13'"]
+storage_obvector = ["pyobvector"]
+storage_valkey = ["valkey-glide>=2.3.0"]
+
+# —— 文件存储 ——
+file_oss = ["oss2"]
+file_s3 = ["boto3"]</code></pre>
+
+  <p>安装方式非常灵活：</p>
+  <pre><code># 只装 MySQL 数据源
+pip install "dbgpt-ext[datasource_mysql]"
+
+# 装 RAG + ChromaDB 向量库
+pip install "dbgpt-ext[rag,storage_chromadb]"
+
+# 全家桶（开发环境）
+pip install "dbgpt-ext[datasource_mysql,datasource_postgres,storage_milvus,\
+storage_chromadb,rag,graph_rag]"</code></pre>
+
+  <p>这种设计的好处显而易见：</p>
+  <ul>
+    <li><strong>最小依赖</strong>：只装 MySQL 的用户不需要拉 <code>chromadb</code>（它依赖 onnxruntime，几百 MB）</li>
+    <li><strong>避免冲突</strong>：不同向量库的底层依赖可能版本冲突（如 Faiss 和 Milvus 的 numpy 版本要求不同）</li>
+    <li><strong>按需启用</strong>：扩展器代码在运行时才 <code>import</code>，缺依赖时报清晰的 <code>ImportError</code></li>
+  </ul>
+
+  <div class="callout note">
+    <strong>完整的 extras 清单</strong>（共 19 个）：
+    <table>
+      <thead><tr><th>分类</th><th>extra 名</th><th>拉入的依赖</th></tr></thead>
+      <tbody>
+        <tr><td rowspan="2">RAG</td><td><code>rag</code></td><td>spacy, markdown, bs4, python-pptx, python-docx, pypdf, pdfplumber</td></tr>
+        <tr><td><code>graph_rag</code></td><td>networkx, dbgpt-tugraph-plugins, neo4j</td></tr>
+        <tr><td rowspan="9">数据源</td><td><code>datasource_mysql</code></td><td>mysqlclient</td></tr>
+        <tr><td><code>datasource_oracle</code></td><td>oracledb</td></tr>
+        <tr><td><code>datasource_postgres</code></td><td>psycopg2-binary</td></tr>
+        <tr><td><code>datasource_clickhouse</code></td><td>clickhouse-connect</td></tr>
+        <tr><td><code>datasource_spark</code></td><td>pyspark</td></tr>
+        <tr><td><code>datasource_mssql</code></td><td>pymssql</td></tr>
+        <tr><td><code>datasource_hive</code></td><td>pyhive, thrift, thrift_sasl</td></tr>
+        <tr><td><code>datasource_vertica</code></td><td>vertica-python</td></tr>
+        <tr><td><code>datasource_duckdb</code></td><td>duckdb, duckdb-engine</td></tr>
+        <tr><td rowspan="7">向量存储</td><td><code>storage_milvus</code></td><td>pymilvus</td></tr>
+        <tr><td><code>storage_weaviate</code></td><td>weaviate-client</td></tr>
+        <tr><td><code>storage_chromadb</code></td><td>chromadb, onnxruntime</td></tr>
+        <tr><td><code>storage_elasticsearch</code></td><td>elasticsearch</td></tr>
+        <tr><td><code>storage_qdrant</code></td><td>qdrant-client</td></tr>
+        <tr><td><code>storage_obvector</code></td><td>pyobvector</td></tr>
+        <tr><td><code>storage_valkey</code></td><td>valkey-glide</td></tr>
+        <tr><td rowspan="2">文件存储</td><td><code>file_oss</code></td><td>oss2（阿里云 OSS）</td></tr>
+        <tr><td><code>file_s3</code></td><td>boto3（AWS S3）</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- ===================== 3. 数据源 ===================== -->
+  <h2 id="datasource">三、数据源实现概览（15+ 种）</h2>
+  <p>Ext 层的数据源分两大类：<strong>关系型（RDBMS）</strong>和<strong>非关系型</strong>。
+  所有关系型数据源都继承 core 的 <code>RDBMSConnector</code>，非关系型继承 <code>BaseConnector</code>。</p>
+
+  <table>
+    <thead><tr><th>数据源</th><th>文件</th><th>继承关系</th><th>extra</th></tr></thead>
+    <tbody>
+      <tr><td>MySQL</td><td><code>rdbms/conn_mysql.py</code></td><td>RDBMSConnector</td><td>datasource_mysql</td></tr>
+      <tr><td>PostgreSQL</td><td><code>rdbms/conn_postgresql.py</code></td><td>RDBMSConnector</td><td>datasource_postgres</td></tr>
+      <tr><td>Oracle</td><td><code>rdbms/conn_oracle.py</code></td><td>RDBMSConnector</td><td>datasource_oracle</td></tr>
+      <tr><td>DuckDB</td><td><code>rdbms/conn_duckdb.py</code></td><td>RDBMSConnector</td><td>datasource_duckdb</td></tr>
+      <tr><td>ClickHouse</td><td><code>rdbms/conn_clickhouse.py</code></td><td>RDBMSConnector</td><td>datasource_clickhouse</td></tr>
+      <tr><td>MSSQL</td><td><code>rdbms/conn_mssql.py</code></td><td>RDBMSConnector</td><td>datasource_mssql</td></tr>
+      <tr><td>Hive</td><td><code>rdbms/conn_hive.py</code></td><td>RDBMSConnector</td><td>datasource_hive</td></tr>
+      <tr><td>Vertica</td><td><code>rdbms/conn_vertica.py</code></td><td>RDBMSConnector</td><td>datasource_vertica</td></tr>
+      <tr><td>Doris</td><td><code>rdbms/conn_doris.py</code></td><td>RDBMSConnector</td><td>—</td></tr>
+      <tr><td>StarRocks</td><td><code>rdbms/conn_starrocks.py</code></td><td>RDBMSConnector</td><td>—</td></tr>
+      <tr><td>OceanBase</td><td><code>rdbms/conn_oceanbase.py</code></td><td>RDBMSConnector</td><td>—</td></tr>
+      <tr><td>GaussDB</td><td><code>rdbms/conn_gaussdb.py</code></td><td>RDBMSConnector</td><td>—</td></tr>
+      <tr><td>openGauss</td><td><code>rdbms/conn_openGauss.py</code></td><td>RDBMSConnector</td><td>—</td></tr>
+      <tr><td>SQLite</td><td><code>rdbms/conn_sqlite.py</code></td><td>RDBMSConnector</td><td>—（内置）</td></tr>
+      <tr><td>Spark</td><td><code>conn_spark.py</code></td><td>BaseConnector</td><td>datasource_spark</td></tr>
+      <tr><td>Neo4j</td><td><code>conn_neo4j.py</code></td><td>BaseConnector</td><td>graph_rag</td></tr>
+      <tr><td>TuGraph</td><td><code>conn_tugraph.py</code></td><td>BaseConnector</td><td>graph_rag</td></tr>
+      <tr><td>Redis</td><td><code>redis.py</code></td><td>—</td><td>—</td></tr>
+    </tbody>
+  </table>
+
+  <p>以 MySQL 为例，看看一个数据源驱动有多薄——整个文件只有 53 行：</p>
+  <pre><code># dbgpt_ext/datasource/rdbms/conn_mysql.py（完整）
+from dbgpt.datasource.rdbms.base import RDBMSConnector, RDBMSDatasourceParameters
+
+@auto_register_resource(
+    label=_("MySQL datasource"),
+    category=ResourceCategory.DATABASE,
+    tags={"order": TAGS_ORDER_HIGH},
+    description=_("Fast, reliable, scalable open-source relational DBMS."),
+)
+@dataclass
+class MySQLParameters(RDBMSDatasourceParameters):
+    __type__ = "mysql"
+    driver: str = field(default="mysql+pymysql",
+        metadata={"help": _("Driver name for MySQL, default is mysql+pymysql.")})
+
+    def create_connector(self) -> "MySQLConnector":
+        return MySQLConnector.from_parameters(self)
+
+class MySQLConnector(RDBMSConnector):
+    db_type: str = "mysql"
+    db_dialect: str = "mysql"
+    driver: str = "mysql+pymysql"
+    default_db = ["information_schema", "performance_schema", "sys", "mysql"]</code></pre>
+
+  <p>由于 MySQL 完全兼容 SQLAlchemy 标准，<code>MySQLConnector</code> 几乎不需要覆盖任何方法——
+  只需声明 <code>db_type</code>、<code>db_dialect</code>、<code>driver</code>，
+  剩下的 SQL 执行、表结构查询、字段提取都由 <code>RDBMSConnector</code> 基类统一处理。</p>
+
+  <p>相比之下，DuckDB 因为有自己的系统表结构（<code>sqlite_master</code>），需要覆盖几个方法：</p>
+  <pre><code># dbgpt_ext/datasource/rdbms/conn_duckdb.py（节选）
+class DuckDbConnector(RDBMSConnector):
+    db_type: str = "duckdb"
+    db_dialect: str = "duckdb"
+
+    def get_table_comments(self, db_name: str):
+        with self.session_scope() as session:
+            cursor = session.execute(text(
+                "SELECT name, sql FROM sqlite_master WHERE type='table'"
+            ))
+            return [(row[0], row[1]) for row in cursor.fetchall()]
+
+    def table_simple_info(self) -> Iterable[str]:
+        with self.session_scope() as session:
+            cursor = session.execute(
+                text("SELECT name FROM sqlite_master WHERE type='table'")
+            )
+            for row in cursor.fetchall():
+                table_name = row[0]
+                cursor_cols = session.execute(
+                    text(f"PRAGMA table_info({table_name})")
+                )
+                cols = [col[1] for col in cursor_cols.fetchall()]
+                results.append(f"{table_name}({','.join(cols)});")
+            return results</code></pre>
+
+  <p>Spark 则因为不是传统关系型数据库，直接继承 <code>BaseConnector</code>，自己实现 <code>run</code> 方法：</p>
+  <pre><code># dbgpt_ext/datasource/conn_spark.py（节选）
+class SparkConnector(BaseConnector):
+    db_type: str = "spark"
+    driver: str = "spark"
+    dialect: str = "sparksql"
+
+    def __init__(self, file_path, spark_session=None, **kwargs):
+        from pyspark.sql import SparkSession
+        self.spark_session = (spark_session or
+            SparkSession.builder.appName("dbgpt_spark").getOrCreate())
+        self.path = file_path
+        self.table_name = "temp"
+        self.df = self.create_df(self.path)
+
+    def run(self, sql: str, fetch: str = "all"):
+        self.df.createOrReplaceTempView(self.table_name)
+        df = self.spark_session.sql(sql)
+        rows = [df.first().asDict().keys()]
+        for row in df.collect():
+            rows.append(row)
+        return rows</code></pre>
+
+  <p>每个数据源都用 <code>@auto_register_resource</code> 装饰器自动注册到 AWEL 资源注册表，
+  这样在可视化 DAG 编排界面就能拖拽使用。</p>
+
+  <!-- ===================== 4. 向量库 ===================== -->
+  <h2 id="vectorstore">四、向量库实现概览</h2>
+  <p>所有向量库都继承 core 的 <code>VectorStoreBase</code>，实现统一接口：
+  <code>load_document</code> / <code>similar_search</code> / <code>similar_search_with_scores</code> /
+  <code>delete_vector_name</code> / <code>truncate</code> / <code>vector_name_exists</code>。</p>
+
+  <table>
+    <thead><tr><th>向量库</th><th>文件</th><th>索引类型</th><th>extra</th><th>特点</th></tr></thead>
+    <tbody>
+      <tr><td>ChromaDB</td><td><code>chroma_store.py</code></td><td>HNSW (cosine)</td><td>storage_chromadb</td><td>嵌入式、本地持久化、适合开发</td></tr>
+      <tr><td>Milvus</td><td><code>milvus_store.py</code></td><td>HNSW / IVF_FLAT / IVF_SQ8 / ANNOY</td><td>storage_milvus</td><td>分布式、高性能、支持全文检索</td></tr>
+      <tr><td>Weaviate</td><td><code>weaviate_store.py</code></td><td>HNSW</td><td>storage_weaviate</td><td>支持多模态、GraphQL 查询</td></tr>
+      <tr><td>Elasticsearch</td><td><code>elastic_store.py</code></td><td>HNSW + BM25</td><td>storage_elasticsearch</td><td>全文 + 向量混合检索</td></tr>
+      <tr><td>PG Vector</td><td><code>pgvector_store.py</code></td><td>IVFFlat</td><td>—</td><td>PostgreSQL 扩展、SQL 生态</td></tr>
+      <tr><td>Qdrant</td><td><code>qdrant_store.py</code></td><td>HNSW</td><td>storage_qdrant</td><td>Rust 实现、高性能</td></tr>
+      <tr><td>OceanBase</td><td><code>oceanbase_store.py</code></td><td>—</td><td>storage_obvector</td><td>蚂蚁 OB 向量检索</td></tr>
+      <tr><td>Valkey</td><td><code>valkey_store.py</code></td><td>—</td><td>storage_valkey</td><td>Redis 分叉、内存向量化</td></tr>
+    </tbody>
+  </table>
+
+  <p>以 ChromaDB 为例，看看 <code>VectorStoreConfig</code> 的设计模式——
+  配置类和 Store 类都注册为 AWEL 资源：</p>
+  <pre><code># dbgpt_ext/storage/vector_store/chroma_store.py（节选）
+@register_resource(
+    _("Chroma Config"), "chroma_vector_config",
+    category=ResourceCategory.VECTOR_STORE,
+    parameters=[*_COMMON_PARAMETERS,
+        Parameter.build_from(_("Persist Path"), "persist_path", str,
+            description=_("the persist path of vector store."), optional=True),
+    ],
+)
+@dataclass
+class ChromaVectorConfig(VectorStoreConfig):
+    __type__ = "chroma"
+    persist_path: Optional[str] = field(
+        default=os.getenv("CHROMA_PERSIST_PATH", None))
+    collection_metadata: Optional[dict] = field(default=None)
+
+    def create_store(self, **kwargs) -> "ChromaStore":
+        return ChromaStore(vector_store_config=self, **kwargs)
+
+@register_resource(
+    _("Chroma Vector Store"), "chroma_vector_store",
+    category=ResourceCategory.VECTOR_STORE,
+)
+class ChromaStore(VectorStoreBase):
+    def __init__(self, vector_store_config: ChromaVectorConfig,
+                 name, embedding_fn=None, chroma_client=None, ...):
+        from chromadb import PersistentClient, Settings
+        chroma_path = vector_store_config.to_dict().get(
+            "persist_path", os.path.join(PILOT_PATH, "data"))
+        self.persist_dir = os.path.join(resolve_root_path(chroma_path) + "/chromadb")
+        self._chroma_client = PersistentClient(
+            path=self.persist_dir, settings=chroma_settings)</code></pre>
+
+  <p>Milvus 则复杂得多——它支持多种索引类型（HNSW / IVF_FLAT / IVF_SQ8 / ANNOY...），
+  还能检测服务端版本，在 2.5.0 以上自动启用全文检索：</p>
+  <pre><code># dbgpt_ext/storage/vector_store/milvus_store.py（节选）
+class MilvusStore(VectorStoreBase):
+    def __init__(self, vector_store_config, name, embedding_fn=None, ...):
+        self.index_params = {"index_type": "HNSW", "metric_type": "COSINE"}
+        self.index_params_map = {
+            "IVF_FLAT": {"params": {"nprobe": 10}},
+            "IVF_SQ8":  {"params": {"nprobe": 10}},
+            "HNSW":     {"params": {"M": 8, "efConstruction": 64}},
+            "ANNOY":    {"params": {"search_k": 10}},
+            # ...更多索引类型
+        }
+        url = f"http://{self.uri}:{self.port}"
+        self._milvus_client = MilvusClient(uri=url, user=self.username)
+
+    def is_support_full_text_search(self) -> bool:
+        """Milvus 2.5+ 才支持全文检索"""
+        milvus_version = self._milvus_client.get_server_version()
+        return milvus_version >= "2.5.0"</code></pre>
+
+  <!-- ===================== 5. LLM 适配 ===================== -->
+  <h2 id="llm">五、LLM 适配概览（20+ 厂商）</h2>
+  <p>DB-GPT 的 LLM 适配分两类：<strong>本地模型</strong>（通过 HuggingFace / llama.cpp / vLLM 推理）
+  和<strong>代理模型</strong>（调用第三方 API）。代理模型的适配器在
+  <code>dbgpt-core/src/dbgpt/model/proxy/llms/</code> 下，每个厂商一个文件。</p>
+
+  <table>
+    <thead><tr><th>厂商</th><th>文件</th><th>基类</th><th>默认模型</th></tr></thead>
+    <tbody>
+      <tr><td>OpenAI / ChatGPT</td><td><code>chatgpt.py</code></td><td>ProxyLLMClient</td><td>gpt-4o</td></tr>
+      <tr><td>通义千问 (Tongyi)</td><td><code>tongyi.py</code></td><td>OpenAILLMClient</td><td>qwen-max-latest</td></tr>
+      <tr><td>Ollama</td><td><code>ollama.py</code></td><td>ProxyLLMClient</td><td>llama2</td></tr>
+      <tr><td>讯飞星火 (Spark)</td><td><code>spark.py</code></td><td>ProxyLLMClient</td><td>—</td></tr>
+      <tr><td>文心一言 (Wenxin)</td><td><code>wenxin.py</code></td><td>ProxyLLMClient</td><td>—</td></tr>
+      <tr><td>智谱 (Zhipu)</td><td><code>zhipu.py</code></td><td>ProxyLLMClient</td><td>—</td></tr>
+      <tr><td>Claude</td><td><code>claude.py</code></td><td>ProxyLLMClient</td><td>—</td></tr>
+      <tr><td>Gemini</td><td><code>gemini.py</code></td><td>ProxyLLMClient</td><td>—</td></tr>
+      <tr><td>DeepSeek</td><td><code>deepseek.py</code></td><td>OpenAILLMClient</td><td>—</td></tr>
+      <tr><td>Moonshot (Kimi)</td><td><code>moonshot.py</code></td><td>OpenAILLMClient</td><td>—</td></tr>
+      <tr><td>百川 (Baichuan)</td><td><code>baichuan.py</code></td><td>OpenAILLMClient</td><td>—</td></tr>
+      <tr><td>火山引擎 (Volcengine)</td><td><code>volcengine.py</code></td><td>OpenAILLMClient</td><td>—</td></tr>
+      <tr><td>MiniMax</td><td><code>minimax.py</code></td><td>ProxyLLMClient</td><td>—</td></tr>
+      <tr><td>SiliconFlow</td><td><code>siliconflow.py</code></td><td>OpenAILLMClient</td><td>—</td></tr>
+      <tr><td>Yi (零一万物)</td><td><code>yi.py</code></td><td>OpenAILLMClient</td><td>—</td></tr>
+      <tr><td>Gitee AI</td><td><code>gitee.py</code></td><td>OpenAILLMClient</td><td>—</td></tr>
+      <tr><td>AIMLAPI</td><td><code>aimlapi.py</code></td><td>OpenAILLMClient</td><td>—</td></tr>
+      <tr><td>InfiniAI</td><td><code>infiniai.py</code></td><td>OpenAILLMClient</td><td>—</td></tr>
+      <tr><td>BurnCloud</td><td><code>burncloud.py</code></td><td>OpenAILLMClient</td><td>—</td></tr>
+      <tr><td>Litellm (统一代理)</td><td><code>litellm.py</code></td><td>ProxyLLMClient</td><td>—</td></tr>
+    </tbody>
+  </table>
+
+  <p>以通义千问为例，看看 LLM 适配器的代码模式——因为通义 API 兼容 OpenAI 格式，
+  所以直接继承 <code>OpenAILLMClient</code>，只需覆写 API 地址和 Key：</p>
+  <pre><code># dbgpt-core/src/dbgpt/model/proxy/llms/tongyi.py（节选）
+_DEFAULT_API_BASE = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+_DEFAULT_MODEL = "qwen-max-latest"
+
+@auto_register_resource(
+    label=_("Tongyi Proxy LLM"),
+    category=ResourceCategory.LLM_CLIENT,
+)
+@dataclass
+class TongyiDeployModelParameters(OpenAICompatibleDeployModelParameters):
+    provider: str = "proxy/tongyi"
+    api_base: Optional[str] = field(default=_DEFAULT_API_BASE)
+    api_key: Optional[str] = field(default="${env:DASHSCOPE_API_KEY}")
+
+class TongyiLLMClient(OpenAILLMClient):
+    def __init__(self, api_key=None, api_base=None, model=_DEFAULT_MODEL, ...):
+        api_base = api_base or os.getenv("DASHSCOPE_API_BASE") or _DEFAULT_API_BASE
+        api_key = api_key or os.getenv("DASHSCOPE_API_KEY")
+        super().__init__(api_key=api_key, api_base=api_base, model=model, ...)
+
+# 注册支持的模型列表（含上下文长度、是否支持 function calling）
+register_proxy_model_adapter(
+    TongyiLLMClient,
+    supported_models=[
+        ModelMetadata(model=["qwen-max-latest", "qwen-max"],
+            context_length=32*1024, function_calling=True),
+        ModelMetadata(model="deepseek-v3",
+            context_length=64*1024, function_calling=True),
+    ],
+)</code></pre>
+
+  <p>Ollama 则因为有自己的 SDK，直接继承 <code>ProxyLLMClient</code>：</p>
+  <pre><code># dbgpt-core/src/dbgpt/model/proxy/llms/ollama.py（节选）
+class OllamaLLMClient(ProxyLLMClient):
+    def __init__(self, model=None, api_base=None, model_alias="llama2", ...):
+        if not model: model = "llama2"
+        if not api_base: api_base = "http://localhost:11434"
+        self._model = model
+        self._api_base = api_base
+        super().__init__(model_names=[model, model_alias], ...)
+
+    def sync_generate_stream(self, request: ModelRequest):
+        import ollama
+        from ollama import Client
+        client = Client(self._api_base)
+        stream = client.chat(model=model, messages=messages, stream=True)
+        for chunk in stream:
+            content = content + chunk["message"]["content"]
+            msg = parse_chat_message(content, extract_reasoning=is_reasoning_model)
+            yield ModelOutput.build(text=msg.content,
+                thinking=msg.reasoning_content, error_code=0)</code></pre>
+
+  <!-- ===================== 6. RAG 扩展 ===================== -->
+  <h2 id="rag-ext">六、RAG 扩展：Assembler / Retriever / Knowledge</h2>
+  <p>Ext 层的 RAG 扩展是对 core RAG 抽象的具体实现，主要包括四大模块：</p>
+
+  <h3>6.1 知识源（Knowledge）</h3>
+  <p>支持 13 种文档格式的解析：</p>
+  <pre><code>dbgpt_ext/rag/knowledge/
+├── csv.py         # CSV 表格
+├── pdf.py         # PDF 文档（用 pypdf / pdfplumber）
+├── docx.py        # Word 文档（用 python-docx）
+├── pptx.py        # PowerPoint（用 python-pptx）
+├── markdown.py    # Markdown
+├── html.py        # HTML 网页
+├── excel.py       # Excel 表格
+├── json.py        # JSON 数据
+├── txt.py         # 纯文本
+├── doc.py         # 旧版 .doc
+├── url.py         # URL 网页抓取
+├── datasource.py  # 数据库表（直接从 DB 读数据）
+└── string.py      # 纯字符串</code></pre>
+
+  <h3>6.2 组装器（Assembler）</h3>
+  <p>组装器把"知识源 → 切分 → 向量化 → 存储"这条链路封装起来：</p>
+  <pre><code># dbgpt_ext/rag/assembler/base.py（节选）
+class BaseAssembler(ABC):
+    def __init__(self, knowledge: Knowledge,
+                 chunk_parameters=None, extractor=None, **kwargs):
+        self._knowledge = knowledge
+        self._chunk_manager = ChunkManager(
+            knowledge=self._knowledge, chunk_parameter=chunk_parameters)
+        self._chunks: List[Chunk] = []
+        # 加载知识 → 切分
+        documents = knowledge.load()
+        self._chunks = self._chunk_manager.split(documents)
+
+    @abstractmethod
+    def as_retriever(self, **kwargs) -> BaseRetriever:
+        """返回一个检索器"""
+
+    @abstractmethod
+    def persist(self, **kwargs) -> List[str]:
+        """将 chunks 持久化到索引存储"""</code></pre>
+
+  <p><code>EmbeddingAssembler</code> 是最常用的实现，它把 chunks 灌入向量库：</p>
+  <pre><code># dbgpt_ext/rag/assembler/embedding.py（节选）
+class EmbeddingAssembler(BaseAssembler):
+    def __init__(self, knowledge, index_store: IndexStoreBase,
+                 retrieve_strategy=RetrieverStrategy.EMBEDDING, **kwargs):
+        self._index_store = index_store
+        self._retrieve_strategy = retrieve_strategy
+        super().__init__(knowledge=knowledge, **kwargs)
+
+    def persist(self, **kwargs) -> List[str]:
+        return self._index_store.load_document_with_limit(
+            self._chunks, max_chunks_once_load, max_threads)
+
+    def as_retriever(self, top_k=4, **kwargs) -> BaseRetriever:
+        return EmbeddingRetriever(
+            top_k=top_k, index_store=self._index_store,
+            retrieve_strategy=self._retrieve_strategy)</code></pre>
+
+  <p>其他 Assembler：<code>BM25Assembler</code>（关键词检索）、
+  <code>DBSchemaAssembler</code>（数据库 Schema 检索）、
+  <code>SummaryAssembler</code>（摘要检索）。</p>
+
+  <h3>6.3 Embedding 厂商</h3>
+  <p>Ext 层还提供了 Embedding 模型的厂商适配（独立于 LLM）：</p>
+  <pre><code># dbgpt_ext/rag/embeddings/tongyi.py（节选）
+class TongYiEmbeddings(BaseModel, Embeddings):
+    def embed_documents(self, texts: List[str], max_batch_chunks_size=25):
+        from dashscope import TextEmbedding
+        # text-embedding-v3 的 batch 不超过 6
+        if str(self.model_name) == "text-embedding-v3":
+            max_batch_chunks_size = 6
+        for i in range(0, len(texts), max_batch_chunks_size):
+            batch = texts[i:i+max_batch_chunks_size]
+            resp = TextEmbedding.call(model=self.model_name, input=batch)
+            sorted_emb = sorted(resp["output"]["embeddings"],
+                                key=lambda e: e["text_index"])
+            embeddings.extend([r["embedding"] for r in sorted_emb])
+        return embeddings</code></pre>
+
+  <!-- ===================== 7. vis 模块 ===================== -->
+  <h2 id="vis">七、可视化 vis 模块</h2>
+  <p>vis 模块位于 core 包（<code>dbgpt/vis/</code>），但与 ext 层配合使用。
+  它定义了一套"可视化协议"，让 Agent 的输出不只是纯文本，而是带图表、表格、仪表盘的富内容。</p>
+
+  <p>基类 <code>Vis</code> 很简单——核心就是把结构化数据序列化成带 <code>vis_tag</code> 标记的 JSON：</p>
+  <pre><code># dbgpt-core/src/dbgpt/vis/base.py（完整核心）
+class Vis:
+    def sync_display(self, **kwargs) -> Optional[str]:
+        content = json.dumps(
+            self.sync_generate_param(**kwargs),
+            default=serialize, ensure_ascii=False)
+        return f"```{self.vis_tag()}\n{content}\n```"
+
+    @classmethod
+    def vis_tag(cls) -> str:
+        return ""   # 子类覆盖</code></pre>
+
+  <p>前端看到 <code>```vis-db-chart\n{...}\n```</code> 就知道这是一段图表数据，
+  用对应的渲染器画出 ECharts 图表。<code>tags/</code> 目录下有 17 种 vis 实现：</p>
+
+  <table>
+    <thead><tr><th>vis_tag</th><th>类</th><th>用途</th></tr></thead>
+    <tbody>
+      <tr><td>vis-db-chart</td><td>VisChart</td><td>数据库图表（折线/饼图/散点/热力图等 8 种）</td></tr>
+      <tr><td>vis-dashboard</td><td>VisDashboard</td><td>仪表盘（多图表组合）</td></tr>
+      <tr><td>vis-table</td><td>—</td><td>表格数据</td></tr>
+      <tr><td>vis-code</td><td>VisCode</td><td>代码高亮展示</td></tr>
+      <tr><td>vis-agent-messages</td><td>VisAgentMessage</td><td>Agent 对话消息</td></tr>
+      <tr><td>vis-agent-plans</td><td>VisAgentPlans</td><td>Agent 执行计划</td></tr>
+      <tr><td>vis-plugin</td><td>VisPlugin</td><td>插件调用结果</td></tr>
+      <tr><td>vis-thinking</td><td>VisThinking</td><td>思考过程（支持 DeepSeek-R1 reasoning）</td></tr>
+      <tr><td>vis-report-generation</td><td>VisReportGeneration</td><td>报告生成</td></tr>
+      <tr><td>vis-anomaly-detection</td><td>VisAnomalyDetection</td><td>异常检测可视化</td></tr>
+      <tr><td>vis-volatility-analysis</td><td>VisVolatilityAnalysis</td><td>波动率分析</td></tr>
+      <tr><td>vis-app-link</td><td>VisAppLink</td><td>应用链接卡片</td></tr>
+      <tr><td>vis-api-response</td><td>VisApiResponse</td><td>API 响应展示</td></tr>
+    </tbody>
+  </table>
+
+  <p>以 <code>VisChart</code> 为例，它内置了 8 种 AntV 图表类型提示词，
+  LLM 输出 SQL 后自动转成前端可渲染的 JSON：</p>
+  <pre><code># dbgpt-core/src/dbgpt/vis/tags/vis_chart.py（节选）
+class VisChart(Vis):
+    def sync_generate_param(self, **kwargs):
+        chart = kwargs.get("chart")
+        data_df = kwargs.get("data_df")
+        param = {
+            "sql": chart.get("sql"),
+            "type": chart.get("display_type", "response_table"),
+            "title": chart.get("title", ""),
+            "describe": chart.get("thought", ""),
+            "data": json.loads(data_df.to_json(orient="records"))
+        }
+        return param
+
+    @classmethod
+    def vis_tag(cls) -> str:
+        return "vis-db-chart"</code></pre>
+
+  <!-- ===================== 8. 沙箱 ===================== -->
+  <h2 id="sandbox">八、沙箱 dbgpt-sandbox：代码隔离执行</h2>
+  <p><code>dbgpt-sandbox</code> 是独立的包，提供代码隔离执行环境。
+  Agent 生成的代码（尤其是数据分析师 Agent）需要安全执行，不能直接在宿主机跑。</p>
+
+  <h3>8.1 架构总览</h3>
+  <div class="mermaid">
+flowchart TD
+    F["RuntimeFactory.create()<br/>自动检测最优运行时<br/>优先级: Docker &gt; Podman &gt; Nerdctl &gt; Local"]
+    F -.->|"选择"| RT
+    RT["SandboxRuntime 抽象层<br/>create_session() · destroy_session()<br/>list_sessions() · health_check()"]
+    RT --> L["LocalRuntime"]
+    RT --> D["DockerRuntime"]
+    RT --> P["PodmanRuntime"]
+    RT --> N["NerdctlRuntime"]
+    RT --> V["VNC GUI"]
+
+    L --> LI[("subprocess + psutil + tempfile<br/>本地进程隔离")]
+    D --> DI[("Docker Container<br/>python:3.11-slim · node:18-slim<br/>openjdk:11-jre-slim<br/>gcc · golang · rust")]
+    P --> PI[("Podman Container<br/>同 Docker 镜像")]
+    N --> NI[("Nerdctl Container<br/>containerd 后端")]
+
+    classDef factory fill:#2a1a3a,stroke:#c586c0,stroke-width:2px,color:#e6e6e6
+    classDef abstract fill:#1a3a4a,stroke:#4ec9b0,stroke-width:2px,color:#e6e6e6
+    classDef runtime fill:#1a2029,stroke:#569cd6,stroke-width:2px,color:#e6e6e6
+    classDef backend fill:#0f1419,stroke:#ce9178,color:#e6e6e6
+    class F factory
+    class RT abstract
+    class L,D,P,N,V runtime
+    class LI,DI,PI,NI backend
+  </div>
+
+  <h3>8.2 核心抽象</h3>
+  <p><code>SandboxRuntime</code> 是运行时抽象，<code>SandboxSession</code> 是会话抽象：</p>
+  <pre><code># dbgpt-sandbox/src/dbgpt_sandbox/sandbox/execution_layer/base.py（节选）
+class ExecutionStatus(Enum):
+    SUCCESS = "success"
+    ERROR = "error"
+    TIMEOUT = "timeout"
+    RESOURCE_LIMIT = "resource_limit"
+
+@dataclass
+class SessionConfig:
+    language: str = "python"
+    timeout: int = 30           # 秒
+    max_memory: int = 256MB
+    max_cpus: int = 1
+    working_dir: str = "/workspace"
+    network_disabled: bool = False
+
+class SandboxSession(ABC):
+    @abstractmethod
+    async def execute(self, code: str) -> ExecutionResult:
+        """执行代码，返回结果"""
+
+class SandboxRuntime(ABC):
+    @abstractmethod
+    async def create_session(self, session_id, config) -> SandboxSession:
+        """创建沙箱会话"""</code></pre>
+
+  <h3>8.3 本地运行时（LocalRuntime）</h3>
+  <p>本地运行时用 <code>subprocess</code> + <code>psutil</code> 实现进程隔离和资源限制。
+  它支持 8 种语言：</p>
+  <pre><code># dbgpt-sandbox/src/dbgpt_sandbox/sandbox/execution_layer/local_runtime.py（节选）
+class LocalSandboxSession(SandboxSession):
+    async def execute(self, code: str) -> ExecutionResult:
+        # 1. 安全检查
+        warnings = self.security_utils.validate_code(code, self.config.language)
+        if any("危险操作" in w for w in warnings):
+            return ExecutionResult(status=ExecutionStatus.ERROR,
+                                   error=f"代码安全检查失败")
+
+        # 2. 写入临时文件
+        code_file = self._create_code_file(code)
+
+        # 3. 获取执行命令（python/node/javac/g++/go/rustc/bash）
+        command = self._get_exec_command(code_file)
+
+        # 4. 在资源限制下执行
+        result = await self._run_with_limits(command)
+        # → asyncio.create_subprocess_exec + asyncio.wait_for(timeout)
+
+        return ExecutionResult(
+            status=SUCCESS if result["returncode"] == 0 else ERROR,
+            output=result["stdout"], error=result["stderr"],
+            execution_time=execution_time,
+            memory_usage=result.get("memory_usage", 0))</code></pre>
+
+  <p>本地运行时是<strong>默认禁用</strong>的——因为它直接在宿主机执行代码，
+  有安全风险。需要显式开启：</p>
+  <pre><code># 环境变量
+export SANDBOX_RUNTIME=local
+export SANDBOX_ALLOW_LOCAL_RUNTIME=true</code></pre>
+
+  <h3>8.4 Docker 运行时（DockerRuntime）</h3>
+  <p>Docker 运行时是生产推荐方案，每种语言有对应镜像：</p>
+  <pre><code># dbgpt-sandbox/src/dbgpt_sandbox/sandbox/config.py
+LANGUAGE_IMAGES = {
+    "python":     "python:3.11-slim",
+    "python-vnc": "vnc-gui-browser:latest",   # 带图形界面
+    "javascript": "node:18-slim",
+    "java":       "openjdk:11-jre-slim",
+    "cpp":        "gcc:latest",
+    "go":         "golang:1.21-alpine",
+    "rust":       "rust:1.75-slim",
+}
+
+# 资源限制默认值
+MAX_MEMORY = 256MB
+MAX_EXECUTION_TIME = 30s
+MAX_FILE_SIZE = 10MB
+MAX_DEPENDENCY_INSTALL_TIME = 300s
+MAX_PROCESSES = 10</code></pre>
+
+  <p>Docker 会话的 <code>execute</code> 方法会把代码 <code>put_archive</code> 到容器，
+  然后 <code>exec_run</code> 执行：</p>
+  <pre><code># dbgpt-sandbox/src/dbgpt_sandbox/sandbox/execution_layer/docker_runtime.py（节选）
+class DockerSandboxSession(SandboxSession):
+    async def start(self) -> bool:
+        self.container = await asyncio.to_thread(
+            self.docker_client.containers.run,
+            image=self.image_name,
+            command="tail -f /dev/null",     # 保持容器运行
+            mem_limit=self.config.max_memory,
+            cpuset_cpus=str(self.config.max_cpus),
+            network_disabled=self.config.network_disabled,
+            name=f"sandbox_{self.session_id}")
+
+    async def execute(self, code: str) -> DisplayResult:
+        code_file = self._create_code_file(code)
+        tar_data = self._create_tar_from_file(code_file)
+        self.container.put_archive(self.config.working_dir, tar_data)
+        result = self.container.exec_run(
+            self._get_exec_command(filename),
+            workdir=self.config.working_dir)
+        return DisplayResult(
+            status="success" if result.exit_code == 0 else "error",
+            output=result.output[0].decode("utf-8"),
+            error=result.output[1].decode("utf-8"))</code></pre>
+
+  <h3>8.5 运行时工厂（RuntimeFactory）</h3>
+  <p>工厂负责自动检测本机环境，按优先级选择最佳运行时：</p>
+  <pre><code># dbgpt-sandbox/src/dbgpt_sandbox/sandbox/execution_layer/runtime_factory.py（节选）
+class RuntimeFactory:
+    @staticmethod
+    def create(runtime_preference: str = None):
+        # 优先读环境变量
+        env_choice = SANDBOX_RUNTIME  # os.getenv("SANDBOX_RUNTIME")
+        if env_choice:
+            runtime_preference = env_choice.lower()
+
+        if runtime_preference == "docker":
+            return DockerRuntime()
+        elif runtime_preference == "podman":
+            return PodmanRuntime()
+        elif runtime_preference == "nerdctl":
+            return NerdctlRuntime()
+        elif runtime_preference == "local":
+            return RuntimeFactory._local_runtime()
+
+        # 自动检测（无显式指定时）
+        if EnvironmentDetector.is_docker_sdk_available():
+            return DockerRuntime()
+        if EnvironmentDetector.is_podman_available():
+            return PodmanRuntime()
+        if EnvironmentDetector.is_nerdctl_available():
+            return NerdctlRuntime()
+        if SANDBOX_ALLOW_LOCAL_RUNTIME:
+            return LocalRuntime()
+        raise RuntimeError("No container runtime available")</code></pre>
+
+  <!-- ===================== 9. 加速器 ===================== -->
+  <h2 id="accelerator">九、加速器 dbgpt-accelerator</h2>
+  <p><code>dbgpt-accelerator</code> 包解决的是"本地模型推理加速"问题。
+  它分两个子包：</p>
+
+  <table>
+    <thead><tr><th>子包</th><th>定位</th><th>extra</th></tr></thead>
+    <tbody>
+      <tr><td><code>dbgpt-acc-auto</code></td><td>自动检测 + 安装 PyTorch/vLLM/量化</td><td>auto / cpu / cuda118 / cuda121 / cuda124 / vllm / mlx / quant_bnb / quant_gptq</td></tr>
+      <tr><td><code>dbgpt-acc-flash-attn</code></td><td>Flash Attention 加速</td><td>flash_attn</td></tr>
+    </tbody>
+  </table>
+
+  <h3>9.1 dbgpt-acc-auto：自动检测安装</h3>
+  <p>这个包本身没有代码（<code>__init__.py</code> 只有版本号），它的价值全在
+  <code>pyproject.toml</code> 的 extras 设计——根据操作系统、GPU 类型、CUDA 版本，
+  自动拉入正确的 PyTorch 版本：</p>
+  <pre><code># dbgpt-accelerator/dbgpt-acc-auto/pyproject.toml（节选）
+[project.optional-dependencies]
+auto = [
+    # macOS ARM64 用 >=2.2.1，x86_64 用 <2.3
+    "torch>=2.2.1; sys_platform != 'darwin' or platform_machine != 'x86_64'",
+    "torch>=2.2.1,<2.3; sys_platform == 'darwin' and platform_machine == 'x86_64'",
+]
+cpu = ["torch>=2.2.1; ..."]
+cuda118 = ["torch>=2.2.1; sys_platform == 'win32' or sys_platform == 'linux'"]
+cuda121 = ["torch>=2.2.1; ..."]
+cuda124 = ["torch>=2.2.1; ..."]   # 需要 torch>=2.4.0
+vllm = ["vllm>=0.7.0; sys_platform == 'linux'"]  # 只支持 Linux GPU
+mlx = ["mlx-lm>=0.25.2; sys_platform == 'darwin'"]  # Apple Silicon 专用
+
+# 量化加速
+quant_bnb = ["bitsandbytes>=0.39.0", "accelerate"]      # NF4/INT8 量化
+quant_gptqmodel = ["optimum", "gptqmodel"]              # GPTQ 量化
+quant_gptq = ["optimum", "auto-gptq"]
+
+# Flash Attention（依赖 dbgpt-acc-flash-attn）
+flash_attn = ["dbgpt-acc-flash-attn"]
+
+[tool.uv]
+# extras 之间互斥（不能同时装 cpu 和 cuda）
+conflicts = [
+    [{ extra = "auto" }, { extra = "cpu" },
+     { extra = "cuda118" }, { extra = "cuda121" }, { extra = "cuda124" }]
+]</code></pre>
+
+  <p>安装方式：</p>
+  <pre><code># CPU 推理
+pip install "dbgpt-acc-auto[cpu]"
+
+# NVIDIA GPU + CUDA 12.1
+pip install "dbgpt-acc-auto[cuda121]"
+
+# GPU + vLLM 高性能推理
+pip install "dbgpt-acc-auto[cuda121,vllm]"
+
+# Apple Silicon
+pip install "dbgpt-acc-auto[mlx]"
+
+# 加上 Flash Attention（NVIDIA GPU 专用）
+pip install "dbgpt-acc-auto[cuda121,flash_attn]"
+
+# 加上量化
+pip install "dbgpt-acc-auto[cuda121,quant_bnb]"</code></pre>
+
+  <h3>9.2 dbgpt-acc-flash-attn：Flash Attention</h3>
+  <p>Flash Attention 是一种优化的 Attention 算法，减少 GPU HBM 读写，提升推理速度 2-4 倍。
+  这个子包只是 <code>flash-attn</code> 的封装层：</p>
+  <pre><code># dbgpt-accelerator/dbgpt-acc-flash-attn/pyproject.toml
+[project]
+name = "dbgpt-acc-flash-attn"
+dependencies = []
+
+[dependency-groups]
+build = ["setuptools>=75.8.0"]
+direct = ["torch>=2.2.1"]
+main = ["flash-attn>=2.5.8"]
+
+[tool.uv]
+no-build-isolation-package = ["flash-attn"]</code></pre>
+
+  <div class="callout warn">
+    <strong>使用限制：</strong>Flash Attention 需要 NVIDIA GPU（计算能力 7.5+）或
+    兼容 Triton 的 AMD ROCm 环境。CPU 环境无法使用。
+  </div>
+
+  <!-- ===================== 10. 插件机制 ===================== -->
+  <h2 id="plugin-guide">十、插件机制：怎么加一个新扩展</h2>
+
+  <h3>10.1 加一个新数据源</h3>
+  <p>假设要加一个新数据库 XDB，步骤如下：</p>
+  <pre><code># 1. 创建文件 dbgpt_ext/datasource/rdbms/conn_xdb.py
+from dbgpt.datasource.rdbms.base import RDBMSConnector, RDBMSDatasourceParameters
+
+@auto_register_resource(
+    label=_("XDB datasource"),
+    category=ResourceCategory.DATABASE,
+)
+@dataclass
+class XDBParameters(RDBMSDatasourceParameters):
+    __type__ = "xdb"
+    driver: str = "xdb+xdb_python"
+    def create_connector(self) -> "XDBConnector":
+        return XDBConnector.from_parameters(self)
+
+class XDBConnector(RDBMSConnector):
+    db_type: str = "xdb"
+    db_dialect: str = "xdb"
+    driver: str = "xdb+xdb_python"
+
+# 2. 在 pyproject.toml 加 extra
+# [project.optional-dependencies]
+# datasource_xdb = ["xdb-python-driver"]
+
+# 3. 安装：pip install "dbgpt-ext[datasource_xdb]"
+# AWEL 可视化界面会自动出现 XDB 数据源节点</code></pre>
+
+  <h3>10.2 加一个新向量库</h3>
+  <pre><code># 1. 创建文件 dbgpt_ext/storage/vector_store/my_store.py
+@register_resource(_("MyStore Config"), "my_vector_config",
+    category=ResourceCategory.VECTOR_STORE)
+@dataclass
+class MyVectorConfig(VectorStoreConfig):
+    __type__ = "my_store"
+    connection_string: str = field(default=None)
+    def create_store(self, **kwargs) -> "MyStore":
+        return MyStore(vector_store_config=self, **kwargs)
+
+@register_resource(_("MyStore"), "my_vector_store",
+    category=ResourceCategory.VECTOR_STORE)
+class MyStore(VectorStoreBase):
+    def __init__(self, vector_store_config, name, embedding_fn=None, **kwargs):
+        import my_vector_sdk
+        self._client = my_vector_sdk.connect(...)
+
+    def load_document(self, chunks: List[Chunk]) -> List[str]: ...
+    def similar_search(self, text, topk, filters=None) -> List[Chunk]: ...
+    def similar_search_with_scores(self, text, topk, score_threshold, ...): ...
+    def delete_vector_name(self, vector_name): ...
+    def truncate(self): ...
+
+# 2. 在 pyproject.toml 加 extra
+# storage_my_store = ["my-vector-sdk"]</code></pre>
+
+  <h3>10.3 加一个新 LLM 厂商</h3>
+  <pre><code># 1. 创建文件 dbgpt-core/src/dbgpt/model/proxy/llms/my_llm.py
+@auto_register_resource(
+    label=_("MyCorp Proxy LLM"),
+    category=ResourceCategory.LLM_CLIENT,
+)
+@dataclass
+class MyCorpDeployModelParameters(OpenAICompatibleDeployModelParameters):
+    provider: str = "proxy/mycorp"
+    api_base: str = "https://api.mycorp.com/v1"
+    api_key: str = "${env:MYCORP_API_KEY}"
+
+class MyCorpLLMClient(OpenAILLMClient):
+    def __init__(self, api_key=None, api_base=None, ...):
+        super().__init__(api_key=api_key, api_base=api_base, ...)
+
+# 注册支持的模型
+register_proxy_model_adapter(
+    MyCorpLLMClient,
+    supported_models=[
+        ModelMetadata(model="mycorp-v1", context_length=32*1024),
+    ],
+)
+
+# 2. 在 dbgpt/model/adapter/model_adapter.py 的 _supported_proxy_servers 中注册
+# 3. 自动出现在 AWEL 可视化界面的 LLM 节点中</code></pre>
+
+  <div class="callout tip">
+    <strong>关键约定：</strong>所有扩展都用 <code>@auto_register_resource</code> 或
+    <code>@register_resource</code> 装饰器注册到 AWEL 资源注册表。
+    注册后，扩展会<strong>自动</strong>出现在三个地方：
+    <ol>
+      <li>AWEL 可视化 DAG 编排界面的节点列表</li>
+      <li>命令行的 <code>dbgpt new</code> 脚手架模板选项</li>
+      <li>配置文件中的数据源 / 模型 / 向量库选项</li>
+    </ol>
+    这就是 DB-GPT 的"零配置插件"机制——不需要修改任何注册逻辑，加一个文件就能上线。
+  </div>
+
+  <!-- ===================== Quiz ===================== -->
+  <h2 id="quiz">本章测验</h2>
+  <div class="quiz">
+    <ol>
+      <li>
+        <strong>dbgpt-ext 的默认依赖里只有哪两个包？为什么 pymysql 是默认而 mysqlclient 不是？</strong>
+        <details><summary>参考答案</summary>
+        <p>默认依赖是 <code>dbgpt&gt;=0.7.0</code> 和 <code>pymysql</code>。
+        pymysql 是纯 Python 实现的 MySQL 驱动，安装时不需要编译环境；
+        而 <code>mysqlclient</code> 是 C 扩展，需要系统的 <code>libmysqlclient-dev</code>，
+        所以放进 <code>datasource_mysql</code> extra 里按需安装。
+        pymysql 用于 SQLAlchemy 的 <code>mysql+pymysql</code> 驱动即可满足基本需求。</p>
+        </details>
+      </li>
+      <li>
+        <strong>安装 <code>pip install "dbgpt-ext[rag,storage_chromadb]"</code> 会拉入哪些关键依赖？</strong>
+        <details><summary>参考答案</summary>
+        <p>RAG 的依赖：spacy, markdown, bs4, python-pptx, python-docx, olefile, pypdf, pdfplumber。
+        ChromaDB 的依赖：chromadb（&gt;=0.4.22）, onnxruntime（&gt;=1.14.1,&lt;=1.18.1）。
+        其中 onnxruntime 约 200MB，是 ChromaDB 默认嵌入模型（all-MiniLM-L6-v2）的推理引擎。</p>
+        </details>
+      </li>
+      <li>
+        <strong>MySQLConnector 只有 53 行代码就能完整工作，靠的是什么设计？</strong>
+        <details><summary>参考答案</summary>
+        <p>靠的是 <code>RDBMSConnector</code> 基类的 <strong>SQLAlchemy 统一抽象</strong>。
+        所有标准关系型数据库只要兼容 SQLAlchemy，声明 <code>db_type</code> / <code>db_dialect</code> / <code>driver</code>
+        后，SQL 执行、表结构提取、字段查询、索引获取等全部由基类处理。
+        只有当数据库的系统表结构与标准不同时（如 DuckDB 用 <code>sqlite_master</code>），
+        才需要覆盖特定方法。</p>
+        </details>
+      </li>
+      <li>
+        <strong>沙箱的 RuntimeFactory 如何选择运行时？为什么 LocalRuntime 默认禁用？</strong>
+        <details><summary>参考答案</summary>
+        <p>选择优先级：环境变量 <code>SANDBOX_RUNTIME</code> 显式指定 &gt; Docker SDK &gt; Podman &gt;
+        Nerdctl &gt; LocalRuntime。
+        LocalRuntime 默认禁用是因为它直接在宿主机用 <code>subprocess</code> 执行代码，
+        有安全风险（文件读写、网络访问、进程创建无隔离）。
+        需要设置 <code>SANDBOX_RUNTIME=local</code> 和 <code>SANDBOX_ALLOW_LOCAL_RUNTIME=true</code>
+        两个环境变量才能启用。</p>
+        </details>
+      </li>
+      <li>
+        <strong>dbgpt-acc-auto 的 cuda118 / cuda121 / cuda124 三个 extras 为什么互斥？</strong>
+        <details><summary>参考答案</summary>
+        <p>因为它们对应不同版本的 CUDA Toolkit，会拉入不同版本的 PyTorch wheel。
+        同一环境下只能安装一个 CUDA 版本的 PyTorch（GPU 驱动只对应一个 CUDA 版本）。
+        在 <code>pyproject.toml</code> 中用 <code>[tool.uv] conflicts</code> 声明互斥，
+        安装时会报错提示。用户需根据本机 GPU 驱动的 CUDA 版本选择正确的 extra。</p>
+        </details>
+      </li>
+    </ol>
+  </div>
+
+  <div class="pager">
+    <a href="09-serve.html">&larr; 09 · Serve 服务</a>
+    <a href="11-trace.html">11 · 链路追踪 &rarr;</a>
+  </div>
+
+</main>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: 'base',
+    themeVariables: {
+      primaryColor: '#1a2029',
+      primaryTextColor: '#e6e6e6',
+      primaryBorderColor: '#4ec9b0',
+      lineColor: '#569cd6',
+      secondaryColor: '#232b37',
+      tertiaryColor: '#0f1419',
+      textColor: '#e6e6e6',
+      fontFamily: 'JetBrains Mono, Consolas, monospace',
+      fontSize: '16px'
+    },
+    flowchart: { curve: 'basis', padding: 20, useMaxWidth: true }
+  });
+</script>
+</body>
+</html>

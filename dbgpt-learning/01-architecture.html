@@ -1,0 +1,725 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>01 · 整体架构 — DB-GPT 源码精读</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="layout">
+
+<aside class="sidebar">
+  <h2>DBGPT 精读</h2>
+  <ul><li><a href="index.html">总览</a></li></ul>
+  <div class="group-title">入门</div>
+  <ul>
+    <li><a href="01-architecture.html" class="active">01 · 整体架构</a></li>
+    <li><a href="02-startup.html">02 · 启动流程</a></li>
+  </ul>
+  <div class="group-title">核心子系统</div>
+  <ul>
+    <li><a href="03-awel.html">03 · AWEL 工作流</a></li>
+    <li><a href="04-agent.html">04 · Agent 系统</a></li>
+    <li><a href="05-rag.html">05 · RAG 检索</a></li>
+    <li><a href="06-model.html">06 · 模型层</a></li>
+    <li><a href="07-datasource.html">07 · 数据源</a></li>
+  </ul>
+  <div class="group-title">应用层</div>
+  <ul>
+    <li><a href="08-scene.html">08 · Scene 场景</a></li>
+    <li><a href="09-serve.html">09 · Serve 服务</a></li>
+    <li><a href="10-ext.html">10 · Ext 扩展</a></li>
+  </ul>
+  <div class="group-title">实战</div>
+  <ul><li><a href="11-trace.html">11 · 链路追踪</a></li></ul>
+</aside>
+
+<main class="main">
+  <h1>01 · 整体架构 <span class="tag">入门</span></h1>
+  <p class="subtitle">先把森林看清，再去研究每一棵树 —— 本章建立 DB-GPT 的全局视图</p>
+
+  <div class="toc">
+    <div class="toc-title">本章目录</div>
+    <ol>
+      <li><a href="#what">DB-GPT 是什么，解决什么问题</a></li>
+      <li><a href="#packages">Monorepo 与 6+1 包结构</a></li>
+      <li><a href="#pkg-core">dbgpt-core：抽象与契约层</a></li>
+      <li><a href="#pkg-ext">dbgpt-ext：可插拔实现层</a></li>
+      <li><a href="#pkg-serve">dbgpt-serve：服务编排层</a></li>
+      <li><a href="#pkg-app">dbgpt-app：应用集成层</a></li>
+      <li><a href="#pkg-client">dbgpt-client：外部 SDK</a></li>
+      <li><a href="#pkg-sandbox">dbgpt-sandbox：安全沙箱</a></li>
+      <li><a href="#pkg-acc">dbgpt-accelerator：硬件加速</a></li>
+      <li><a href="#dip">依赖倒置原则：为什么 core 永远最底层</a></li>
+      <li><a href="#uv">uv workspace 是怎么把 monorepo 跑起来的</a></li>
+      <li><a href="#systemapp">SystemApp：组件容器的灵魂</a></li>
+      <li><a href="#layered">分层架构总览图</a></li>
+      <li><a href="#dep-table">包间依赖关系表</a></li>
+    </ol>
+  </div>
+
+  <!-- ===================== 1. DB-GPT 是什么 ===================== -->
+  <h2 id="what">一、DB-GPT 是什么，解决什么问题</h2>
+
+  <p>从顶层 <code>pyproject.toml</code> 的 description 字段就能看出项目的自我定位：</p>
+
+  <div class="file-block">
+    <div class="file-header">
+      <span>D:/code/DB-GPT/pyproject.toml</span>
+      <span class="lines">第 4-7 行</span>
+    </div>
+    <div class="file-body">
+<pre><code><span class="c"># 顶层 monorepo 包名是 dbgpt-mono，版本 0.8.1</span>
+<span class="n">[project]</span>
+<span class="k">name</span> = <span class="s">"dbgpt-mono"</span>
+<span class="k">version</span> = <span class="s">"0.8.1"</span>
+<span class="k">description</span> = <span class="s">"""DB-GPT is an experimental open-source project that uses localized GPT</span>
+<span class="s">large models to interact with your data and environment. With this solution, you can be</span>
+<span class="s">assured that there is no risk of data leakage, and your data is 100% private and secure."""</span></code></pre>
+    </div>
+  </div>
+
+  <p>把这段话拆成三个关键词来理解：</p>
+  <ul>
+    <li><strong>localized（本地化）</strong>：模型可以完全跑在内网，不依赖任何公有云 API；</li>
+    <li><strong>interact with your data（与你的数据交互）</strong>：核心场景是 Text2SQL、Text2Chart、RAG 问答、Agent 自动化分析；</li>
+    <li><strong>100% private（数据不出域）</strong>：面向金融、政企、医疗等对数据合规敏感的行业。</li>
+  </ul>
+
+  <p>对照仓库自带的设计文档 <code>DB-GPT-Core-Code-Design-Analysis.md</code> 第 10 行可以看到，DB-GPT 把自己定位成一个 <em>"modular, layered architecture"</em>（模块化分层架构）。也就是说，它不只是"一个能用 LLM 跑 SQL 的脚本"，而是一个可被二次开发、可被部署成微服务、可被嵌入到其他产品里的 <strong>Agentic AI 数据应用平台</strong>。</p>
+
+  <div class="callout tip">
+    <strong>一句话定位：</strong>DB-GPT = <em>AWEL 工作流引擎 + 多模型管理 + RAG + Agent + Text2SQL</em>，把"自然语言 → SQL/代码 → 分析 → 可视化报告"这条链路用本地化大模型完整打通，并通过 monorepo 的方式把上述能力按职责切成 6+1 个 Python 包。
+  </div>
+
+  <!-- ===================== 2. Monorepo 包结构 ===================== -->
+  <h2 id="packages">二、Monorepo 与 6+1 包结构</h2>
+
+  <p>顶层 <code>pyproject.toml</code> 的 <code>[tool.uv.workspace]</code> 段明确声明了这是一个 uv workspace monorepo，成员列表如下：</p>
+
+  <div class="file-block">
+    <div class="file-header">
+      <span>D:/code/DB-GPT/pyproject.toml</span>
+      <span class="lines">第 31-40 行</span>
+    </div>
+    <div class="file-body">
+<pre><code><span class="n">[tool.uv.workspace]</span>
+<span class="k">members</span> = [
+  <span class="s">"packages/dbgpt-app"</span>,
+  <span class="s">"packages/dbgpt-client"</span>,
+  <span class="s">"packages/dbgpt-core"</span>,
+  <span class="s">"packages/dbgpt-ext"</span>,
+  <span class="s">"packages/dbgpt-serve"</span>,
+  <span class="s">"packages/dbgpt-sandbox"</span>,
+  <span class="s">"packages/dbgpt-accelerator/dbgpt-acc*"</span>,
+]</code></pre>
+    </div>
+  </div>
+
+  <p>这 6 + 1 个包（accelerator 下还有子包，所以用通配 <code>dbgpt-acc*</code>）的角色划分如下：</p>
+
+  <table>
+    <thead>
+      <tr><th>包名</th><th>PyPI 发布名</th><th>顶层角色</th><th>关键产物</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><span class="badge core">core</span> dbgpt-core</td>
+        <td><code>dbgpt</code></td>
+        <td>抽象层 / 契约层</td>
+        <td>SystemApp、AWEL、core/interface/*、util</td>
+      </tr>
+      <tr>
+        <td><span class="badge ext">ext</span> dbgpt-ext</td>
+        <td><code>dbgpt-ext</code></td>
+        <td>可插拔实现层</td>
+        <td>datasource / storage / rag / llms / vis</td>
+      </tr>
+      <tr>
+        <td><span class="badge serve">serve</span> dbgpt-serve</td>
+        <td><code>dbgpt-serve</code></td>
+        <td>服务编排层（REST）</td>
+        <td>serve/agent、conversation、flow、model、rag、prompt</td>
+      </tr>
+      <tr>
+        <td><span class="badge app">app</span> dbgpt-app</td>
+        <td><code>dbgpt-app</code></td>
+        <td>应用集成层（入口）</td>
+        <td>dbgpt_server.py、component_configs.py、scene/</td>
+      </tr>
+      <tr>
+        <td><span class="badge ext">ext</span> dbgpt-client</td>
+        <td><code>dbgpt-client</code></td>
+        <td>外部 Python SDK</td>
+        <td>Client、schema、app、flow、knowledge、datasource</td>
+      </tr>
+      <tr>
+        <td><span class="badge ext">ext</span> dbgpt-sandbox</td>
+        <td><code>dbgpt-sandbox</code></td>
+        <td>代码执行沙箱</td>
+        <td>docker 化隔离运行环境、selenium 浏览器</td>
+      </tr>
+      <tr>
+        <td><span class="badge ext">ext</span> dbgpt-accelerator</td>
+        <td><code>dbgpt-acc-auto</code> / <code>dbgpt-acc-flash-attn</code></td>
+        <td>硬件加速（可选）</td>
+        <td>torch / vllm / flash-attn 自动探测</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout tip">
+    <strong>"6+1"的含义：</strong>核心 6 个包都直接参与业务链路；accelerator 是 "+1"，因为它只在模型推理这一环做硬件加速，业务代码可以完全不感知它的存在。这也对应了 <code>dbgpt-app/pyproject.toml</code> 第 13 行 <code>"dbgpt-acc-auto"</code> 这种近乎"无感"的依赖方式。
+  </div>
+
+  <!-- ===================== 3. dbgpt-core ===================== -->
+  <h2 id="pkg-core">三、dbgpt-core：抽象与契约层</h2>
+
+  <p><code>dbgpt-core</code> 的发布名其实就叫 <code>dbgpt</code>（见 <code>packages/dbgpt-core/pyproject.toml</code> 第 2 行 <code>name = "dbgpt"</code>），它是整个 monorepo 的<strong>底座</strong>。其余 5 个业务包都必须直接或间接地依赖它。</p>
+
+  <h3>3.1 它定义了什么</h3>
+  <ul>
+    <li><strong>组件容器</strong>：<code>dbgpt/component.py</code> 里的 <code>SystemApp</code>、<code>BaseComponent</code>、<code>ComponentType</code>、<code>LifeCycle</code>；</li>
+    <li><strong>核心接口</strong>：<code>core/interface/</code> 下的 <code>llm.py</code>、<code>storage.py</code>、<code>message.py</code>、<code>embeddings.py</code>；</li>
+    <li><strong>AWEL 引擎</strong>：<code>core/awel/</code> 下的 DAG、operators、trigger、flow；</li>
+    <li><strong>通用工具</strong>：<code>dbgpt/util/</code> 下的 <code>AppConfig</code>、<code>annotations.PublicAPI</code>、fastapi 工具等。</li>
+  </ul>
+
+  <h3>3.2 依赖为什么这么"瘦"</h3>
+
+  <p>看 <code>packages/dbgpt-core/pyproject.toml</code> 第 14-27 行的强制依赖：</p>
+
+  <div class="file-block">
+    <div class="file-header">
+      <span>packages/dbgpt-core/pyproject.toml</span>
+      <span class="lines">第 14-27 行</span>
+    </div>
+    <div class="file-body">
+<pre><code><span class="k">dependencies</span> = [
+    <span class="s">"aiohttp==3.8.4"</span>,
+    <span class="s">"chardet==5.1.0"</span>,
+    <span class="s">"importlib-resources==5.12.0"</span>,
+    <span class="s">"cachetools"</span>,
+    <span class="s">"pydantic>=2.6.0"</span>,
+    <span class="c"># For AWEL type checking</span>
+    <span class="s">"typeguard"</span>,
+    <span class="c"># Snowflake no additional dependencies.</span>
+    <span class="s">"snowflake-id"</span>,
+    <span class="s">"typing_inspect"</span>,
+    <span class="s">"tomli>=2.2.1"</span>,
+    <span class="s">"apscheduler>=3.10,&lt;4"</span>,
+]</code></pre>
+    </div>
+  </div>
+
+  <p>没有 SQLAlchemy、没有 transformers、没有 fastapi —— 这些都被挪到了 <code>[project.optional-dependencies]</code> 里。设计文档第 93-96 行直接给出了原因：</p>
+
+  <div class="callout tip">
+    <strong>设计原则：</strong>核心保持轻量（Minimal Core），让用户只装自己需要的特性；不同模型 provider 之间的版本冲突在 extras 层面解决，而不是污染基础包。例如 <code>hf_glm4</code> 需要 <code>transformers>=4.51.3</code> 而 <code>hf_kimi</code> 需要 <code>transformers&lt;4.51.3</code>，两者在第 178-195 行用 <code>conflicts</code> 显式声明互斥，uv 就能在安装阶段识别冲突。
+  </div>
+
+  <h3>3.3 extras 如何切分能力</h3>
+  <p>core 包把可选项切成至少 11 组，常见的几组：</p>
+  <ul>
+    <li><code>client</code>：fastapi + httpx，提供 HTTP 客户端能力；</li>
+    <li><code>cli</code>：click + rich + prettytable，提供 <code>dbgpt</code> 命令行；</li>
+    <li><code>agent</code>：pandas / numpy / mcp，提供 Agent 执行环境；</li>
+    <li><code>simple_framework</code>：SQLAlchemy + duckdb + jinja2 + uvicorn，提供"开箱即跑"的最小框架；</li>
+    <li><code>framework</code>：alembic / transformers tokenizers / graphviz / cryptography / pyzmq，是生产部署需要的"全家桶"；</li>
+    <li><code>proxy_openai</code> / <code>proxy_tongyi</code> / <code>proxy_zhipuai</code> / <code>proxy_anthropic</code> / <code>proxy_litellm</code>：各家大模型代理；</li>
+    <li><code>code</code>：<code>lyric-py</code> 系列 + cloudpickle，支持代码执行与 AWEL 算子序列化。</li>
+  </ul>
+
+  <!-- ===================== 4. dbgpt-ext ===================== -->
+  <h2 id="pkg-ext">四、dbgpt-ext：可插拔实现层</h2>
+
+  <p>如果说 core 是"接口"，那么 ext 就是"实现"。它的依赖关系最干净——只反向依赖 core：</p>
+
+  <pre><code><span class="c"># packages/dbgpt-ext/pyproject.toml 第 12-15 行</span>
+<span class="k">dependencies</span> = [
+    <span class="s">"dbgpt>=0.7.0"</span>,
+    <span class="s">"pymysql"</span>,
+]</code></pre>
+
+  <p>ext 把所有"可选集成"按维度切成几十个 extras，覆盖了三类资源：</p>
+  <ul>
+    <li><strong>数据源</strong>：<code>datasource_mysql / oracle / postgres / clickhouse / spark / mssql / hive / vertica / duckdb</code>；</li>
+    <li><strong>向量 / 存储</strong>：<code>storage_milvus / weaviate / chromadb / elasticsearch / qdrant / obvector / valkey</code>；</li>
+    <li><strong>RAG / 文件</strong>：<code>rag</code>（spacy/pypdf/python-docx）、<code>graph_rag</code>（networkx/neo4j）、<code>file_oss</code>、<code>file_s3</code>。</li>
+  </ul>
+
+  <p>这种切法带来三个直接收益：</p>
+  <ol>
+    <li>用户安装时只装自己真正要用的依赖，避免 <code>pip install</code> 一拉几百 MB；</li>
+    <li>不同 backend 之间的版本冲突天然隔离（比如 chromadb 的 onnxruntime 上限不会污染 milvus）；</li>
+    <li>新加一种存储/数据源只需要新增 extras + 在 <code>src/dbgpt_ext/storage/</code> 或 <code>src/dbgpt_ext/datasource/</code> 下加实现类，core 一行都不用动 —— 这就是<strong>开闭原则</strong>。</li>
+  </ol>
+
+  <!-- ===================== 5. dbgpt-serve ===================== -->
+  <h2 id="pkg-serve">五、dbgpt-serve：服务编排层</h2>
+
+  <p><code>dbgpt-serve</code> 的角色是<strong>把 core 抽象 + ext 实现组合成 REST 服务</strong>。它的依赖极简，只反向依赖 ext：</p>
+
+  <pre><code><span class="c"># packages/dbgpt-serve/pyproject.toml 第 12-15 行</span>
+<span class="k">dependencies</span> = [
+    <span class="s">"dbgpt-ext"</span>,
+    <span class="s">"apscheduler>=3.10,&lt;4"</span>,
+]</code></pre>
+
+  <p>serve 的内部按业务领域切成若干子目录（来自设计文档第 105-114 行）：</p>
+  <ul>
+    <li><code>serve/agent/</code>：Agent 生命周期管理；</li>
+    <li><code>serve/conversation/</code>：会话与上下文；</li>
+    <li><code>serve/datasource/</code>：数据源连接服务；</li>
+    <li><code>serve/flow/</code>：AWEL 工作流的服务化；</li>
+    <li><code>serve/model/</code>：模型服务与管理；</li>
+    <li><code>serve/rag/</code>：RAG pipeline 的 REST 化；</li>
+    <li><code>serve/prompt/</code>：Prompt 模板管理；</li>
+    <li><code>serve/core/</code>：服务层公共工具。</li>
+  </ul>
+
+  <div class="callout tip">
+    <strong>为什么 serve 只依赖 ext 而不直接依赖 core？</strong>因为 ext 已经把 core 作为强制依赖带进来了，serve 通过 extras 传递依赖关系（比如 <code>dbgpt-ext[rag,storage_chromadb]</code>）。这样 serve 这一层只需要关心<strong>"业务领域如何组装"</strong>，而把"具体用哪个向量库"留给更上层 app 决定。
+  </div>
+
+  <!-- ===================== 6. dbgpt-app ===================== -->
+  <h2 id="pkg-app">六、dbgpt-app：应用集成层（运行入口）</h2>
+
+  <p>app 是<strong>真正的"可执行应用"</strong>，它把所有包捏合成一个 FastAPI 服务。它的依赖最"重"：</p>
+
+  <div class="file-block">
+    <div class="file-header">
+      <span>packages/dbgpt-app/pyproject.toml</span>
+      <span class="lines">第 12-22 行</span>
+    </div>
+    <div class="file-body">
+<pre><code><span class="k">dependencies</span> = [
+    <span class="s">"dbgpt-acc-auto"</span>,
+    <span class="s">"dbgpt[client,cli,agent,simple_framework,framework,code,proxy_openai,proxy_tongyi,proxy_zhipuai]"</span>,
+    <span class="s">"dbgpt-ext[rag,storage_chromadb]"</span>,
+    <span class="s">"dbgpt-serve"</span>,
+    <span class="s">"dbgpt-client"</span>,
+    <span class="s">"dbgpt-sandbox"</span>,
+    <span class="s">"aiofiles"</span>,
+    <span class="s">"httpx>=0.24.0"</span>,
+    <span class="s">"pyparsing"</span>,
+]</code></pre>
+    </div>
+  </div>
+
+  <p>可以看出 app 几乎把整个 monorepo 全部装配在一起：core 的若干 extras、ext 的 RAG+chromadb、serve、client、sandbox、accelerator 全到位。这正是"集成层"该有的样子——它要做所有的<strong>装配（wiring）</strong>工作。app 内部最关键的三个文件（设计文档第 146-153 行）：</p>
+  <ul>
+    <li><code>dbgpt_app/dbgpt_server.py</code>：FastAPI 入口，<code>SystemApp(app)</code> 就在这里创建；</li>
+    <li><code>dbgpt_app/component_configs.py</code>：组件注册表，决定要 load 哪些 BaseComponent；</li>
+    <li><code>dbgpt_app/initialization/</code>：数据库迁移、启动初始化逻辑。</li>
+  </ul>
+
+  <p>设计文档第 158-162 行给出的装配范式：</p>
+  <pre><code><span class="t">system_app</span> = <span class="f">SystemApp</span>(app)
+<span class="f">mount_routers</span>(app)
+<span class="f">initialize_components</span>(param, system_app)</code></pre>
+
+  <p>这三行是整个 DB-GPT 运行时的"骨架"，第 02 章会逐行展开。这里只需要记住：<strong>SystemApp 是骨架中的脊椎</strong>。</p>
+
+  <!-- ===================== 7. dbgpt-client ===================== -->
+  <h2 id="pkg-client">七、dbgpt-client：外部 Python SDK</h2>
+
+  <p>client 包给<strong>外部应用</strong>提供一个统一的 Python SDK，让第三方代码可以不启动整个 DB-GPT 服务就调用其能力。它的依赖刻意保持"瘦"：</p>
+
+  <pre><code><span class="c"># packages/dbgpt-client/pyproject.toml 第 12-22 行</span>
+<span class="k">dependencies</span> = [
+    <span class="s">"dbgpt[client,cli]"</span>,
+    <span class="s">"dbgpt_ext"</span>,
+    <span class="s">"shortuuid"</span>,
+    <span class="s">"SQLAlchemy>=2.0.25, &lt;2.0.29"</span>,
+    <span class="s">"msgpack"</span>,        <span class="c"># 序列化</span>
+    <span class="s">"cloudpickle"</span>,    <span class="c"># AWEL 算子序列化</span>
+]</code></pre>
+
+  <p>设计文档第 212-213 行给出的接口形态：</p>
+  <pre><code><span class="k">class</span> <span class="t">Client</span>:
+    <span class="k">async def</span> <span class="f">chat</span>(self, model: <span class="t">str</span>, messages: <span class="t">Union</span>[<span class="t">str</span>, <span class="t">List</span>[<span class="t">str</span>]], ...)
+    <span class="k">async def</span> <span class="f">chat_stream</span>(self, model: <span class="t">str</span>, messages: <span class="t">Union</span>[<span class="t">str</span>, <span class="t">List</span>[<span class="t">str</span>]], ...)</code></pre>
+
+  <p>这套接口刻意做成<strong>OpenAI 兼容</strong>风格（设计文档第 222-226 行），好处是：</p>
+  <ol>
+    <li>已经在用 OpenAI SDK 的存量应用可以平滑迁移；</li>
+    <li>符合 AI 行业的事实标准，降低学习成本；</li>
+    <li>便于在 LangChain / LlamaIndex 这类生态里直接接入。</li>
+  </ol>
+
+  <!-- ===================== 8. dbgpt-sandbox ===================== -->
+  <h2 id="pkg-sandbox">八、dbgpt-sandbox：安全代码执行沙箱</h2>
+
+  <p>sandbox 是为 Agent 代码执行场景准备的独立包，定位见其 description：</p>
+  <pre><code><span class="c"># packages/dbgpt-sandbox/pyproject.toml 第 3-4 行</span>
+<span class="k">name</span> = <span class="s">"dbgpt-sandbox"</span>
+<span class="k">description</span> = <span class="s">"A secure sandbox execution environment for DB-GPT Agent"</span></code></pre>
+
+  <p>它的依赖里最值得注意的三行：</p>
+  <ul>
+    <li><code>"docker>=6.0.0"</code>：用 Docker 做进程级隔离；</li>
+    <li><code>"selenium>=4.0.0"</code>：支持浏览器自动化（Agent 浏览网页场景）；</li>
+    <li><code>"fastapi>=0.68.0"</code> + <code>"uvicorn>=0.15.0"</code>：沙箱自身也是一个独立的 HTTP 服务，可以远程调用。</li>
+  </ul>
+
+  <p>它甚至有独立的可执行入口 <code>dbgpt-sandbox = "dbgpt_sandbox.sandbox.main:main"</code>（第 57 行），说明沙箱服务<strong>可以独立部署</strong>到一台专门的机器上，主服务通过网络调用。这对生产环境的安全性很重要——Agent 写出的代码哪怕有恶意，也不会碰到主进程的内存。</p>
+
+  <!-- ===================== 9. dbgpt-accelerator ===================== -->
+  <h2 id="pkg-acc">九、dbgpt-accelerator：硬件加速</h2>
+
+  <p>accelerator 目录下目前有两个子包：</p>
+  <ul>
+    <li><code>dbgpt-acc-auto</code>：自动探测硬件并选择最合适的加速方案；</li>
+    <li><code>dbgpt-acc-flash-attn</code>：Flash Attention 专用加速。</li>
+  </ul>
+
+  <p>acc-auto 自己 <code>dependencies = []</code>（第 11 行），真正的 torch / vllm / bitsandbytes 都在 extras 里，并且按平台 marker 区分：</p>
+  <ul>
+    <li><code>auto / cpu / cuda118 / cuda121 / cuda124</code>：四选一的 CUDA 版本；</li>
+    <li><code>vllm</code>：仅在 Linux 上可用的高性能推理；</li>
+    <li><code>mlx</code>：仅 macOS Apple Silicon；</li>
+    <li><code>quant_bnb / quant_gptq / quant_gptqmodel</code>：各种量化方案。</li>
+  </ul>
+
+  <p>设计文档第 288-292 行点明了它的设计哲学："Optional Performance + Hardware Specific + Fallback Support"。也就是说：</p>
+  <div class="callout tip">
+    <strong>加速是可选的、硬件相关的、可降级的。</strong>没装 torch 时，core 里的模型加载逻辑会自动走"无加速"路径；装了 vllm 就优先走 vllm。业务层代码完全不用关心这些差异——这就是把"加速策略"从"业务代码"中剥离出来的收益。
+  </div>
+
+  <!-- ===================== 10. 依赖倒置 ===================== -->
+  <h2 id="dip">十、依赖倒置原则：为什么 core 永远最底层</h2>
+
+  <p>把六个包的依赖关系画成一张图，可以立刻看出一条铁律——<strong>箭头永远从上层指向 core，core 不依赖任何业务包</strong>。</p>
+
+  <div class="mermaid">
+flowchart TD
+    APP["dbgpt-app<br/>顶层入口<br/>(FastAPI server + scene)"]
+    SERVE["dbgpt-serve<br/>(REST API)"]
+    CLIENT["dbgpt-client<br/>(SDK)"]
+    SANDBOX["dbgpt-sandbox<br/>(代码沙箱)"]
+    EXT["dbgpt-ext<br/>可插拔实现<br/>datasource/storage/rag/llms"]
+    CORE["dbgpt-core<br/>抽象契约<br/>SystemApp / AWEL / interface<br/>(不依赖任何业务包)"]
+    ACC["dbgpt-accelerator<br/>(硬件加速, 侧路)"]
+
+    APP --> SERVE
+    APP --> CLIENT
+    APP --> SANDBOX
+    SERVE --> EXT
+    CLIENT --> EXT
+    EXT --> CORE
+    ACC -.-> CORE
+  </div>
+
+  <p>这张图里的箭头方向就是<strong>编译期依赖</strong>的方向。它带来的好处：</p>
+  <ol>
+    <li><strong>core 永远稳定</strong>：因为 core 不引用任何上层模块，core 的 API 变更不会触发上层"反向"修改；</li>
+    <li><strong>测试好写</strong>：测试 core 时不需要起 docker、不需要装 SQLAlchemy；测试 serve 时可以 mock ext；</li>
+    <li><strong>循环依赖天然不存在</strong>：dag 结构里没有回路，<code>import</code> 不会 deadlock；</li>
+    <li><strong>二次开发友好</strong>：自己写一个 <code>mycompany-dbgpt-ext</code> 只依赖 core，就能替换官方的 ext。</li>
+  </ol>
+
+  <p>设计文档第 310-313 行原话："Higher-level modules (app, serve) depend on abstractions (core) rather than concrete implementations (ext)."——这是依赖倒置原则（DIP）的标准表述。</p>
+
+  <!-- ===================== 11. uv workspace ===================== -->
+  <h2 id="uv">十一、uv workspace 是怎么把 monorepo 跑起来的</h2>
+
+  <p>回到顶层 <code>pyproject.toml</code>，关键的三段是：</p>
+
+  <h4>第 15-23 行：<code>[tool.uv.sources]</code> 声明本地替换</h4>
+  <pre><code><span class="n">[tool.uv.sources]</span>
+<span class="k">dbgpt</span>         = { workspace = <span class="k">true</span> }
+<span class="k">dbgpt-client</span> = { workspace = <span class="k">true</span> }
+<span class="k">dbgpt-ext</span>    = { workspace = <span class="k">true</span> }
+<span class="k">dbgpt-serve</span>  = { workspace = <span class="k">true</span> }
+<span class="k">dbgpt-app</span>    = { workspace = <span class="k">true</span> }
+<span class="k">dbgpt-acc-auto</span>     = { workspace = <span class="k">true</span> }
+<span class="k">dbgpt-acc-flash-attn</span> = { workspace = <span class="k">true</span> }
+<span class="k">dbgpt-sandbox</span> = { workspace = <span class="k">true</span> }</code></pre>
+
+  <p>这段配置告诉 uv："当代码里 <code>import dbgpt</code> 或在依赖列表里写 <code>"dbgpt"</code> 时，不要去 PyPI 下载，而是<strong>从 workspace 内部解析</strong>。"这是 monorepo 能做到"改 core 一行代码，app 立刻生效"的关键。</p>
+
+  <h4>第 31-40 行：<code>[tool.uv.workspace]</code> 列出成员</h4>
+  <p>已经在第二节给出，成员路径里 <code>"packages/dbgpt-accelerator/dbgpt-acc*"</code> 这种通配符写法表示 accelerator 目录下所有以 <code>dbgpt-acc-</code> 开头的子包都自动纳入 workspace。</p>
+
+  <h4>第 42-60 行：<code>[tool.uv]</code> 顶层 dev 依赖</h4>
+  <p>pytest、ruff、mypy、pre-commit 这些<strong>跨包共用</strong>的开发工具，放在顶层而不是每个子包重复声明。子包自己的 <code>[tool.uv] dev-dependencies</code> 大多为空（如 <code>dbgpt-serve</code> 第 28-29 行 <code>dev-dependencies = []</code>），只有需要特殊测试工具时才在子包层补充（例如 <code>dbgpt-ext</code> 第 94 行加了 <code>"pytest>=8.3.4"</code>）。</p>
+
+  <div class="callout tip">
+    <strong>工作机制总结：</strong>uv 通过 <code>[tool.uv.workspace]</code> 把 7 个子目录识别为同一个虚拟环境的成员；通过 <code>[tool.uv.sources]</code> 让成员之间的相互引用走本地路径而不是 PyPI；通过 <code>[tool.uv] managed = true</code> 接管整个依赖解析。开发者只需要在仓库根目录 <code>uv sync</code> 一次，所有子包就同时可编辑、可调试、可测试。
+  </div>
+
+  <!-- ===================== 12. SystemApp ===================== -->
+  <h2 id="systemapp">十二、SystemApp：组件容器的灵魂</h2>
+
+  <p>所有包能在运行时协同工作，靠的不是"互相 import"，而是通过 <code>SystemApp</code> 这个<strong>组件容器</strong>。它位于 <code>D:/code/DB-GPT/packages/dbgpt-core/src/dbgpt/component.py</code>。</p>
+
+  <h3>12.1 LifeCycle：统一的生命周期钩子</h3>
+
+  <p>所有组件都继承自 <code>LifeCycle</code>（第 27-79 行），它定义了 5 对同步/异步钩子：</p>
+
+  <div class="file-block">
+    <div class="file-header">
+      <span>dbgpt/component.py · LifeCycle 执行顺序</span>
+      <span class="lines">第 28-36 行</span>
+    </div>
+    <div class="file-body">
+<pre><code><span class="k">class</span> <span class="t">LifeCycle</span>:
+    <span class="s">"""Execution order of lifecycle hooks:
+    1. on_init
+    2. after_init
+    3. before_start(async_before_start)
+    4. after_start(async_after_start)
+    5. before_stop(async_before_stop)
+    """</span></code></pre>
+    </div>
+  </div>
+
+  <p>每个钩子的语义（来自第 38-79 行的 docstring）：</p>
+  <ul>
+    <li><code>on_init</code>：组件被注册时触发，做最轻量的初始化；</li>
+    <li><code>after_init</code>：注释里写明"大多数情况下你应该在这里初始化数据库连接"；</li>
+    <li><code>before_start</code>：服务即将 listen 之前；</li>
+    <li><code>after_start</code>：服务已经启动，可以接收请求了；</li>
+    <li><code>before_stop</code>：进程退出前的清理钩子。</li>
+  </ul>
+
+  <h3>12.2 SystemApp 本身：一个组件注册表</h3>
+
+  <p>SystemApp 继承自 LifeCycle（第 172 行），同时内部维护一个字典：</p>
+
+  <div class="file-block">
+    <div class="file-header">
+      <span>dbgpt/component.py · SystemApp.__init__</span>
+      <span class="lines">第 176-188 行</span>
+    </div>
+    <div class="file-body">
+<pre><code><span class="k">def</span> <span class="f">__init__</span>(self,
+             asgi_app: <span class="t">Optional</span>[<span class="s">"FastAPI"</span>] = <span class="k">None</span>,
+             app_config: <span class="t">Optional</span>[<span class="t">AppConfig</span>] = <span class="k">None</span>) -> <span class="k">None</span>:
+    self.components: <span class="t">Dict</span>[<span class="t">str</span>, <span class="t">BaseComponent</span>] = {}
+    self._asgi_app = asgi_app
+    self._app_config = app_config <span class="k">or</span> <span class="f">AppConfig</span>()
+    self._stop_event = <span class="f">threading.Event</span>()
+    self._stop_event.<span class="f">clear</span>()
+    self.<span class="f">_build</span>()</code></pre>
+    </div>
+  </div>
+
+  <p>它持有三个核心字段：</p>
+  <ul>
+    <li><code>components: Dict[str, BaseComponent]</code>：组件注册表，key 是组件 name；</li>
+    <li><code>_asgi_app</code>：FastAPI 实例（可选，CLI 场景下可以为 None）；</li>
+    <li><code>_app_config</code>：统一配置对象。</li>
+  </ul>
+
+  <h3>12.3 注册与查询：依赖注入的核心</h3>
+
+  <p>注册一个组件有两种方式（第 200-232 行）：</p>
+  <ul>
+    <li><code>register(component_type, *args, **kwargs)</code>：传入类，SystemApp 帮你实例化；</li>
+    <li><code>register_instance(instance)</code>：传入已构造好的实例。</li>
+  </ul>
+
+  <p>查询组件使用 <code>get_component(name, component_type, ...)</code>（第 234-266 行），它的<strong>容错策略</strong>很有意思——查不到时可以：</p>
+  <ol>
+    <li>传入 <code>or_register_component</code>：现场注册一个新实例并返回；</li>
+    <li>传入 <code>default_component</code>：直接返回这个默认值（不注册）；</li>
+    <li>否则抛 <code>ValueError("No component found with name {name}")</code>。</li>
+  </ol>
+
+  <p>同时还有一层类型校验（第 264-265 行）：<code>isinstance(component, component_type)</code> 不匹配就抛 TypeError，避免业务代码拿错组件类型。</p>
+
+  <h3>12.4 为什么这套设计能"避免循环依赖"</h3>
+
+  <div class="callout tip">
+    <strong>关键洞察：</strong>假设 serve 层的 <code>ModelServe</code> 需要调用 core 层的 <code>WorkerManager</code>，而 <code>WorkerManager</code> 又需要触发 serve 的某个回调。如果双方直接 import 对方，就会形成循环。SystemApp 的解法是：<strong>双方都只依赖 <code>BaseComponent</code> 抽象</strong>，运行时通过 <code>system_app.get_component(ComponentType.WORKER_MANAGER, WorkerManager)</code> 拿实例。编译期没有循环 import，运行期通过注册表完成解耦。设计文档第 41-43 行把这总结为"Eliminates circular dependencies between modules"。
+  </div>
+
+  <h3>12.5 与 FastAPI 生命周期的绑定</h3>
+
+  <p>第 333-359 行的 <code>_build()</code> 方法把 SystemApp 的生命周期<strong>自动绑定</strong>到 FastAPI 的 startup / shutdown 事件：</p>
+
+  <div class="file-block">
+    <div class="file-header">
+      <span>dbgpt/component.py · _build</span>
+      <span class="lines">第 340-359 行（节选）</span>
+    </div>
+    <div class="file-body">
+<pre><code><span class="k">async def</span> <span class="f">startup_event</span>(self):
+    <span class="k">async def</span> <span class="f">_startup_func</span>():
+        <span class="k">try</span>:
+            <span class="k">await</span> self.<span class="f">async_after_start</span>()
+        <span class="k">except</span> <span class="t">Exception</span> <span class="k">as</span> e:
+            <span class="f">logger</span>.<span class="f">error</span>(<span class="s">f"Error starting system app: {e}"</span>)
+            sys.<span class="f">exit</span>(<span class="n">1</span>)
+    asyncio.<span class="f">create_task</span>(<span class="f">_startup_func</span>())
+    self.<span class="f">after_start</span>()
+
+<span class="k">async def</span> <span class="f">shutdown_event</span>(self):
+    <span class="k">await</span> self.<span class="f">async_before_stop</span>()
+    self.<span class="f">before_stop</span>()
+
+<span class="f">register_event_handler</span>(self.app, <span class="s">"startup"</span>, startup_event)
+<span class="f">register_event_handler</span>(self.app, <span class="s">"shutdown"</span>, shutdown_event)</code></pre>
+    </div>
+  </div>
+
+  <p>也就是说：只要把 SystemApp 创建出来，所有注册过的组件会自动随着 FastAPI 启动而 <code>after_start</code>，随着 FastAPI 关闭而 <code>before_stop</code>。这是 DB-GPT 整个生命周期管理的<strong>单一入口</strong>。</p>
+
+  <h3>12.6 ComponentType：一份预定义的组件清单</h3>
+
+  <p>第 82-105 行的 <code>ComponentType</code> 枚举列出了系统级组件的命名约定，常见的有：</p>
+  <ul>
+    <li><code>WORKER_MANAGER</code> / <code>WORKER_MANAGER_FACTORY</code>：模型 worker 管理；</li>
+    <li><code>MODEL_CONTROLLER</code> / <code>MODEL_REGISTRY</code>：模型注册与路由；</li>
+    <li><code>MODEL_CACHE_MANAGER</code>：模型推理结果缓存；</li>
+    <li><code>PLUGIN_HUB</code>：插件中心；</li>
+    <li><code>MULTI_AGENTS</code>：多 Agent 管理；</li>
+    <li><code>TRACER</code> / <code>TRACER_SPAN_STORAGE</code>：链路追踪；</li>
+    <li><code>RAG_GRAPH_DEFAULT</code>：RAG 图引擎；</li>
+    <li><code>AWEL_TRIGGER_MANAGER</code> / <code>AWEL_DAG_MANAGER</code>：AWEL 工作流；</li>
+    <li><code>AGENT_MANAGER</code> / <code>RESOURCE_MANAGER</code> / <code>SKILL_MANAGER</code>：Agent 资源体系。</li>
+  </ul>
+
+  <p>这套枚举不是"封闭"的——业务方完全可以自定义新的 <code>ComponentType</code>，但官方预定义的这些就是<strong>阅读源码的索引</strong>：在 <code>component_configs.py</code> 里看到 <code>ComponentType.XXX</code>，就能反查到对应的实现类。</p>
+
+  <!-- ===================== 13. 分层架构总览图 ===================== -->
+  <h2 id="layered">十三、分层架构总览图</h2>
+
+  <p>把前面 12 节的内容综合起来，DB-GPT 的运行时分层如下：</p>
+
+  <div class="mermaid">
+flowchart TD
+    USER["用户 / 外部系统<br/>(Web UI / OpenAI SDK / Python Client)"]
+    APP["dbgpt-app (FastAPI)<br/>scene/ (业务场景)<br/>openapi/ (REST)<br/>initialization/"]
+    CLIENT["dbgpt-client (SDK)<br/>Client.chat(...)<br/>Client.flow(...)<br/>Client.knowledge()"]
+    SERVE["dbgpt-serve (REST 服务)<br/>agent / flow / model /<br/>rag / conversation / ..."]
+    EXT["dbgpt-ext (可插拔实现)<br/>datasource / storage /<br/>rag / llms / vis"]
+    SANDBOX["dbgpt-sandbox<br/>(Docker 代码沙箱)"]
+    CORE["dbgpt-core 抽象层<br/>SystemApp 组件容器<br/>AWEL DAG 工作流引擎<br/>core/interface llm/storage/…"]
+    ACC["dbgpt-accelerator (硬件加速)<br/>torch / vllm / flash-attn / bitsandbytes"]
+
+    USER -->|"HTTP"| APP
+    USER -->|"Python import"| CLIENT
+    APP --> SERVE
+    CLIENT --> SERVE
+    SERVE --> EXT
+    APP --> SANDBOX
+    EXT -->|"import 抽象"| CORE
+    ACC -.->|"可选 / 自动探测"| CORE
+  </div>
+
+  <!-- ===================== 14. 包间依赖关系表 ===================== -->
+  <h2 id="dep-table">十四、包间依赖关系表</h2>
+
+  <p>下表汇总自各包 <code>pyproject.toml</code> 的 <code>[project.dependencies]</code> 和 <code>[project.optional-dependencies]</code>，"<code>↳ extras</code>"表示通过 extras 传递的能力组合。</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>包 (发布名)</th>
+        <th>直接 dependencies</th>
+        <th>引入的 extras</th>
+        <th>被谁依赖</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>dbgpt-core</strong><br><code>dbgpt</code></td>
+        <td>aiohttp, pydantic, typeguard, snowflake-id, apscheduler 等</td>
+        <td>11 组：client/cli/agent/simple_framework/framework/hf/code/proxy_*/model_vl</td>
+        <td>ext / serve / app / client</td>
+      </tr>
+      <tr>
+        <td><strong>dbgpt-ext</strong><br><code>dbgpt-ext</code></td>
+        <td><code>dbgpt&gt;=0.7.0</code>, pymysql</td>
+        <td>9 类 datasource + 7 类 storage + rag/graph_rag/file_*</td>
+        <td>serve / app / client</td>
+      </tr>
+      <tr>
+        <td><strong>dbgpt-serve</strong><br><code>dbgpt-serve</code></td>
+        <td><code>dbgpt-ext</code>, apscheduler</td>
+        <td>libro / dbgpts</td>
+        <td>app</td>
+      </tr>
+      <tr>
+        <td><strong>dbgpt-app</strong><br><code>dbgpt-app</code></td>
+        <td><code>dbgpt-acc-auto</code>, <code>dbgpt[...]</code>, <code>dbgpt-ext[rag,storage_chromadb]</code>, <code>dbgpt-serve</code>, <code>dbgpt-client</code>, <code>dbgpt-sandbox</code></td>
+        <td>cache / observability / base / dbgpts</td>
+        <td>—（顶层入口）</td>
+      </tr>
+      <tr>
+        <td><strong>dbgpt-client</strong><br><code>dbgpt-client</code></td>
+        <td><code>dbgpt[client,cli]</code>, <code>dbgpt_ext</code>, shortuuid, SQLAlchemy, msgpack, cloudpickle</td>
+        <td>—</td>
+        <td>app</td>
+      </tr>
+      <tr>
+        <td><strong>dbgpt-sandbox</strong><br><code>dbgpt-sandbox</code></td>
+        <td>docker, selenium, fastapi, uvicorn, pydantic</td>
+        <td>dev</td>
+        <td>app</td>
+      </tr>
+      <tr>
+        <td><strong>dbgpt-acc-auto</strong><br><code>dbgpt-acc-auto</code></td>
+        <td><code>[]</code>（空）</td>
+        <td>auto/cpu/cuda118-124/vllm/mlx/quant_*/flash_attn</td>
+        <td>app</td>
+      </tr>
+      <tr>
+        <td><strong>dbgpt-acc-flash-attn</strong></td>
+        <td>（由 acc-auto 的 <code>flash_attn</code> extras 引入）</td>
+        <td>—</td>
+        <td>acc-auto</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout tip">
+    <strong>阅读这张表的诀窍：</strong>从下往上看，可以看到一条清晰的"装配链"——core 提供契约 → ext 提供实现 → serve 包装成服务 → app 装配出可运行进程。任何一个包都可以<strong>单独发布到 PyPI</strong>（事实上它们都各自有 <code>[build-system] requires = ["hatchling"]</code>），用户完全可以只装 <code>dbgpt-ext[storage_milvus]</code> 去用它的向量存储能力，而不启动整个 app。
+  </div>
+
+  <div class="quiz">
+    <h4>思考题</h4>
+    <ul>
+      <li>1. 如果让你新加一种向量库（比如 Redis），应该改 core / ext / serve / app 中的哪几层？分别要加什么文件？</li>
+      <li>2. <code>dbgpt-app</code> 的依赖里同时出现了 <code>"dbgpt[...]"</code> 和 <code>"dbgpt-ext[rag,storage_chromadb]"</code>——为什么不直接把所有 extras 都塞进 core 包的强制依赖？</li>
+      <li>3. <code>SystemApp.get_component()</code> 的 <code>or_register_component</code> 参数和 <code>default_component</code> 参数行为有什么区别？什么场景下该用哪个？</li>
+      <li>4. LifeCycle 的 <code>after_init</code> 注释建议"在这里初始化数据库连接"，而不是在 <code>on_init</code> 里。试结合 <code>register_instance</code> 的调用顺序，思考为什么连接不能太早建立？</li>
+      <li>5. <code>dbgpt-sandbox</code> 为什么被设计成可以独立部署的 HTTP 服务，而不是直接作为 app 的子进程？这种设计在安全 / 性能 / 运维上各带来什么收益？</li>
+      <li>6. 顶层 <code>pyproject.toml</code> 里 <code>[tool.uv.sources]</code> 写了 8 个 <code>workspace = true</code>。如果漏写其中一项，会发生什么？</li>
+      <li>7. <code>dbgpt-core</code> 的 <code>conflicts</code> 段（第 178-195 行）声明了若干 extras 互斥。如果用户同时 <code>pip install dbgpt[hf_glm4,hf_kimi]</code>，pip 和 uv 分别会怎么处理？</li>
+      <li>8. 从分层架构图看，<code>dbgpt-accelerator</code> 在业务链路上的位置是"侧路"。如果未来要支持一种全新的加速硬件（比如 TPU），需要改动哪些包？core 真的完全不用动吗？</li>
+    </ul>
+  </div>
+
+  <div class="pager">
+    <a href="index.html">← 总览</a>
+    <a href="02-startup.html">02 · 启动流程 →</a>
+  </div>
+</main>
+
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: 'base',
+    themeVariables: {
+      primaryColor: '#1a2029',
+      primaryTextColor: '#e6e6e6',
+      primaryBorderColor: '#4ec9b0',
+      lineColor: '#569cd6',
+      secondaryColor: '#232b37',
+      tertiaryColor: '#0f1419',
+      textColor: '#e6e6e6',
+      fontFamily: 'JetBrains Mono, Consolas, monospace',
+      fontSize: '16px'
+    },
+    flowchart: { curve: 'basis', padding: 20, useMaxWidth: true }
+  });
+</script>
+</body>
+</html>

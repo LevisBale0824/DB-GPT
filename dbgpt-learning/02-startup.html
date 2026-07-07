@@ -1,0 +1,912 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>02 · 启动流程 — DB-GPT 源码精读</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="layout">
+
+<aside class="sidebar">
+  <h2>DBGPT 精读</h2>
+  <ul><li><a href="index.html">总览</a></li></ul>
+  <div class="group-title">入门</div>
+  <ul>
+    <li><a href="01-architecture.html">01 · 整体架构</a></li>
+    <li><a href="02-startup.html" class="active">02 · 启动流程</a></li>
+  </ul>
+  <div class="group-title">核心子系统</div>
+  <ul>
+    <li><a href="03-awel.html">03 · AWEL 工作流</a></li>
+    <li><a href="04-agent.html">04 · Agent 系统</a></li>
+    <li><a href="05-rag.html">05 · RAG 检索</a></li>
+    <li><a href="06-model.html">06 · 模型层</a></li>
+    <li><a href="07-datasource.html">07 · 数据源</a></li>
+  </ul>
+  <div class="group-title">应用层</div>
+  <ul>
+    <li><a href="08-scene.html">08 · Scene 场景</a></li>
+    <li><a href="09-serve.html">09 · Serve 服务</a></li>
+    <li><a href="10-ext.html">10 · Ext 扩展</a></li>
+  </ul>
+  <div class="group-title">实战</div>
+  <ul><li><a href="11-trace.html">11 · 链路追踪</a></li></ul>
+</aside>
+
+<main class="main">
+
+<h1>02 · 启动流程 <span class="tag">App 层</span></h1>
+<p class="subtitle">"dbgpt start webserver" 这行命令之后，到底发生了什么？—— 从 CLI 注册、配置加载、FastAPI 创建、SystemApp 组装、组件注册、数据库迁移到 uvicorn 拉起的全链路源码精读。</p>
+
+<div class="toc">
+  <div class="toc-title">本章目录</div>
+  <ol>
+    <li><a href="#cli-entry">命令入口：CLI 是怎么注册的</a></li>
+    <li><a href="#run-webserver">run_webserver 主流程</a></li>
+    <li><a href="#initialize-app">initialize_app：组装 FastAPI 的八步</a></li>
+    <li><a href="#system-app">SystemApp 与组件注册机制</a></li>
+    <li><a href="#component-configs">component_configs.py 核心组件清单</a></li>
+    <li><a href="#initialization-dir">initialization/ 目录详解</a></li>
+    <li><a href="#sequence">启动时序图</a></li>
+    <li><a href="#troubleshoot">启动失败常见原因与排查</a></li>
+  </ol>
+</div>
+
+<!-- ============================ 1. CLI ============================ -->
+<h2 id="cli-entry">一、命令入口：CLI 是怎么注册的</h2>
+
+<p>安装 <code>dbgpt-core</code> 后，终端里就能用 <code>dbgpt</code> 命令了。这个命令注册在
+<code>packages/dbgpt-core/pyproject.toml</code> 里：</p>
+
+<div class="file-block">
+  <div class="file-header">
+    <span>packages/dbgpt-core/pyproject.toml</span>
+    <span class="lines">[project.scripts]</span>
+  </div>
+  <div class="file-body">
+<pre><code><span class="c"># pyproject.toml 片段</span>
+[project.scripts]
+<span class="f">dbgpt</span> = <span class="s">"dbgpt.cli.cli_scripts:main"</span>
+</code></pre>
+  </div>
+  <div class="line-explain">
+    <span class="ln">解读</span>
+    pip 安装时会生成一个 <code>dbgpt</code> 可执行脚本，指向 <code>dbgpt/cli/cli_scripts.py</code> 里的 <code>main()</code> 函数。
+    <code>main()</code> 本身只有一行：<code>return cli()</code>，它调用的是 <code>@click.group()</code> 装饰的 <code>cli</code> 组。
+  </div>
+</div>
+
+<p><code>cli_scripts.py</code> 用 click 搭了一棵命令树。与启动相关的核心结构是：</p>
+
+<div class="file-block">
+  <div class="file-header">
+    <span>dbgpt/cli/cli_scripts.py</span>
+    <span class="lines">L16-48 · cli / start 组</span>
+  </div>
+  <div class="file-body">
+<pre><code><span class="k">import</span> click
+
+<span class="n">@click.group()</span>
+<span class="k">def</span> <span class="f">cli</span>(log_level):
+    logger.setLevel(logging.getLevelName(log_level.upper()))
+
+<span class="n">@click.group(invoke_without_command=True)</span>
+<span class="n">@click.pass_context</span>
+<span class="k">def</span> <span class="f">start</span>(ctx):
+    <span class="s">"""Start specific server."""</span>
+    <span class="k">if</span> ctx.invoked_subcommand <span class="k">is None</span>:
+        cmd = start.commands.get(<span class="s">"web"</span>) <span class="k">or</span> start.commands.get(<span class="s">"webserver"</span>)
+        <span class="k">if</span> cmd:
+            ctx.invoke(cmd)
+</code></pre>
+  </div>
+  <div class="line-explain">
+    <span class="ln">L37-48</span>
+    <code>start</code> 是一个 click group，<code>invoke_without_command=True</code> 意味着即使不写子命令也会执行回调。
+    如果用户只输入 <code>dbgpt start</code>（不带 <code>webserver</code>），会自动尝试调用 <code>web</code> 子命令。
+  </div>
+</div>
+
+<p>那么 <code>dbgpt start webserver</code> 里的 <code>webserver</code> 子命令是哪里来的？答案在
+<code>cli_scripts.py</code> 的底部，通过一系列 <code>try / except ImportError</code> 块"按需挂载"子命令：</p>
+
+<div class="file-block">
+  <div class="file-header">
+    <span>dbgpt/cli/cli_scripts.py</span>
+    <span class="lines">L258-274 · webserver 命令挂载</span>
+  </div>
+  <div class="file-body">
+<pre><code><span class="k">try</span>:
+    <span class="k">from</span> dbgpt_app._cli <span class="k">import</span> (
+        _stop_all_dbgpt_server,
+        migration,
+        start_webserver,
+        stop_webserver,
+    )
+
+    add_command_alias(start_webserver, name=<span class="s">"webserver"</span>, parent_group=start)
+    add_command_alias(start_webserver, name=<span class="s">"web"</span>, parent_group=start)
+    add_command_alias(stop_webserver, name=<span class="s">"webserver"</span>, parent_group=stop)
+    add_command_alias(migration, name=<span class="s">"migration"</span>, parent_group=db)
+    stop_all_func_list.append(_stop_all_dbgpt_server)
+<span class="k">except</span> ImportError <span class="k">as</span> e:
+    logging.warning(<span class="s">f"Integrating dbgpt webserver command line tool failed: {e}"</span>)
+</code></pre>
+  </div>
+  <div class="line-explain">
+    <span class="ln">解读</span>
+    从 <code>dbgpt_app._cli</code> 模块导入 <code>start_webserver</code>（一个 click command），
+    然后用 <code>add_command_alias</code> 把它同时挂到 <code>start</code> 组的 <code>webserver</code> 和 <code>web</code> 两个别名下。
+    所以 <code>dbgpt start webserver</code> 和 <code>dbgpt start web</code> 执行的是同一段逻辑。
+    用 try/except 包裹是<strong>按需挂载</strong>设计：如果没装 <code>dbgpt-app</code> 包，CLI 仍可正常使用其他命令。
+  </div>
+</div>
+
+<p>真正干活的 <code>start_webserver</code> 定义在 <code>dbgpt_app/_cli.py</code> 中：</p>
+
+<div class="file-block">
+  <div class="file-header">
+    <span>dbgpt_app/_cli.py</span>
+    <span class="lines">L99-169 · start_webserver 命令</span>
+  </div>
+  <div class="file-body">
+<pre><code><span class="n">@click.command(name="webserver")</span>
+<span class="n">@_add_webserver_start_options</span>
+<span class="k">def</span> <span class="f">start_webserver</span>(config, profile, yes, api_key, **kwargs):
+    <span class="s">"""Start webserver (dbgpt_server.py)."""</span>
+    <span class="k">if not</span> kwargs.get(<span class="s">"daemon"</span>):
+        _print_banner()
+
+    <span class="k">if</span> kwargs.get(<span class="s">"daemon"</span>):
+        log_file = os.path.join(LOGDIR, <span class="s">"webserver_uvicorn.log"</span>)
+        _run_current_with_daemon(<span class="s">"WebServer"</span>, log_file)
+        <span class="k">return</span>
+
+    <span class="c"># Resolve (or create) a config file via the wizard if needed</span>
+    <span class="k">try</span>:
+        <span class="k">from</span> dbgpt.cli._wizard <span class="k">import</span> maybe_run_wizard
+        resolved_config = maybe_run_wizard(
+            profile=profile, config=config, yes=yes, api_key=api_key
+        )
+    <span class="k">except</span> ImportError:
+        <span class="k">if not</span> config:
+            <span class="k">raise</span> click.UsageError(<span class="s">"No config file found..."</span>)
+        resolved_config = config
+
+    <span class="c"># 打印 profile / config / workspace 信息框</span>
+    <span class="c"># ...（略）...</span>
+
+    <span class="k">from</span> dbgpt_app.dbgpt_server <span class="k">import</span> run_webserver
+    run_webserver(resolved_config)
+</code></pre>
+  </div>
+  <div class="line-explain">
+    <span class="ln">L114-121</span>如果 <code>--daemon</code>，就 fork 子进程后台运行，主进程直接 return。<br>
+    <span class="ln">L124-139</span>第一次运行时，如果没给 <code>--config</code>，会启动交互式 wizard（<code>maybe_run_wizard</code>）帮用户选 LLM provider、写 API key，生成 TOML 配置。<br>
+    <span class="ln">L167-169</span>最终调用 <code>dbgpt_server.py</code> 里的 <code>run_webserver(resolved_config)</code>，把控制权交给 App 层。
+  </div>
+</div>
+
+<div class="callout tip">
+  <strong>命令分发链路小结：</strong>
+  <code>dbgpt start webserver</code> → click <code>cli</code> → <code>start</code> group → <code>start_webserver</code>（_cli.py）→ <code>run_webserver(config)</code>（dbgpt_server.py）
+</div>
+
+<!-- ============================ 2. run_webserver ============================ -->
+<h2 id="run-webserver">二、run_webserver 主流程</h2>
+
+<p>进入 <code>dbgpt_server.py</code> 后，主流程清晰分为四步：加载配置 → 初始化 tracer → <code>initialize_app</code> → <code>run_uvicorn</code>。</p>
+
+<div class="file-block">
+  <div class="file-header">
+    <span>dbgpt_app/dbgpt_server.py</span>
+    <span class="lines">L282-318 · run_webserver</span>
+  </div>
+  <div class="file-body">
+<pre><code><span class="k">def</span> <span class="f">run_webserver</span>(config_file: str):
+    <span class="c"># 1. 加载配置（含 scan_configs 扫描所有 Serve/App 配置类）</span>
+    param = load_config(config_file)
+
+    <span class="c"># 2. 初始化链路追踪</span>
+    trace_config = param.service.web.trace <span class="k">or</span> param.trace
+    trace_file = trace_config.file <span class="k">or</span> os.path.join(<span class="s">"logs"</span>, <span class="s">"dbgpt_webserver_tracer.jsonl"</span>)
+    config = system_app.config
+    config.configs[<span class="s">"app_config"</span>] = param
+    initialize_tracer(
+        trace_file,
+        system_app=system_app,
+        root_operation_name=trace_config.root_operation_name <span class="k">or</span> <span class="s">"DB-GPT-Webserver"</span>,
+        tracer_parameters=trace_config,
+    )
+
+    <span class="c"># 3. 在 root_tracer span 中执行 initialize_app</span>
+    <span class="k">with</span> root_tracer.start_span(
+        <span class="s">"run_webserver"</span>,
+        span_type=SpanType.RUN,
+        metadata={<span class="s">"run_service"</span>: SpanTypeRunName.WEBSERVER, ...},
+    ):
+        param = initialize_app(param)
+
+        <span class="c"># 导入额外的 Agent 扩展（触发注册）</span>
+        <span class="k">from</span> dbgpt_serve.agent.agents.expand.app_start_assisant_agent <span class="k">import</span> <span class="c"># noqa</span>
+            StartAppAssistantAgent
+        <span class="k">from</span> dbgpt_serve.agent.agents.expand.intent_recognition_agent <span class="k">import</span> <span class="c"># noqa</span>
+            IntentRecognitionAgent
+
+        <span class="c"># 4. 启动 uvicorn HTTP 服务</span>
+        run_uvicorn(param.service.web)
+</code></pre>
+  </div>
+  <div class="line-explain">
+    <span class="ln">L284</span><code>load_config</code> 不只是读 TOML，它内部会调用 <code>scan_configs()</code>，后者扫描所有 <code>dbgpt_serve.*</code> 子模块，把每个 Serve 的 <code>ServeConfig</code> 数据类注册到 <code>ConfigurationManager</code>，这样后续 <code>cfg.parse_config(ApplicationConfig)</code> 才能把 TOML 里的 <code>[serve.rag]</code>、<code>[serve.flow]</code> 等段反序列化出来。<br>
+    <span class="ln">L291-296</span>Tracer 在所有组件之前初始化，保证后续每个组件的 <code>on_init</code> / <code>after_init</code> 都能被链路追踪覆盖。<br>
+    <span class="ln">L307</span><code>initialize_app</code> 是核心——它完成"创建 FastAPI、注册组件、迁移数据库、挂路由、挂静态文件"所有脏活。<br>
+    <span class="ln">L317</span>最后 <code>run_uvicorn</code> 把 <code>CORSMiddleware(app=app)</code> 包装后交给 uvicorn 阻塞运行。
+  </div>
+</div>
+
+<p>值得注意的是，<code>dbgpt_server.py</code> 的模块顶层（import 阶段）就已经创建了 FastAPI app 和 SystemApp：</p>
+
+<div class="file-block">
+  <div class="file-header">
+    <span>dbgpt_app/dbgpt_server.py</span>
+    <span class="lines">L43-52 · 模块级单例</span>
+  </div>
+  <div class="file-body">
+<pre><code>app = create_app(
+    title=<span class="s">_("DB-GPT Open API")</span>,
+    description=<span class="s">_("DB-GPT Open API")</span>,
+    version=version,
+    openapi_tags=[],
+)
+<span class="c"># Use custom router to support priority</span>
+replace_router(app)
+
+system_app = SystemApp(app)
+</code></pre>
+  </div>
+  <div class="line-explain">
+    <span class="ln">L43-48</span><code>app</code> 和 <code>system_app</code> 是<strong>模块级全局单例</strong>。这是因为 gunicorn / uvicorn 的 worker 模型需要在 import 阶段拿到 ASGI app 对象。<br>
+    <span class="ln">L50</span><code>replace_router(app)</code> 把 FastAPI 默认的 APIRouter 替换为支持 <code>priority</code> 字段的自定义 Router，方便精确控制路由匹配顺序。<br>
+    <span class="ln">L52</span><code>SystemApp(app)</code> 把 FastAPI 实例包装成 SystemApp——后续所有组件都注册到这个对象上。
+  </div>
+</div>
+
+<!-- ============================ 3. initialize_app ============================ -->
+<h2 id="initialize-app">三、initialize_app：组装 FastAPI 的八步</h2>
+
+<p><code>initialize_app(param)</code> 是启动流程的"心脏"。按执行顺序拆解如下：</p>
+
+<div class="file-block">
+  <div class="file-header">
+    <span>dbgpt_app/dbgpt_server.py</span>
+    <span class="lines">L137-255 · initialize_app（精简版）</span>
+  </div>
+  <div class="file-body">
+<pre><code><span class="k">def</span> <span class="f">initialize_app</span>(param: ApplicationConfig, args=None):
+    <span class="c"># ---- Step 1: 日志 ----</span>
+    setup_logging(<span class="s">"dbgpt"</span>, log_config, default_logger_filename=...)
+
+    <span class="c"># ---- Step 2: 数据库初始化（server_init 内部调 _initialize_db_storage）</span>
+    server_init(param, system_app)
+
+    <span class="c"># ---- Step 3: 挂载 API 路由 ----</span>
+    mount_routers(app)
+
+    <span class="c"># ---- Step 4: 注册所有组件到 SystemApp ----</span>
+    model_start_listener = _create_model_start_listener(system_app)
+    initialize_components(param, system_app)
+
+    <span class="c"># ---- Step 5: 生命周期 on_init ----</span>
+    system_app.on_init()
+
+    <span class="c"># ---- Step 6: 数据库迁移（Alembic / db.create_all）</span>
+    _migration_db_storage(param.service.web.database, web_config.disable_alembic_upgrade)
+
+    <span class="c"># ---- Step 7: 生命周期 after_init + 注册默认数据源 ----</span>
+    system_app.after_init()
+    <span class="c"># try: 注册 Walmart_Sales 示例 SQLite 数据源（seed 数据）</span>
+
+    <span class="c"># ---- Step 8: 模型 Worker / 静态文件 / before_start ----</span>
+    <span class="k">if not</span> web_config.light:
+        <span class="c"># 统一部署模式：在本进程内启动 ModelServe + WorkerManager</span>
+        initialize_worker_manager_in_client(...)
+    <span class="k">else</span>:
+        <span class="c"># 轻量模式：只连接外部 controller，不在本地启动 worker</span>
+        initialize_worker_manager_in_client(run_locally=False, controller_addr=...)
+
+    mount_static_files(app, param)
+    system_app.before_start()
+    <span class="k">return</span> param
+</code></pre>
+  </div>
+  <div class="line-explain">
+    <span class="ln">Step 2</span><code>server_init</code> → <code>_initialize_db_storage</code> → <code>_initialize_db</code>：根据配置创建 SQLite 或 MySQL 引擎，调 <code>initialize_db</code>，并把 <code>UnifiedDBManagerFactory</code> 注册到 SystemApp。<br>
+    <span class="ln">Step 3</span><code>mount_routers</code> 用 lazy import 挂载 10+ 个 API Router（api_v1 / api_v2 / knowledge / gpts_v1 / app_v2 / editor / feedback ...），所有前缀 <code>/api</code>。<br>
+    <span class="ln">Step 4</span><code>initialize_components</code> 是下一节的重头戏。<br>
+    <span class="ln">Step 5-7</span>三次生命周期回调（<code>on_init</code> → <code>after_init</code>）穿插着 DB 迁移，因为迁移必须在组件 <code>on_init</code>（注册 ORM models）之后、<code>after_init</code>（组件开始读写 DB）之前。<br>
+    <span class="ln">Step 8</span>根据 <code>light</code> 模式决定本地跑 Worker 还是远程连接；最后 <code>before_start</code> 是 ASGI startup 前的最后钩子。
+  </div>
+</div>
+
+<div class="callout warn">
+  <strong>light 模式 vs 统一部署模式：</strong>
+  <ul>
+    <li><strong>统一部署（light=False，默认）</strong>：LLM Worker 和 Web Server 跑在同一个 uvicorn 进程里，适合开发/单机部署。</li>
+    <li><strong>轻量模式（light=True）</strong>：Web Server 不加载本地模型，而是通过 <code>controller_addr</code> 连接一个独立的 Model Controller 服务（由 <code>dbgpt start controller</code> 启动），适合生产多节点部署。</li>
+  </ul>
+</div>
+
+<!-- ============================ 4. SystemApp ============================ -->
+<h2 id="system-app">四、SystemApp 与组件注册机制</h2>
+
+<p><code>SystemApp</code> 是 DB-GPT 自己实现的轻量级 IoC 容器，定义在 <code>dbgpt-core/src/dbgpt/component.py</code>。它承担三个职责：</p>
+
+<ol>
+  <li><strong>组件注册表</strong>：<code>self.components: Dict[str, BaseComponent]</code> 存所有单例组件。</li>
+  <li><strong>生命周期管理</strong>：继承 <code>LifeCycle</code>，统一调度 <code>on_init / after_init / before_start / after_start / before_stop</code>。</li>
+  <li><strong>ASGI 集成</strong>：把 <code>after_start / before_stop</code> 挂到 FastAPI 的 <code>startup / shutdown</code> 事件上。</li>
+</ol>
+
+<div class="file-block">
+  <div class="file-header">
+    <span>dbgpt/component.py</span>
+    <span class="lines">L27-79 · LifeCycle 钩子定义</span>
+  </div>
+  <div class="file-body">
+<pre><code><span class="k">class</span> <span class="t">LifeCycle</span>:
+    <span class="s">"""Execution order of lifecycle hooks:
+    1. on_init
+    2. after_init
+    3. before_start(async_before_start)
+    4. after_start(async_after_start)
+    5. before_stop(async_before_stop)
+    """</span>
+
+    <span class="k">def</span> <span class="f">on_init</span>(self): <span class="k">pass</span>          <span class="c"># 组件正在初始化（DB 可能还没好）</span>
+    <span class="k">def</span> <span class="f">after_init</span>(self): <span class="k">pass</span>      <span class="c"># 初始化完成（DB 已 ready，可建表/读写）</span>
+    <span class="k">async def</span> <span class="f">async_before_start</span>(self): <span class="k">pass</span>
+    <span class="k">def</span> <span class="f">after_start</span>(self): <span class="k">pass</span>    <span class="c"># ASGI 启动后（可启动后台线程/定时任务）</span>
+    <span class="k">def</span> <span class="f">before_stop</span>(self): <span class="k">pass</span>    <span class="c"># 关闭前清理</span>
+</code></pre>
+  </div>
+  <div class="line-explain">
+    <span class="ln">L30-36</span>生命周期顺序非常关键：<code>on_init</code> 时数据库还没迁移完，不能做 ORM 查询；<code>after_init</code> 时才能安全读写 DB；<code>after_start</code> 在 uvicorn 接受请求后触发，适合启动定时任务线程。
+  </div>
+</div>
+
+<div class="file-block">
+  <div class="file-header">
+    <span>dbgpt/component.py</span>
+    <span class="lines">L200-266 · register / get_component</span>
+  </div>
+  <div class="file-body">
+<pre><code><span class="k">def</span> <span class="f">register</span>(self, component: Type[T], *args, **kwargs) -> T:
+    <span class="s">"""Register a new component by its type."""</span>
+    instance = component(self, *args, **kwargs)   <span class="c"># 实例化</span>
+    self.register_instance(instance)
+    <span class="k">return</span> instance
+
+<span class="k">def</span> <span class="f">register_instance</span>(self, instance: T) -> T:
+    <span class="s">"""Register an already initialized component."""</span>
+    name = instance.name
+    <span class="k">if</span> isinstance(name, ComponentType):
+        name = name.value
+    <span class="k">if</span> name <span class="k">in</span> self.components:
+        <span class="k">raise</span> RuntimeError(<span class="s">f"Component name {name} already exists"</span>)
+    self.components[name] = instance
+    instance.init_app(self)            <span class="c"># 立即调 init_app</span>
+    <span class="k">return</span> instance
+
+<span class="k">def</span> <span class="f">get_component</span>(self, name, component_type, ...):
+    component = self.components.get(name)
+    <span class="k">if not</span> component:
+        <span class="k">if</span> or_register_component:
+            <span class="k">return</span> self.register(or_register_component, ...)
+        <span class="k">raise</span> ValueError(<span class="s">f"No component found with name {name}"</span>)
+    <span class="k">return</span> component
+</code></pre>
+  </div>
+  <div class="line-explain">
+    <span class="ln">L209</span><code>register</code> 会立即 <code>component(self, *args)</code> 实例化——构造函数里会自动调 <code>init_app(system_app)</code>。<br>
+    <span class="ln">L223-226</span>用 name 做唯一性校验，重名直接抛 <code>RuntimeError</code>，防止组件被意外覆盖。<br>
+    <span class="ln">L231</span><code>init_app</code> 在注册时立刻调用，而不等到 <code>on_init</code>，这样组件可以拿到 <code>system_app</code> 引用、注册子组件。<br>
+    <span class="ln">L258-260</span><code>get_component</code> 支持 <code>or_register_component</code> 参数——找不到就自动注册一个默认实现，这是惰性注册的常用模式。
+  </div>
+</div>
+
+<div class="callout tip">
+  <strong>ComponentType 枚举：</strong>
+  <code>component.py</code> L82-105 定义了 <code>ComponentType</code> 字符串枚举（如 <code>WORKER_MANAGER / MODEL_CONTROLLER / RAG_STORAGE_MANAGER / CONNECTOR_MANAGER / RESOURCE_MANAGER</code> 等），
+  组件通过 <code>name = ComponentType.XXX</code> 声明自己的注册名，保证全工程统一。
+</div>
+
+<!-- ============================ 5. component_configs ============================ -->
+<h2 id="component-configs">五、component_configs.py 核心组件清单</h2>
+
+<p><code>initialize_components(param, system_app)</code> 是启动时组件总装的核心函数。它按严格顺序注册了以下组件：</p>
+
+<div class="file-block">
+  <div class="file-header">
+    <span>dbgpt_app/component_configs.py</span>
+    <span class="lines">L14-64 · initialize_components 全文</span>
+  </div>
+  <div class="file-body">
+<pre><code><span class="k">def</span> <span class="f">initialize_components</span>(param, system_app):
+    <span class="k">from</span> dbgpt.model.cluster.controller.controller <span class="k">import</span> controller
+    <span class="k">from</span> dbgpt_app.initialization.embedding_component <span class="k">import</span> (
+        _initialize_embedding_model, _initialize_rerank_model,
+    )
+    <span class="k">from</span> dbgpt_app.initialization.scheduler <span class="k">import</span> DefaultScheduler
+    <span class="k">from</span> dbgpt_app.initialization.serve_initialization <span class="k">import</span> register_serve_apps
+    <span class="k">from</span> dbgpt_serve.datasource.manages.connector_manager <span class="k">import</span> ConnectorManager
+    <span class="k">from</span> dbgpt_serve.rag.storage_manager <span class="k">import</span> StorageManager
+
+    <span class="c"># 1. 基础设施</span>
+    system_app.register(DefaultExecutorFactory, max_workers=...)
+    system_app.register(DefaultScheduler)
+    system_app.register_instance(controller)        <span class="c"># ModelController 单例</span>
+    system_app.register(ConnectorManager)           <span class="c"># 数据源连接池</span>
+    system_app.register(StorageManager)             <span class="c"># RAG 向量存储</span>
+
+    <span class="c"># 2. Agent 基础</span>
+    <span class="k">from</span> dbgpt_serve.agent.hub.controller <span class="k">import</span> module_plugin
+    system_app.register_instance(module_plugin)
+    <span class="k">from</span> dbgpt_serve.agent.agents.controller <span class="k">import</span> multi_agents
+    system_app.register_instance(multi_agents)
+
+    <span class="c"># 3. Embedding / Rerank / Cache / AWEL / Agent / Serve</span>
+    _initialize_embedding_model(system_app, default_embedding_name)
+    _initialize_rerank_model(system_app, default_rerank_name)
+    _initialize_model_cache(system_app, web_config)
+    _initialize_awel(system_app, web_config.awel_dirs)
+    _initialize_resource_manager(system_app)
+    _initialize_agent(system_app)
+    _initialize_openapi(system_app)
+    register_serve_apps(system_app, param, host, port)
+    _initialize_operators()
+    _initialize_code_server(system_app)
+    _initialize_prompt_templates()
+    _initialize_benchmark_data(system_app)
+    _initialize_connector_manager(system_app)
+</code></pre>
+  </div>
+  <div class="line-explain">
+    <span class="ln">L32-39</span>第一批注册的是<strong>底层基础设施</strong>：线程池、调度器、模型控制器、数据源连接池、RAG 存储管理器。它们没有外部依赖，必须最先就位。<br>
+    <span class="ln">L41-47</span>第二批是<strong>Agent 模块的单例控制器</strong>（module_plugin 管理 Agent 插件，multi_agents 管理多智能体编排）。<br>
+    <span class="ln">L49-64</span>第三批是一连串 <code>_initialize_*</code> 私有函数，各自负责一个子系统的初始化，顺序严格：<code>AWEL 必须在 operators 之前</code>（operators 依赖 DAG manager）；<code>Serve 必须在 prompt_templates 之前</code>（prompt 注册依赖 Serve 的配置）。
+  </div>
+</div>
+
+<p>下表汇总了 <code>initialize_components</code> 注册的全部组件：</p>
+
+<table>
+  <tr>
+    <th>序号</th>
+    <th>组件 / 函数</th>
+    <th>注册名 (ComponentType)</th>
+    <th>来源模块</th>
+    <th>职责</th>
+  </tr>
+  <tr>
+    <td>1</td>
+    <td><code>DefaultExecutorFactory</code></td>
+    <td><code>EXECUTOR_DEFAULT</code></td>
+    <td>dbgpt.util.executor_utils</td>
+    <td>全局线程池，所有异步任务共用</td>
+  </tr>
+  <tr>
+    <td>2</td>
+    <td><code>DefaultScheduler</code></td>
+    <td>dbgpt_default_scheduler</td>
+    <td>initialization/scheduler.py</td>
+    <td>基于 <code>schedule</code> 库的定时任务调度器</td>
+  </tr>
+  <tr>
+    <td>3</td>
+    <td><code>controller</code></td>
+    <td><code>MODEL_CONTROLLER</code></td>
+    <td>dbgpt.model.cluster.controller</td>
+    <td>ModelController 单例，管理所有 LLM/Embedding Worker 注册与发现</td>
+  </tr>
+  <tr>
+    <td>4</td>
+    <td><code>ConnectorManager</code></td>
+    <td><code>CONNECTOR_MANAGER</code></td>
+    <td>dbgpt_serve.datasource.manages</td>
+    <td>SQL 数据源连接池（SQLite / MySQL / Doris 等）</td>
+  </tr>
+  <tr>
+    <td>5</td>
+    <td><code>StorageManager</code></td>
+    <td><code>RAG_STORAGE_MANAGER</code></td>
+    <td>dbgpt_serve.rag.storage_manager</td>
+    <td>RAG 向量存储管理（ChromaDB / Milvus 等）</td>
+  </tr>
+  <tr>
+    <td>6</td>
+    <td><code>module_plugin</code></td>
+    <td><code>PLUGIN_HUB</code></td>
+    <td>dbgpt_serve.agent.hub.controller</td>
+    <td>Agent 插件市场管理器</td>
+  </tr>
+  <tr>
+    <td>7</td>
+    <td><code>multi_agents</code></td>
+    <td><code>MULTI_AGENTS</code></td>
+    <td>dbgpt_serve.agent.agents.controller</td>
+    <td>多智能体编排控制器</td>
+  </tr>
+  <tr>
+    <td>8</td>
+    <td><code>RemoteEmbeddingFactory</code></td>
+    <td>—（EmbeddingFactory）</td>
+    <td>initialization/embedding_component.py</td>
+    <td>通过 WorkerManager 远程调用 Embedding 模型</td>
+  </tr>
+  <tr>
+    <td>9</td>
+    <td><code>RemoteRerankEmbeddingFactory</code></td>
+    <td>—（RerankEmbeddingFactory）</td>
+    <td>initialization/embedding_component.py</td>
+    <td>通过 WorkerManager 远程调用 Rerank 模型</td>
+  </tr>
+  <tr>
+    <td>10</td>
+    <td>Model Cache</td>
+    <td><code>MODEL_CACHE_MANAGER</code></td>
+    <td>dbgpt.storage.cache</td>
+    <td>LLM 推理结果缓存（memory / disk）</td>
+  </tr>
+  <tr>
+    <td>11</td>
+    <td>AWEL initialize</td>
+    <td><code>AWEL_DAG_MANAGER</code></td>
+    <td>dbgpt.core.awel</td>
+    <td>加载 DAG 定义文件，初始化工作流引擎</td>
+  </tr>
+  <tr>
+    <td>12</td>
+    <td>ResourceManager + Skill</td>
+    <td><code>RESOURCE_MANAGER / SKILL_MANAGER</code></td>
+    <td>dbgpt.agent.resource / skill</td>
+    <td>注册 Agent 可用的工具资源（数据源/知识库/插件/MCP/搜索...）</td>
+  </tr>
+  <tr>
+    <td>13</td>
+    <td>initialize_agent</td>
+    <td>—</td>
+    <td>dbgpt.agent</td>
+    <td>初始化 Agent 框架核心</td>
+  </tr>
+  <tr>
+    <td>14</td>
+    <td><code>EditorService</code></td>
+    <td>—</td>
+    <td>dbgpt_app.openapi.api_v1.editor</td>
+    <td>代码编辑器 OpenAPI 服务</td>
+  </tr>
+  <tr>
+    <td>15</td>
+    <td>register_serve_apps（14 个 Serve）</td>
+    <td>各 Serve.name</td>
+    <td>initialization/serve_initialization.py</td>
+    <td>批量注册 Prompt/Conversation/Flow/RAG/Datasource/Feedback/DbgptsHub/DbgptsMy/File/Evaluate/Libro/Model/Connector/ScheduledTask Serve</td>
+  </tr>
+  <tr>
+    <td>16</td>
+    <td>_initialize_operators</td>
+    <td>—（扫描注册）</td>
+    <td>component_configs.py</td>
+    <td>扫描 <code>dbgpt_app.operators</code> 和 <code>dbgpt_serve.agent.resource</code>，注册所有 AWEL Operator</td>
+  </tr>
+  <tr>
+    <td>17</td>
+    <td>Code Server</td>
+    <td>—</td>
+    <td>dbgpt.util.code.server</td>
+    <td>代码沙箱执行服务</td>
+  </tr>
+  <tr>
+    <td>18</td>
+    <td>Prompt Templates</td>
+    <td>—（注册到 registry）</td>
+    <td>dbgpt_app.scene.*.prompt</td>
+    <td>导入所有 Scene 的 prompt 模块，触发模板注册</td>
+  </tr>
+  <tr>
+    <td>19</td>
+    <td>Benchmark Data</td>
+    <td><code>BENCHMARK_DATA_MANAGER</code></td>
+    <td>dbgpt_serve.evaluate</td>
+    <td>评测基准数据初始化</td>
+  </tr>
+  <tr>
+    <td>20</td>
+    <td>External ConnectorManager</td>
+    <td>—</td>
+    <td>dbgpt.agent.resource.connector</td>
+    <td>外部 MCP 连接器管理（加载 catalog.json）</td>
+  </tr>
+</table>
+
+<h3>register_serve_apps 注册的 14 个 Serve</h3>
+
+<p><code>serve_initialization.py</code> 的 <code>register_serve_apps</code> 函数按固定顺序注册了 14 个 Serve 组件，每个都是一个独立的子服务：</p>
+
+<table>
+  <tr><th>#</th><th>Serve 类</th><th>模块</th><th>功能</th></tr>
+  <tr><td>1</td><td>PromptServe</td><td>dbgpt_serve.prompt</td><td>提示词模板管理</td></tr>
+  <tr><td>2</td><td>ConversationServe</td><td>dbgpt_serve.conversation</td><td>对话历史管理</td></tr>
+  <tr><td>3</td><td>FlowServe</td><td>dbgpt_serve.flow</td><td>AWEL 工作流编排（DAG CRUD + 执行）</td></tr>
+  <tr><td>4</td><td>RagServe</td><td>dbgpt_serve.rag</td><td>知识库 / RAG 检索</td></tr>
+  <tr><td>5</td><td>DatasourceServe</td><td>dbgpt_serve.datasource</td><td>数据源管理（增删改查连接配置）</td></tr>
+  <tr><td>6</td><td>FeedbackServe</td><td>dbgpt_serve.feedback</td><td>对话反馈收集</td></tr>
+  <tr><td>7</td><td>DbgptsHubServe</td><td>dbgpt_serve.dbgpts.hub</td><td>DBGPTs 市场（从远程仓库拉取）</td></tr>
+  <tr><td>8</td><td>DbgptsMyServe</td><td>dbgpt_serve.dbgpts.my</td><td>已安装的 DBGPTs 管理</td></tr>
+  <tr><td>9</td><td>FileServe</td><td>dbgpt_serve.file</td><td>文件上传 / 下载 / 管理</td></tr>
+  <tr><td>10</td><td>EvaluateServe</td><td>dbgpt_serve.evaluate</td><td>模型评测服务</td></tr>
+  <tr><td>11</td><td>LibroServe</td><td>dbgpt_serve.libro</td><td>Libro 笔记本（交互式代码执行）</td></tr>
+  <tr><td>12</td><td>ModelServe</td><td>dbgpt_serve.model</td><td>模型实例管理（部署/停止/列表）</td></tr>
+  <tr><td>13</td><td>ConnectorServe</td><td>dbgpt_serve.connector</td><td>外部 MCP 连接器</td></tr>
+  <tr><td>14</td><td>ScheduledTaskServe</td><td>dbgpt_serve.scheduled_task</td><td>定时任务（cron 聊天回放）</td></tr>
+</table>
+
+<!-- ============================ 6. initialization/ ============================ -->
+<h2 id="initialization-dir">六、initialization/ 目录详解</h2>
+
+<p><code>dbgpt_app/initialization/</code> 目录包含 8 个 <code>.py</code> 文件，各自负责启动时的一项初始化职责：</p>
+
+<table>
+  <tr><th>文件</th><th>核心内容</th></tr>
+  <tr>
+    <td><code>__init__.py</code></td>
+    <td>空，仅标记为包</td>
+  </tr>
+  <tr>
+    <td><code>app_initialization.py</code></td>
+    <td><code>scan_app_configs()</code>：用 <code>ModelScanner</code> 递归扫描 <code>dbgpt_app.scene</code> 下所有 <code>config.py</code>，把 Scene 配置类注册到 ConfigurationManager</td>
+  </tr>
+  <tr>
+    <td><code>db_model_initialization.py</code></td>
+    <td>集中 import 所有 SQLAlchemy ORM Entity（<code>_MODELS</code> 列表含 16 个 Entity），确保 <code>db.create_all()</code> 时 metadata 里能找到所有表定义</td>
+  </tr>
+  <tr>
+    <td><code>embedding_component.py</code></td>
+    <td><code>RemoteEmbeddingFactory / RemoteRerankEmbeddingFactory</code>：通过 WorkerManager 远程调用的 Embedding/Rerank 工厂</td>
+  </tr>
+  <tr>
+    <td><code>scheduler.py</code></td>
+    <td><code>DefaultScheduler</code>：继承 BaseComponent，<code>after_start</code> 时启动后台线程轮询 <code>schedule.run_pending()</code></td>
+  </tr>
+  <tr>
+    <td><code>serve_initialization.py</code></td>
+    <td><code>scan_serve_configs()</code> + <code>register_serve_apps()</code>：扫描 13 个 Serve 模块的配置 + 注册 14 个 Serve 实例</td>
+  </tr>
+  <tr>
+    <td><code>skills_provisioning.py</code></td>
+    <td><code>ensure_builtin_skills()</code>：为 pip 安装用户在 <code>~/.dbgpt/</code> 下复制内置技能模板</td>
+  </tr>
+  <tr>
+    <td><code>workspace_provisioning.py</code></td>
+    <td><code>_ensure_pilot_workspace()</code>：把 <code>pilot_template/</code> 目录（含 alembic.ini、benchmark 数据）复制到用户工作区，幂等不覆盖</td>
+  </tr>
+</table>
+
+<h3>数据库迁移流程</h3>
+
+<div class="file-block">
+  <div class="file-header">
+    <span>dbgpt_app/base.py</span>
+    <span class="lines">L98-163 · _migration_db_storage</span>
+  </div>
+  <div class="file-body">
+<pre><code><span class="k">def</span> <span class="f">_migration_db_storage</span>(db_params, disable_alembic_upgrade):
+    <span class="k">from</span> dbgpt_app.initialization.db_model_initialization <span class="k">import</span> _MODELS  <span class="c"># noqa</span>
+    <span class="k">from</span> dbgpt_app.initialization.workspace_provisioning <span class="k">import</span> _ensure_pilot_workspace
+
+    <span class="c"># 1. 为 pip 用户准备 pilot workspace（alembic.ini、benchmark 数据等）</span>
+    pilot_root = os.path.dirname(default_meta_data_path)
+    _ensure_pilot_workspace(pilot_root)
+
+    <span class="c"># 2. 准备内置技能</span>
+    <span class="k">from</span> dbgpt_app.initialization.skills_provisioning <span class="k">import</span> ensure_builtin_skills
+    ensure_builtin_skills(SKILLS_DIR)
+
+    <span class="k">if not</span> disable_alembic_upgrade:
+        <span class="k">from</span> dbgpt.storage.metadata.db_manager <span class="k">import</span> db
+        <span class="k">from</span> dbgpt.util._db_migration_utils <span class="k">import</span> _ddl_init_and_upgrade
+
+        <span class="c"># 3a. SQLite：直接 db.create_all() + alembic stamp/upgrade</span>
+        <span class="k">if</span> isinstance(db_params, SQLiteConnectorParameters) <span class="k">or</span> ...:
+            db.create_all()
+            _ddl_init_and_upgrade(default_meta_data_path, disable_alembic_upgrade)
+        <span class="k">else</span>:
+            <span class="c"># 3b. MySQL：不自动建表，打印警告，要求手动执行 assets/schema/dbgpt.sql</span>
+            logger.warning(<span class="s">"For safety, MySQL not support DDL init..."</span>)
+</code></pre>
+  </div>
+  <div class="line-explain">
+    <span class="ln">L104</span>必须先 import <code>_MODELS</code>（16 个 Entity），这样 SQLAlchemy 的 <code>Base.metadata</code> 才包含所有表定义。<br>
+    <span class="ln">L121-126</span>为 pip 安装用户复制 workspace 模板——因为 pip 包不包含 <code>pilot/</code> 目录，必须从 <code>pilot_template/</code> 拷贝。<br>
+    <span class="ln">L140-151</span>SQLite 路径：<code>db.create_all()</code> 建全部表，然后 <code>_ddl_init_and_upgrade</code> 跑 alembic 迁移脚本补齐字段。<br>
+    <span class="ln">L153-163</span>MySQL 路径：出于安全考虑不自动执行 DDL，只打印警告日志要求手动执行 <code>assets/schema/dbgpt.sql</code>。
+  </div>
+</div>
+
+<h3>db_model_initialization.py 中的 ORM Entity 清单</h3>
+
+<div class="file-block">
+  <div class="file-header">
+    <span>initialization/db_model_initialization.py</span>
+    <span class="lines">L25-43 · _MODELS 列表</span>
+  </div>
+  <div class="file-body">
+<pre><code>_MODELS = [
+    PluginHubEntity,           <span class="c"># 插件市场</span>
+    FileServeEntity,           <span class="c"># 文件管理</span>
+    MyPluginEntity,            <span class="c"># 已安装插件</span>
+    PromptManageEntity,        <span class="c"># 提示词模板</span>
+    KnowledgeSpaceEntity,      <span class="c"># 知识空间</span>
+    KnowledgeDocumentEntity,   <span class="c"># 知识文档</span>
+    DocumentChunkEntity,       <span class="c"># 文档分块</span>
+    ChatFeedBackEntity,        <span class="c"># 对话反馈</span>
+    ConnectConfigEntity,       <span class="c"># 数据源连接配置</span>
+    ChatHistoryEntity,         <span class="c"># 对话历史（会话级）</span>
+    ChatHistoryMessageEntity,  <span class="c"># 对话历史（消息级）</span>
+    ModelInstanceEntity,       <span class="c"># 模型实例</span>
+    FlowServeEntity,           <span class="c"># AWEL Flow</span>
+    RecommendQuestionEntity,   <span class="c"># 推荐问题</span>
+    FlowVariableEntity,        <span class="c"># Flow 变量</span>
+    BenchmarkSummaryEntity,    <span class="c"># 评测摘要</span>
+    ShareLinkEntity,           <span class="c"># 分享链接</span>
+]
+</code></pre>
+  </div>
+</div>
+
+<!-- ============================ 7. 时序图 ============================ -->
+<h2 id="sequence">七、启动时序图</h2>
+
+<p>下面用 ASCII art 画出从命令行到 uvicorn 接受第一个请求的完整时序：</p>
+
+<div class="mermaid">
+sequenceDiagram
+    participant U as 用户
+    participant CLI as dbgpt CLI
+    participant SW as start_webserver<br/>(_cli.py)
+    participant RW as run_webserver<br/>(dbgpt_server.py)
+    participant IA as initialize_app
+    participant SA as SystemApp
+    participant UV as uvicorn
+
+    U->>CLI: dbgpt start webserver
+    CLI->>SW: click 命令分发
+    SW->>SW: maybe_run_wizard<br/>(首次交互生成 TOML)
+    SW->>SW: _print_banner
+    SW->>RW: run_webserver(resolved_config)
+
+    RW->>RW: load_config(config_file)<br/>scan_configs() 扫描 Serve/App 配置
+    RW->>RW: initialize_tracer(...)<br/>链路追踪初始化
+
+    RW->>IA: initialize_app(param)
+
+    Note over IA: Step 1: setup_logging
+    IA->>IA: Step 2: server_init<br/>→ _initialize_db_storage<br/>创建 SQLAlchemy engine<br/>register UnifiedDBManagerFactory
+    IA->>IA: Step 3: mount_routers<br/>(10+ API Router)
+    IA->>SA: Step 4: initialize_components
+    Note over SA: register DefaultExecutorFactory<br/>register DefaultScheduler<br/>register controller / ConnectorManager<br/>register StorageManager<br/>register module_plugin / multi_agents<br/>_initialize_embedding/rerank_model<br/>_initialize_model_cache<br/>_initialize_awel (DAG 定义加载)<br/>_initialize_resource_manager<br/>_initialize_agent<br/>register_serve_apps (14 个 Serve)<br/>_initialize_operators (扫描注册)<br/>_initialize_code_server<br/>_initialize_prompt_templates<br/>_initialize_benchmark_data
+    IA->>SA: Step 5: on_init()<br/>(所有组件 on_init)
+    IA->>IA: Step 6: _migration_db_storage<br/>_ensure_pilot_workspace<br/>ensure_builtin_skills<br/>db.create_all() + alembic upgrade
+    IA->>SA: Step 7: after_init()<br/>(所有组件 after_init)<br/>注册 Walmart_Sales 示例数据源
+    IA->>IA: Step 8: initialize_worker_manager_in_client<br/>light=False: 本地启动 Worker<br/>light=True: 连接远程 Controller
+    IA->>IA: mount_static_files
+    IA->>SA: before_start()
+
+    IA-->>RW: return param
+    RW->>UV: run_uvicorn(param.service.web)
+    UV->>UV: CORSMiddleware(app)<br/>uvicorn.run(host, port) 阻塞
+    Note over UV: ASGI startup:<br/>system_app.after_start()<br/>启动后台线程/定时任务
+    Note over UV: ASGI shutdown:<br/>system_app.before_stop()<br/>清理资源
+</div>
+
+<!-- ============================ 8. 排查 ============================ -->
+<h2 id="troubleshoot">八、启动失败常见原因与排查</h2>
+
+<table>
+  <tr><th>现象</th><th>根因</th><th>排查点</th></tr>
+  <tr>
+    <td><code>FileNotFoundError: Configuration file not found</code></td>
+    <td>TOML 配置文件路径不对</td>
+    <td>检查 <code>-c</code> 参数或 <code>~/.dbgpt/configs/</code> 下是否有 profile；首次运行需要 <code>dbgpt setup</code></td>
+  </tr>
+  <tr>
+    <td><code>RuntimeError: Component name xxx already exists</code></td>
+    <td>同一个 ComponentType 被注册了两次</td>
+    <td>通常是自定义扩展重复注册了 <code>WORKER_MANAGER</code> 或 <code>CONNECTOR_MANAGER</code>，检查 hook 脚本</td>
+  </tr>
+  <tr>
+    <td><code>No module named 'dbgpt_ext'</code></td>
+    <td>缺少可选依赖包</td>
+    <td><code>pip install dbgpt-ext</code> 或 <code>uv sync --extra base</code></td>
+  </tr>
+  <tr>
+    <td>MySQL 启动后表不存在</td>
+    <td>MySQL 不自动建表（安全策略）</td>
+    <td>手动执行 <code>mysql -u root -p &lt; assets/schema/dbgpt.sql</code>；或改用 SQLite</td>
+  </tr>
+  <tr>
+    <td>Alembic 迁移报错 <code>Can't locate revision</code></td>
+    <td>pilot_template 未正确复制</td>
+    <td>删除 <code>~/.dbgpt/workspace/pilot/meta_data/</code> 重试；检查 <code>pilot_template/alembic/versions/</code> 是否完整</td>
+  </tr>
+  <tr>
+    <td>Worker 启动但 LLM 调用超时</td>
+    <td>模型路径错误或 GPU 不可用</td>
+    <td>检查 <code>light</code> 模式；统一部署模式下确认 <code>default_llm</code> 模型已正确加载</td>
+  </tr>
+  <tr>
+    <td>启动卡在 <code>register_serve_apps</code></td>
+    <td>某个 Serve 的 <code>init_app</code> 阻塞</td>
+    <td>开启 DEBUG 日志 <code>--log-level debug</code>，观察最后一条 <code>Register component</code> 日志定位是哪个 Serve 卡住</td>
+  </tr>
+  <tr>
+    <td>端口被占用 <code>[Errno 98] Address already in use</code></td>
+    <td>上一次进程未正常退出</td>
+    <td><code>dbgpt stop webserver --port 5670</code>；或 <code>lsof -i:5670</code> 杀进程</td>
+  </tr>
+</table>
+
+<div class="callout tip">
+  <strong>调试技巧：</strong>
+  <code>dbgpt_server.py</code> 中大量使用 lazy import（函数内 import），目的是加速 <code>--help</code> 响应。
+  如果你修改了组件初始化逻辑，建议在 <code>initialize_components</code> 的每一步前后加
+  <code>logger.info(f"Step X done")</code>，配合 <code>--log-level info</code> 可以清楚看到每一步耗时。
+</div>
+
+<!-- ============================ Quiz ============================ -->
+<div class="quiz">
+  <h4>思考题</h4>
+  <ol>
+    <li><code>dbgpt start webserver</code> 和 <code>dbgpt start web</code> 有什么区别？为什么 DB-GPT 要提供两个别名？</li>
+    <li><code>SystemApp.register</code> 和 <code>SystemApp.register_instance</code> 有什么区别？什么场景下应该用后者？</li>
+    <li>为什么 <code>_migration_db_storage</code> 必须在 <code>system_app.on_init()</code> 之后、<code>system_app.after_init()</code> 之前执行？如果把顺序反过来会怎样？</li>
+    <li><code>initialize_components</code> 中 <code>_initialize_awel</code> 必须在 <code>_initialize_operators</code> 之前，为什么？</li>
+    <li><code>light</code> 模式（<code>light=True</code>）跳过了哪些初始化逻辑？它依赖什么外部服务？</li>
+    <li><code>load_config</code> 里的 <code>scan_configs()</code> 如果不执行，<code>cfg.parse_config(ApplicationConfig)</code> 会出什么问题？</li>
+    <li>MySQL 用户为什么必须手动执行 <code>dbgpt.sql</code>？这个设计决策的 trade-off 是什么？</li>
+    <li><code>DefaultScheduler</code> 在 <code>after_start</code> 而不是 <code>on_init</code> 中启动后台线程，原因是什么？</li>
+  </ol>
+</div>
+
+<div class="pager">
+  <a href="01-architecture.html">← 01 · 整体架构</a>
+  <a href="03-awel.html">03 · AWEL 工作流 →</a>
+</div>
+
+</main>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: 'base',
+    themeVariables: {
+      primaryColor: '#1a2029',
+      primaryTextColor: '#e6e6e6',
+      primaryBorderColor: '#4ec9b0',
+      lineColor: '#569cd6',
+      secondaryColor: '#232b37',
+      tertiaryColor: '#0f1419',
+      textColor: '#e6e6e6',
+      fontFamily: 'JetBrains Mono, Consolas, monospace',
+      fontSize: '16px'
+    },
+    flowchart: { curve: 'basis', padding: 20, useMaxWidth: true },
+    sequence: { mirrorActors: false, boxMargin: 8 }
+  });
+</script>
+</body>
+</html>

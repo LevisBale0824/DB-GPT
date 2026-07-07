@@ -1,0 +1,1114 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>09 · Serve 服务层 · DB-GPT 源码精读</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="layout">
+
+<aside class="sidebar">
+  <h2>DBGPT 精读</h2>
+  <ul><li><a href="index.html">总览</a></li></ul>
+  <div class="group-title">入门</div>
+  <ul>
+    <li><a href="01-architecture.html">01 · 整体架构</a></li>
+    <li><a href="02-startup.html">02 · 启动流程</a></li>
+  </ul>
+  <div class="group-title">核心子系统</div>
+  <ul>
+    <li><a href="03-awel.html">03 · AWEL 工作流</a></li>
+    <li><a href="04-agent.html">04 · Agent 系统</a></li>
+    <li><a href="05-rag.html">05 · RAG 检索</a></li>
+    <li><a href="06-model.html">06 · 模型层</a></li>
+    <li><a href="07-datasource.html">07 · 数据源</a></li>
+  </ul>
+  <div class="group-title">应用层</div>
+  <ul>
+    <li><a href="08-scene.html">08 · Scene 场景</a></li>
+    <li><a href="09-serve.html" class="active">09 · Serve 服务</a></li>
+    <li><a href="10-ext.html">10 · Ext 扩展</a></li>
+  </ul>
+  <div class="group-title">实战</div>
+  <ul><li><a href="11-trace.html">11 · 链路追踪</a></li></ul>
+</aside>
+
+<main class="main">
+  <h1>09 · Serve 服务层 <span class="tag">Serve</span></h1>
+  <p class="subtitle">把 core 抽象封装为 REST API —— DB-GPT 如何用"模板化四层"批量生产 17+ 个 HTTP 服务模块</p>
+
+  <div class="toc">
+    <div class="toc-title">本章导览</div>
+    <ol>
+      <li><a href="#role">Serve 层的职责与定位</a></li>
+      <li><a href="#modules">服务模块清单（大表格）</a></li>
+      <li><a href="#four-layer">CRUD 四层架构：DAO + Service + Endpoint + Schema</a></li>
+      <li><a href="#api-pattern">通用 API 模式：分页、错误、鉴权、OpenAPI</a></li>
+      <li><a href="#lifecycle">Serve 生命周期：init_app → on_init → before_start → after_start</a></li>
+      <li><a href="#conversation">精读 conversation 模块：聊天会话管理</a></li>
+      <li><a href="#flow">精读 flow 模块：JSON DAG 的持久化、加载、执行</a></li>
+      <li><a href="#migration">数据库迁移与建表策略</a></li>
+      <li><a href="#frontend">与前端 web/ 的对应</a></li>
+      <li><a href="#quiz">本章测验</a></li>
+    </ol>
+  </div>
+
+  <div class="callout tip">
+    <strong>一句话定位：</strong>Serve 层是 DB-GPT 的"产品化外壳"。
+    <code>dbgpt-core</code> 提供能力（Agent / RAG / Model / Datasource），
+    <code>dbgpt_serve</code> 把这些能力包装成<em>可被前端/外部系统调用的 REST API</em>。
+    每个 Serve 模块都是<em>同一套模板</em>的实例：DAO + Service + Endpoint + Schema 四层，
+    配上 FastAPI 路由、Pydantic 模型、SQLAlchemy 表、统一错误处理。
+    全仓库 17+ 个 Serve 模块，<em>90% 的代码结构是复制粘贴再改业务</em>。
+  </div>
+
+  <!-- ===================== 1. 职责 ===================== -->
+  <h2 id="role">一、Serve 层的职责与定位</h2>
+  <p>打开 <code>packages/dbgpt-serve</code> 的目录结构，你会看到 17 个名字相似的子包：
+    <code>agent / conversation / datasource / evaluate / feedback / file / flow / libro
+    / model / prompt / rag / scheduled_task / connector / dbgpts / evaluate / feedback</code>。
+    它们是 DB-GPT 的"服务化封装层"。</p>
+
+  <p>这一层在整体架构中的位置：</p>
+  <div class="mermaid serve-role-flow">
+flowchart LR
+    FE["前端 web/<br/>React + axios"]
+    EP["Endpoint<br/>FastAPI @router"]
+    SVC["Service<br/>业务逻辑 · BaseService"]
+    DAO["DAO + Entity<br/>SQLAlchemy · BaseDao · Model"]
+    CORE["dbgpt-core / ext / app<br/>Agent · RAG · AWEL · Model<br/>Storage · Component"]
+
+    FE -->|"REST API<br/>/api/v1 /api/v2"| EP
+    EP --> SVC
+    SVC --> DAO
+    DAO -->|"调用"| CORE
+
+    classDef frontend fill:#1a3a4a,stroke:#4ec9b0,stroke-width:2px,color:#e6e6e6
+    classDef serve fill:#1a2029,stroke:#569cd6,stroke-width:2px,color:#e6e6e6
+    classDef core fill:#232b37,stroke:#ce9178,stroke-width:2px,color:#e6e6e6
+    class FE frontend
+    class EP,SVC,DAO serve
+    class CORE core
+  </div>
+
+  <p>图例：<span class="badge core">青色</span> 前端 ·
+    <span class="badge serve">蓝色</span> dbgpt-serve（本章）·
+    <span class="badge ext">橙色</span> 上游 core/ext/app</p>
+
+  <p>换句话说：<code>dbgpt_serve</code> 不实现"AI 能力"，它只负责<em>把已有的 AI 能力 HTTP 化</em>。
+    这是它与 <code>dbgpt-app</code>（早期承担一部分 HTTP 路由）的关键区别——
+    长期方向是<em>所有 REST API 都搬到 serve 层</em>，dbgpt-app 只做启动和组装。</p>
+
+  <!-- ===================== 2. 模块清单 ===================== -->
+  <h2 id="modules">二、服务模块清单（大表格）</h2>
+  <p>下表是 <code>packages/dbgpt-serve/src/dbgpt_serve/</code> 下全部主要子模块，
+    标注了路径、API 前缀、典型端点、对应的 core 子系统。</p>
+  <table>
+    <thead><tr>
+      <th>模块</th><th>包路径</th><th>API 前缀</th><th>典型端点</th><th>对应 core 子系统</th>
+    </tr></thead>
+    <tbody>
+      <tr>
+        <td><strong>conversation</strong></td>
+        <td><code>dbgpt_serve/conversation/</code></td>
+        <td><code>/api/v1/serve/conversation</code></td>
+        <td><code>/new /list /messages/history /delete /clear /query_page /export_messages</code></td>
+        <td>core 下的 <code>StorageConversation / MessageStorageItem</code></td>
+      </tr>
+      <tr>
+        <td><strong>flow</strong></td>
+        <td><code>dbgpt_serve/flow/</code></td>
+        <td><code>/api/v1/serve/awel</code><br><code>/api/v2/serve/awel</code></td>
+        <td><code>POST /flows / GET /flows/{uid} / /nodes / /flow/debug / /flow/export/{uid}</code></td>
+        <td>core/awel 的 <code>DAG / FlowFactory / DAGManager</code></td>
+      </tr>
+      <tr>
+        <td><strong>agent</strong></td>
+        <td><code>dbgpt_serve/agent/</code><br>(含 chat/ app/ hub/ team/ resource/)</td>
+        <td><code>/api/v1/serve/agent</code> 等</td>
+        <td><code>/chat/dialogue/messages / app/list / hub/update</code></td>
+        <td>dbgpt-agent 的 <code>Agent / AgentManager / VisibleMessage</code></td>
+      </tr>
+      <tr>
+        <td><strong>model</strong></td>
+        <td><code>dbgpt_serve/model/</code></td>
+        <td><code>/api/v1/serve/model</code></td>
+        <td><code>/support-models / /start / /stop / /model_types</code></td>
+        <td>dbgpt/model 的 <code>WorkerManager / BaseModelController / ModelStorage</code></td>
+      </tr>
+      <tr>
+        <td><strong>rag</strong></td>
+        <td><code>dbgpt_serve/rag/</code></td>
+        <td><code>/api/v1/serve/rag</code></td>
+        <td><code>/spaces / /documents/sync / /knowledge/retrieve / /chunks</code></td>
+        <td>core/rag + ext/rag 的 <code>KnowledgeFactory / EmbeddingRetriever</code></td>
+      </tr>
+      <tr>
+        <td><strong>datasource</strong></td>
+        <td><code>dbgpt_serve/datasource/</code></td>
+        <td><code>/api/v2/serve</code></td>
+        <td><code>/datasources / /datasources/{id}/tables / /datasources/test</code></td>
+        <td>dbgpt/datasource 的 <code>RDBMS / ConnectorManager</code></td>
+      </tr>
+      <tr>
+        <td><strong>prompt</strong></td>
+        <td><code>dbgpt_serve/prompt/</code></td>
+        <td><code>/api/v1/serve/prompt</code></td>
+        <td><code>/add / /list / /detail / /debug / /verify</code></td>
+        <td>core 的 <code>PromptManager / BasePromptTemplate</code></td>
+      </tr>
+      <tr>
+        <td><strong>file</strong></td>
+        <td><code>dbgpt_serve/file/</code></td>
+        <td><code>/api/v1/serve/file</code></td>
+        <td><code>/upload / /download / /list</code></td>
+        <td>core 的 <code>FileStorageClient</code></td>
+      </tr>
+      <tr>
+        <td><strong>feedback</strong></td>
+        <td><code>dbgpt_serve/feedback/</code></td>
+        <td><code>/api/v1/serve/feedback</code></td>
+        <td><code>/list / /create</code></td>
+        <td>(独立) 消息反馈持久化</td>
+      </tr>
+      <tr>
+        <td><strong>libro</strong></td>
+        <td><code>dbgpt_serve/libro/</code></td>
+        <td><code>/api/v1/serve/libro</code></td>
+        <td><code>/cells / /query_page</code></td>
+        <td>notebook 风格的代码块管理</td>
+      </tr>
+      <tr>
+        <td><strong>scheduled_task</strong></td>
+        <td><code>dbgpt_serve/scheduled_task/</code></td>
+        <td><code>/api/v1/serve/scheduled</code></td>
+        <td><code>/create / /pause / /resume</code></td>
+        <td>调度器 + cron 表达式</td>
+      </tr>
+      <tr>
+        <td><strong>connector</strong></td>
+        <td><code>dbgpt_serve/connector/</code></td>
+        <td><code>/api/v1/serve/connector</code></td>
+        <td><code>/list / /test</code></td>
+        <td>dbgpt/datasource 的连接器注册</td>
+      </tr>
+      <tr>
+        <td><strong>evaluate</strong></td>
+        <td><code>dbgpt_serve/evaluate/</code></td>
+        <td><code>/api/v1/serve/evaluate</code></td>
+        <td><code>/datasets / /run</code></td>
+        <td>benchmark / 自动化评测</td>
+      </tr>
+      <tr>
+        <td><strong>dbgpts/hub</strong></td>
+        <td><code>dbgpt_serve/dbgpts/hub/</code></td>
+        <td><code>/api/v1/serve/dbgpts/hub</code></td>
+        <td><code>/list / /install</code></td>
+        <td>dbgpts 包市场</td>
+      </tr>
+      <tr>
+        <td><strong>dbgpts/my</strong></td>
+        <td><code>dbgpt_serve/dbgpts/my/</code></td>
+        <td><code>/api/v1/serve/dbgpts/my</code></td>
+        <td><code>/list / /delete</code></td>
+        <td>本地 dbgpts 管理</td>
+      </tr>
+      <tr>
+        <td><strong>core</strong></td>
+        <td><code>dbgpt_serve/core/</code></td>
+        <td>—（无路由）</td>
+        <td>仅提供 <code>BaseServe / BaseService / Result / add_exception_handler</code></td>
+        <td>所有 Serve 模块的公共基类</td>
+      </tr>
+      <tr>
+        <td><strong>utils</strong></td>
+        <td><code>dbgpt_serve/utils/</code></td>
+        <td>—</td>
+        <td>模板工具（生成新 Serve 用）</td>
+        <td>脚手架</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="callout">
+    <strong>命名规律：</strong>每个 Serve 模块都有这样 4 个常量在 <code>config.py</code> 里：
+    <code>APP_NAME = "conversation"</code>、
+    <code>SERVE_APP_NAME = "dbgpt_serve_conversation"</code>、
+    <code>SERVE_CONFIG_KEY_PREFIX = "dbgpt.serve.conversation."</code>、
+    <code>SERVER_APP_TABLE_NAME = "dbgpt_serve_conversation"</code>。
+    这套前缀用于配置文件、组件注册、数据库表名、日志 tag 的统一约定。
+  </div>
+
+  <!-- ===================== 3. 四层架构 ===================== -->
+  <h2 id="four-layer">三、CRUD 四层架构：DAO + Service + Endpoint + Schema</h2>
+  <p>Serve 层最显著的特征是<em>高度的模板化</em>。打开任意一个 Serve 子模块，
+    你都能看到同样的四个文件，做几乎同样的事。下面用 conversation 做例子展示这个套路。</p>
+
+  <div class="mermaid">flowchart TD
+    REQ["HTTP 请求\nPOST /api/v1/serve/conversation/query_page"]
+    EP["Endpoint 层  api/endpoints.py\n@router.post\nFastAPI 路由声明 / 参数校验、鉴权\n统一返回 Result.succ / Result.failed"]
+    SVC["Service 层  service/service.py\n业务逻辑编排\n跨模块调用\n不直接碰 SQLAlchemy session"]
+    DAO["DAO 层  models/models.py\n所有 SQLAlchemy 操作集中在这里\nEntity ↔ Request / Response 转换"]
+    SCH["Schema 层  api/schemas.py + models/models.py\nRequest / Response 用 Pydantic\nEntity 用 SQLAlchemy 声明式建表"]
+    REQ --> EP --> SVC --> DAO --> SCH</div>
+
+  <p>这四层分别对应 4 个固定文件：
+    <code>api/endpoints.py</code>（路由）、
+    <code>api/schemas.py</code>（Pydantic）、
+    <code>service/service.py</code>（业务）、
+    <code>models/models.py</code>（SQLAlchemy + DAO）。
+    另有两个辅助文件：<code>config.py</code>（常量 + ServeConfig）、
+    <code>serve.py</code>（生命周期管理，下文详述）。</p>
+
+  <h3>core 提供的公共基类</h3>
+  <p>四层架构的"骨架"来自 <code>dbgpt_serve/core/</code>。它导出了几个关键工具：</p>
+  <pre><code><span class="com"># dbgpt_serve/core/__init__.py</span>
+<span class="k">from</span> dbgpt_serve.core.config <span class="k">import</span> BaseServeConfig <span class="k">as</span> BaseServeConfig
+<span class="k">from</span> dbgpt_serve.core.schemas <span class="k">import</span> (
+    ResourceParameters, ResourceTypes, Result,
+    add_exception_handler,
+)
+<span class="k">from</span> dbgpt_serve.core.serve <span class="k">import</span> BaseServe <span class="k">as</span> BaseServe
+<span class="k">from</span> dbgpt_serve.core.service <span class="k">import</span> BaseService <span class="k">as</span> BaseService
+
+<span class="com"># 异步包装阻塞函数（DAO 多为同步 SQLAlchemy 调用）</span>
+<span class="k">async def</span> <span class="fn">blocking_func_to_async</span>(system_app, func, *args, **kwargs):
+    executor = <span class="fn">DefaultExecutorFactory.get_instance</span>(system_app).<span class="fn">create</span>()
+    <span class="k">return await</span> <span class="fn">_blocking_func_to_async</span>(executor, func, *args, **kwargs)</code></pre>
+
+  <p><code>BaseService</code> 定义了 Service 层的契约：必须提供 <code>dao</code> 和 <code>config</code> 属性，
+    默认实现 <code>create()</code> 直接转给 DAO：</p>
+  <pre><code><span class="com"># dbgpt_serve/core/service.py</span>
+<span class="k">class</span> <span class="type">BaseService</span>(BaseComponent, Generic[T, REQ, RES], ABC):
+    name = <span class="s">"dbgpt_serve_base_service"</span>
+    _dag_manager: Optional[DAGManager] = <span class="kw">None</span>
+
+    <span class="kw">@property</span>
+    <span class="kw">@abstractmethod</span>
+    <span class="k">def</span> <span class="fn">dao</span>(<span class="kw">self</span>) -> BaseDao[T, REQ, RES]: <span class="kw">...</span>
+
+    <span class="kw">@property</span>
+    <span class="kw">@abstractmethod</span>
+    <span class="k">def</span> <span class="fn">config</span>(<span class="kw">self</span>) -> BaseServeConfig: <span class="kw">...</span>
+
+    <span class="k">def</span> <span class="fn">create</span>(<span class="kw">self</span>, request: REQ) -> RES:
+        <span class="kw">return</span> <span class="kw">self</span>.dao.<span class="fn">create</span>(request)  <span class="com"># 默认实现</span>
+
+    <span class="k">def</span> <span class="fn">before_start</span>(<span class="kw">self</span>):
+        <span class="kw">self</span>._dag_manager = <span class="fn">DAGManager.get_instance</span>(<span class="kw">self</span>._system_app)</code></pre>
+
+  <p>注意 <code>BaseService</code> 还引入了 <code>DAGManager</code>——这意味着<em>所有 Service 都能拿到全局 DAG 管理器</em>，
+    这对 flow 模块尤其重要。</p>
+
+  <!-- ===================== 4. 通用 API 模式 ===================== -->
+  <h2 id="api-pattern">四、通用 API 模式：分页、错误、鉴权、OpenAPI</h2>
+
+  <h3>4.1 统一返回 Result</h3>
+  <p>所有 Endpoint 返回值都被 <code>Result[T]</code> 包装（来自 <code>dbgpt.core.schema.api</code>）：</p>
+  <pre><code><span class="com"># 典型用法</span>
+<span class="kw">@router.post</span>(<span class="s">"/query"</span>, response_model=Result[ServerResponse])
+<span class="k">async def</span> <span class="fn">query</span>(request: ServeRequest, service: Service = <span class="fn">Depends</span>(get_service)):
+    <span class="k">return</span> Result.<span class="fn">succ</span>(service.<span class="fn">get</span>(request))
+
+<span class="com"># 失败时</span>
+<span class="k">return</span> Result.<span class="fn">failed</span>(msg=<span class="fn">str</span>(e))
+<span class="k">return</span> Result.<span class="fn">fail</span>(<span class="s">"Invalid JSON format"</span>)  <span class="com"># 简版</span></code></pre>
+
+  <p><code>Result</code> 的 JSON 形态是 <code>{&quot;success&quot;: bool, &quot;err_code&quot;: str, &quot;err_msg&quot;: str, &quot;data&quot;: T}</code>，
+    方便前端统一处理成功/失败。</p>
+
+  <h3>4.2 统一异常处理</h3>
+  <p><code>dbgpt_serve/core/schemas.py</code> 提供了三类异常处理器，由 <code>add_exception_handler(app)</code> 一次性挂到 FastAPI 上：</p>
+  <pre><code><span class="k">async def</span> <span class="fn">validation_exception_handler</span>(request, exc: RequestValidationError):
+    <span class="com"># Pydantic 校验失败 → 400 + E0001</span>
+    message = <span class="s">""</span>
+    <span class="k">for</span> error <span class="k">in</span> exc.<span class="fn">errors</span>():
+        loc = <span class="s">"."</span>.<span class="fn">join</span>(<span class="fn">map</span>(str, error.<span class="fn">get</span>(<span class="s">"loc"</span>)))
+        message += loc + <span class="s">":"</span> + error.<span class="fn">get</span>(<span class="s">"msg"</span>) + <span class="s">";"</span>
+    <span class="k">return</span> <span class="fn">JSONResponse</span>(status_code=<span class="n">400</span>, content=Result.<span class="fn">failed</span>(msg=message, err_code=<span class="s">"E0001"</span>).<span class="fn">to_dict</span>())
+
+<span class="k">async def</span> <span class="fn">http_exception_handler</span>(request, exc: HTTPException):
+    <span class="com"># FastAPI 抛出的 HTTPException（如 404、403）</span>
+    <span class="k">return</span> <span class="fn">JSONResponse</span>(status_code=exc.status_code, content=Result.<span class="fn">failed</span>(...).<span class="fn">to_dict</span>())
+
+<span class="k">async def</span> <span class="fn">common_exception_handler</span>(request, exc: Exception):
+    <span class="com"># 兜底：未知异常 → 400 + E0003</span>
+    <span class="k">return</span> <span class="fn">JSONResponse</span>(status_code=<span class="n">400</span>, content=Result.<span class="fn">failed</span>(msg=<span class="fn">str</span>(exc), err_code=<span class="s">"E0003"</span>).<span class="fn">to_dict</span>())
+
+<span class="k">def</span> <span class="fn">add_exception_handler</span>(app):
+    app.<span class="fn">add_exception_handler</span>(RequestValidationError, validation_exception_handler)
+    app.<span class="fn">add_exception_handler</span>(HTTPException, http_exception_handler)
+    app.<span class="fn">add_exception_handler</span>(Exception, common_exception_handler)</code></pre>
+
+  <div class="callout tip">
+    <strong>错误码约定：</strong><code>E0001</code> = 参数校验失败；
+    <code>E0003</code> = 未捕获异常；HTTP 状态码会被 <code>JSONResponse(status_code=...)</code> 覆盖。
+    <em>注意</em>：这种把所有异常都变成 400 的做法对前端简单，但牺牲了 RESTful 语义，调试时需要看 err_code 区分。
+  </div>
+
+  <h3>4.3 鉴权：Bearer Token + 配置开关</h3>
+  <p>几乎所有 Serve 模块的 <code>endpoints.py</code> 都有一段<em>几乎一字不差</em>的 <code>check_api_key</code> 函数：</p>
+  <pre><code><span class="com"># conversation/api/endpoints.py（所有 Serve 模块复制的模板）</span>
+get_bearer_token = <span class="fn">HTTPBearer</span>(auto_error=<span class="kw">False</span>)
+
+<span class="kw">@cache</span>
+<span class="k">def</span> <span class="fn">_parse_api_keys</span>(api_keys: str) -> List[str]:
+    <span class="k">if not</span> api_keys: <span class="k">return</span> []
+    <span class="k">return</span> [key.<span class="fn">strip</span>() <span class="k">for</span> key <span class="k">in</span> api_keys.<span class="fn">split</span>(<span class="s">","</span>)]
+
+<span class="k">async def</span> <span class="fn">check_api_key</span>(
+    auth: Optional[HTTPAuthorizationCredentials] = <span class="fn">Depends</span>(get_bearer_token),
+    request: Request = <span class="kw">None</span>,
+    service: Service = <span class="fn">Depends</span>(get_service),
+) -> Optional[str]:
+    <span class="com"># /api/v1 路径下放行（兼容旧接口）</span>
+    <span class="k">if</span> request.url.path.<span class="fn">startswith</span>(<span class="s">"/api/v1"</span>): <span class="k">return None</span>
+    <span class="k">if</span> service.config.api_keys:
+        api_keys = <span class="fn">_parse_api_keys</span>(service.config.api_keys)
+        <span class="k">if</span> auth <span class="kw">is</span> <span class="kw">None</span> <span class="kw">or</span> (token := auth.credentials) <span class="kw">not in</span> api_keys:
+            <span class="k">raise</span> <span class="fn">HTTPException</span>(status_code=<span class="n">401</span>, detail={<span class="s">"error"</span>: {...}})
+        <span class="k">return</span> token
+    <span class="k">return None</span>  <span class="com"># api_keys 未设置，放行</span>
+
+<span class="kw">@router.post</span>(<span class="s">"/query_page"</span>, dependencies=[<span class="fn">Depends</span>(check_api_key)])
+<span class="k">async def</span> <span class="fn">query_page</span>(...): ...</code></pre>
+
+  <p>鉴权开关来自 <code>ServeConfig.api_keys</code>（逗号分隔的 key 列表），可以在 <code>.env</code> 或
+    <code>dbgpt.serve.conversation.api_keys</code> 配置项里设置。<em>未设置时默认放行</em>，
+    这是为了本地开发方便；生产环境强烈建议配置。</p>
+
+  <h3>4.4 分页：PaginationResult 约定</h3>
+  <p>分页查询统一返回 <code>PaginationResult[T]</code>：</p>
+  <pre><code><span class="kw">@router.post</span>(<span class="s">"/query_page"</span>, response_model=Result[PaginationResult[ServerResponse]])
+<span class="k">async def</span> <span class="fn">query_page</span>(
+    request: ServeRequest,
+    page: Optional[int] = <span class="fn">Query</span>(default=<span class="n">1</span>, description=<span class="s">"current page"</span>),
+    page_size: Optional[int] = <span class="fn">Query</span>(default=<span class="n">10</span>, description=<span class="s">"page size"</span>),
+    service: Service = <span class="fn">Depends</span>(get_service),
+):
+    <span class="k">return</span> Result.<span class="fn">succ</span>(service.<span class="fn">get_list_by_page</span>(request, page, page_size))</code></pre>
+
+  <p>DAO 层实现分页的典型写法（conversation 模块）：</p>
+  <pre><code><span class="com"># conversation/models/models.py</span>
+<span class="k">def</span> <span class="fn">get_conv_by_page</span>(<span class="kw">self</span>, req, page, page_size) -> PaginationResult[ServerResponse]:
+    <span class="k">with</span> <span class="kw">self</span>.<span class="fn">session</span>(commit=<span class="kw">False</span>) <span class="k">as</span> session:
+        query = <span class="kw">self</span>.<span class="fn">_create_query_object</span>(session, req)
+        query = query.<span class="fn">order_by</span>(ServeEntity.gmt_created.<span class="fn">desc</span>())
+        total_count = query.<span class="fn">count</span>()
+        items = query.<span class="fn">offset</span>((page - <span class="n">1</span>) * page_size).<span class="fn">limit</span>(page_size)
+        total_pages = (total_count + page_size - <span class="n">1</span>) // page_size
+        result_items = [<span class="kw">self</span>.<span class="fn">to_response</span>(it) <span class="k">for</span> it <span class="k">in</span> items]
+        <span class="k">return</span> <span class="fn">PaginationResult</span>(
+            items=result_items, total_count=total_count,
+            total_pages=total_pages, page=page, page_size=page_size,
+        )</code></pre>
+
+  <h3>4.5 OpenAPI 文档：FastAPI 自动生成</h3>
+  <p>因为 Schema 用的是 Pydantic，FastAPI 会自动把所有 Endpoint 注册到 <code>/docs</code>（Swagger UI）
+    和 <code>/redoc</code>。<code>response_model=Result[ServerResponse]</code> 这种写法让返回结构也在文档里可见。
+    这是 Serve 层选择 FastAPI 而不是 Flask 的核心收益之一。</p>
+
+  <!-- ===================== 5. 生命周期 ===================== -->
+  <h2 id="lifecycle">五、Serve 生命周期：init_app → on_init → before_start → after_start</h2>
+  <p>每个 Serve 模块都是 <code>BaseServe</code> 的子类，它的生命周期由 <code>SystemApp</code> 驱动：</p>
+
+  <div class="mermaid">flowchart LR
+    INIT["① init_app(system_app)\n- include_router\n- 注册 Service 组件\n- 读取 ServeConfig\n- 设置 _app_has_initiated"]
+    ONINIT["② on_init()\n- import Model\n- 预加载依赖\n- 尚未可访问别的 Serve 组件"]
+    BEFORE["③ before_start()\n- create DB tables\n- 初始化 storage\n- 注册 Operator\n- 构建 VariablesProvider"]
+    AFTER["④ after_start()\n- flow 特有：\n  load_dag_from_db\n  load_dag_from_dbgpts"]
+    INIT --> ONINIT --> BEFORE --> AFTER</div>
+
+  <p>以 conversation 为例，<code>init_app</code> 挂载路由：</p>
+  <pre><code><span class="com"># conversation/serve.py</span>
+<span class="k">class</span> <span class="type">Serve</span>(BaseServe):
+    name = SERVE_APP_NAME  <span class="com"># "dbgpt_serve_conversation"</span>
+
+    <span class="k">def</span> <span class="fn">__init__</span>(<span class="kw">self</span>, system_app, config=<span class="kw">None</span>,
+                 api_prefix=<span class="s">"/api/v1/serve/conversation"</span>,  <span class="com"># 默认前缀</span>
+                 api_tags=<span class="kw">None</span>, db_url_or_db=<span class="kw">None</span>, try_create_tables=<span class="kw">False</span>):
+        <span class="k">if</span> api_tags <span class="kw">is</span> <span class="kw">None</span>: api_tags = [SERVE_APP_NAME_HUMP]
+        <span class="fn">super</span>().<span class="fn">__init__</span>(system_app, api_prefix, api_tags, db_url_or_db, try_create_tables)
+        <span class="kw">self</span>._conv_storage = <span class="kw">None</span>
+        <span class="kw">self</span>._message_storage = <span class="kw">None</span>
+
+    <span class="k">def</span> <span class="fn">init_app</span>(<span class="kw">self</span>, system_app):
+        <span class="k">if</span> <span class="kw">self</span>._app_has_initiated: <span class="k">return</span>
+        <span class="kw">self</span>._system_app = system_app
+        <span class="kw">self</span>._system_app.app.<span class="fn">include_router</span>(
+            router, prefix=<span class="kw">self</span>._api_prefix, tags=<span class="kw">self</span>._api_tags
+        )
+        <span class="kw">self</span>._config = <span class="kw">self</span>._config <span class="kw">or</span> <span class="fn">ServeConfig.from_app_config</span>(
+            system_app.config, SERVE_CONFIG_KEY_PREFIX
+        )
+        <span class="fn">init_endpoints</span>(<span class="kw">self</span>._system_app, <span class="kw">self</span>._config)
+        <span class="kw">self</span>._app_has_initiated = <span class="kw">True</span></code></pre>
+
+  <p><code>before_start</code> 里做实质性的初始化（创建表 + 构建 storage）：</p>
+  <pre><code><span class="com"># conversation/serve.py</span>
+<span class="k">def</span> <span class="fn">before_start</span>(<span class="kw">self</span>):
+    <span class="k">from</span> dbgpt.storage.chat_history.chat_history_db <span class="k">import</span> (
+        ChatHistoryEntity, ChatHistoryMessageEntity,
+    )
+    <span class="k">from</span> dbgpt.storage.metadata.db_storage <span class="k">import</span> SQLAlchemyStorage
+    <span class="k">from</span> dbgpt.util.serialization.json_serialization <span class="k">import</span> JsonSerializer
+
+    <span class="kw">self</span>._db_manager = <span class="kw">self</span>.<span class="fn">create_or_get_db_manager</span>()
+
+    <span class="com"># 两个 storage 分别存"会话列表"和"消息明细"</span>
+    <span class="kw">self</span>._conv_storage = <span class="fn">SQLAlchemyStorage</span>(
+        <span class="kw">self</span>._db_manager, ChatHistoryEntity,
+        <span class="fn">DBStorageConversationItemAdapter</span>(), <span class="fn">JsonSerializer</span>(),
+    )
+    <span class="kw">self</span>._message_storage = <span class="fn">SQLAlchemyStorage</span>(
+        <span class="kw">self</span>._db_manager, ChatHistoryMessageEntity,
+        <span class="fn">DBMessageStorageItemAdapter</span>(), <span class="fn">JsonSerializer</span>(),
+    )</code></pre>
+
+  <p><code>create_or_get_db_manager</code> 来自 <code>BaseServe</code>，它优先使用系统级
+    <code>UnifiedDBManagerFactory</code>（保证所有 Serve 共享同一个 SQLite/MySQL 实例），
+    回退到自身 <code>db_url_or_db</code>。<code>try_create_tables=True</code> 时会调用
+    <code>init_db.create_all()</code>——这就是 Serve 的"轻量建表"机制。</p>
+
+  <!-- ===================== 6. conversation 精读 ===================== -->
+  <h2 id="conversation">六、精读 conversation 模块：聊天会话管理</h2>
+  <p>conversation 模块是<em>最常用</em>的 Serve 模块——每次用户打开聊天页面，前端都要先调它的
+    <code>/list</code> 拉历史会话、调 <code>/new</code> 新建会话、调 <code>/messages/history</code>
+    拉某会话的全部消息。</p>
+
+  <h3>6.1 数据模型</h3>
+  <p>conversation 没有自己建表，而是复用 <code>dbgpt/storage/chat_history/chat_history_db.py</code> 里的
+    <code>ChatHistoryEntity</code> 和 <code>ChatHistoryMessageEntity</code>。在
+    <code>conversation/models/models.py</code> 里直接 <em>import as</em> 成 ServeEntity：</p>
+  <pre><code><span class="com"># conversation/models/models.py</span>
+<span class="k">from</span> dbgpt.storage.chat_history.chat_history_db <span class="k">import</span> ChatHistoryEntity <span class="k">as</span> ServeEntity
+<span class="k">from</span> dbgpt.storage.chat_history.chat_history_db <span class="k">import</span> ChatHistoryMessageEntity
+
+<span class="k">class</span> <span class="type">ServeDao</span>(BaseDao[ServeEntity, ServeRequest, ServerResponse]):
+    <span class="k">def</span> <span class="fn">from_request</span>(<span class="kw">self</span>, request):
+        request_dict = request.<span class="fn">to_dict</span>() <span class="k">if</span> <span class="fn">isinstance</span>(request, ServeRequest) <span class="k">else</span> request
+        <span class="k">return</span> <span class="fn">ServeEntity</span>(**request_dict)
+
+    <span class="k">def</span> <span class="fn">to_response</span>(<span class="kw">self</span>, entity) -> ServerResponse:
+        gmt_created = entity.gmt_created.<span class="fn">strftime</span>(<span class="s">"%Y-%m-%d %H:%M:%S"</span>) <span class="k">if</span> entity.gmt_created <span class="k">else</span> <span class="kw">None</span>
+        <span class="k">return</span> <span class="fn">ServerResponse</span>(
+            app_code=entity.app_code, conv_uid=entity.conv_uid,
+            user_input=entity.summary, <span class="com"># 注意：summary → user_input</span>
+            chat_mode=entity.chat_mode, sys_code=entity.sys_code,
+            gmt_created=gmt_created, gmt_modified=...,
+        )</code></pre>
+
+  <div class="callout">
+    <strong>命名映射的坑：</strong>数据库里叫 <code>summary</code>，API 返回叫 <code>user_input</code>。
+    这种字段重命名大量出现在 DAO 的 <code>to_response</code> 里——是为了兼容旧的前端字段约定。
+    阅读 Serve 代码时<em>不要假设字段名就是数据库列名</em>，一定要看 DAO 转换函数。
+  </div>
+
+  <h3>6.2 Service 层：把 storage 和 DAO 串起来</h3>
+  <p>conversation 的 Service 有个特别之处：它<em>同时持有 DAO 和两个 Storage</em>，
+    DAO 管"会话列表"，Storage 管"消息流"。这是因为消息流需要走
+    <code>StorageConversation</code> 这个领域对象而不是裸 SQL：</p>
+  <pre><code><span class="com"># conversation/service/service.py</span>
+<span class="k">class</span> <span class="type">Service</span>(BaseService[ServeEntity, ServeRequest, ServerResponse]):
+    name = SERVE_SERVICE_COMPONENT_NAME
+
+    <span class="kw">@property</span>
+    <span class="k">def</span> <span class="fn">conv_storage</span>(<span class="kw">self</span>) -> StorageInterface:
+        <span class="k">if</span> <span class="kw">self</span>._storage: <span class="k">return</span> <span class="kw">self</span>._storage
+        <span class="k">from</span> ..serve <span class="k">import</span> Serve
+        <span class="k">return</span> Serve.<span class="fn">call_on_current_serve</span>(
+            <span class="kw">self</span>._system_app, <span class="k">lambda</span> serve: serve.conv_storage
+        )
+
+    <span class="k">def</span> <span class="fn">create_storage_conv</span>(<span class="kw">self</span>, request, load_message=<span class="kw">True</span>) -> StorageConversation:
+        <span class="k">return</span> <span class="fn">StorageConversation</span>(
+            conv_uid=request.conv_uid, chat_mode=request.chat_mode,
+            user_name=request.user_name, sys_code=request.sys_code,
+            conv_storage=<span class="kw">self</span>.<span class="fn">conv_storage</span>,
+            message_storage=<span class="kw">self</span>.<span class="fn">message_storage</span>,
+            load_message=load_message,
+        )
+
+    <span class="k">def</span> <span class="fn">delete</span>(<span class="kw">self</span>, request):
+        conv = <span class="kw">self</span>.<span class="fn">create_storage_conv</span>(request)
+        conv.<span class="fn">delete</span>()  <span class="com"># 同时删会话和消息</span>
+
+    <span class="k">def</span> <span class="fn">clear</span>(<span class="kw">self</span>, request):
+        conv = <span class="kw">self</span>.<span class="fn">create_storage_conv</span>(request)
+        conv.<span class="fn">clear</span>()  <span class="com"># 只删消息保留会话</span></code></pre>
+
+  <p><code>get_history_messages</code> 是 conversation Service 里最复杂的方法，它要：
+    (1) 从 storage 读出所有消息；
+    (2) 调 <code>_append_view_messages</code> 合并 view 消息；
+    (3) 调 feedback 模块拿每条消息的反馈；
+    (4) 调 file 模块的 <code>replace_uri</code> 把文件 URI 换成可访问 URL。</p>
+  <pre><code><span class="com"># conversation/service/service.py</span>
+<span class="k">def</span> <span class="fn">get_history_messages</span>(<span class="kw">self</span>, request) -> List[MessageVo]:
+    <span class="k">from</span> ...file.serve <span class="k">import</span> Serve <span class="k">as</span> FileServe
+    file_serve = <span class="fn">FileServe.get_instance</span>(<span class="kw">self</span>.system_app)
+
+    conv: StorageConversation = <span class="kw">self</span>.<span class="fn">create_storage_conv</span>(request)
+    messages = <span class="fn">_append_view_messages</span>(conv.messages)
+
+    <span class="com"># 跨模块：拿 feedback</span>
+    feedback_service = <span class="fn">get_service</span>()
+    feedbacks = feedback_service.<span class="fn">list_conv_feedbacks</span>(conv_uid=request.conv_uid)
+    fb_map = {fb.message_id: fb.<span class="fn">to_dict</span>() <span class="k">for</span> fb <span class="k">in</span> feedbacks}
+
+    result = []
+    <span class="k">for</span> msg <span class="k">in</span> messages:
+        feedback = fb_map.<span class="fn">get</span>(<span class="fn">str</span>(msg.round_index), {})
+        result.<span class="fn">append</span>(<span class="fn">MessageVo</span>(
+            role=msg.type,
+            context=<span class="fn">vis_name_change</span>(msg.<span class="fn">get_view_markdown_text</span>(file_serve.replace_uri)),
+            order=msg.round_index,
+            model_name=<span class="kw">self</span>.config.default_model,
+            feedback=feedback,
+        ))
+    <span class="k">return</span> result</code></pre>
+
+  <div class="callout tip">
+    <strong>跨模块调用范式：</strong>Service 层通过两种方式获取别的 Serve：
+    (1) <code>Serve.call_on_current_serve(system_app, lambda s: s.xxx)</code>——拿 Serve 组件实例；
+    (2) <code>Service.get_instance(system_app)</code>——拿 Service 组件。
+    这两种都依赖 <code>SystemApp</code> 的组件注册表，是 DB-GPT 的 IoC 容器。
+  </div>
+
+  <h3>6.3 Endpoint：导出会话为 JSON 文件</h3>
+  <p>conversation 提供了 <code>/export_messages</code> 端点把全部会话打包成 JSON 下载——
+    这是 Serve 层"小工具型"端点的典型写法（流式响应、Content-Disposition 头）：</p>
+  <pre><code><span class="kw">@router.get</span>(<span class="s">"/export_messages"</span>, dependencies=[<span class="fn">Depends</span>(check_api_key)])
+<span class="k">async def</span> <span class="fn">export_all_messages</span>(user_name=<span class="kw">None</span>, user_id=<span class="kw">None</span>, sys_code=<span class="kw">None</span>,
+                            format: Literal[<span class="s">"file"</span>, <span class="s">"json"</span>] = <span class="fn">Query</span>(<span class="s">"file"</span>),
+                            service: Service = <span class="fn">Depends</span>(get_service)):
+    request = <span class="fn">ServeRequest</span>(user_name=user_name <span class="kw">or</span> user_id, sys_code=sys_code)
+    page, page_size, all_conversations = <span class="n">1</span>, <span class="n">100</span>, []
+    <span class="k">while</span> <span class="kw">True</span>:  <span class="com"># 分页把所有会话捞完</span>
+        pr = service.<span class="fn">get_list_by_page</span>(request, page, page_size)
+        all_conversations.<span class="fn">extend</span>(pr.items)
+        <span class="k">if</span> page >= pr.total_pages: <span class="k">break</span>
+        page += <span class="n">1</span>
+    result = {<span class="s">"user_name"</span>: ..., <span class="s">"conversations"</span>: []}
+    <span class="k">for</span> conv <span class="k">in</span> all_conversations:
+        messages = service.<span class="fn">get_history_messages</span>(<span class="fn">ServeRequest</span>(conv_uid=conv.conv_uid))
+        result[<span class="s">"conversations"</span>].<span class="fn">append</span>({<span class="s">"conv_uid"</span>: conv.conv_uid, <span class="s">"messages"</span>: ...})
+
+    <span class="k">if</span> format == <span class="s">"json"</span>:
+        <span class="k">return</span> <span class="fn">JSONResponse</span>(content=result)
+    <span class="k">return</span> <span class="fn">StreamingResponse</span>(
+        <span class="fn">io.BytesIO</span>(<span class="fn">json.dumps</span>(result).<span class="fn">encode</span>(<span class="s">"utf-8"</span>)),
+        media_type=<span class="s">"application/file"</span>,
+        headers={<span class="s">"Content-Disposition"</span>: <span class="s">f"attachment;filename=...</span>.json<span class="s">"</span>},
+    )</code></pre>
+
+  <h3>6.4 Operator：把 conversation 接入 AWEL</h3>
+  <p>conversation 还提供了 <code>ServePreChatHistoryLoadOperator</code>——这是
+    <em>Serve 模块与 AWEL 工作流的衔接点</em>。这个 Operator 让 DAG 中的对话能自动加载历史消息：</p>
+  <pre><code><span class="com"># conversation/operators.py</span>
+<span class="k">class</span> <span class="type">ServePreChatHistoryLoadOperator</span>(PreChatHistoryLoadOperator):
+    <span class="k">def</span> <span class="fn">__init__</span>(<span class="kw">self</span>, storage=<span class="kw">None</span>, message_storage=<span class="kw">None</span>, **kwargs):
+        <span class="fn">super</span>().<span class="fn">__init__</span>(storage, message_storage,
+                            use_in_memory_storage_if_not_set=<span class="kw">False</span>, **kwargs)
+
+    <span class="kw">@property</span>
+    <span class="k">def</span> <span class="fn">storage</span>(<span class="kw">self</span>):
+        <span class="k">if</span> <span class="kw">self</span>._storage: <span class="k">return</span> <span class="kw">self</span>._storage
+        <span class="com"># 反查当前 Serve 组件，拿 conv_storage</span>
+        storage = Serve.<span class="fn">call_on_current_serve</span>(
+            <span class="kw">self</span>.system_app, <span class="k">lambda</span> serve: serve.conv_storage
+        )
+        <span class="k">if not</span> storage:
+            <span class="kw">self</span>._storage = <span class="fn">InMemoryStorage</span>()  <span class="com"># 兜底</span>
+        <span class="k">return</span> <span class="kw">self</span>._storage</code></pre>
+
+  <p>这种"Operator 延迟从 Serve 拿 storage"的模式在多个 Serve 模块里都能看到——
+    它解决了"Operator 在 DAG 构建时尚未注入 system_app"的时序问题。</p>
+
+  <!-- ===================== 7. flow 精读 ===================== -->
+  <h2 id="flow">七、精读 flow 模块：JSON DAG 的持久化、加载、执行</h2>
+  <p>flow 是 Serve 层最复杂的模块。它负责把前端拖拽出的 JSON DAG（工作流）保存到数据库、
+    在启动时重新加载、按需注册到 DAGManager 让它真正"可执行"。</p>
+
+  <h3>7.1 实体模型：flow_data 是个 JSON blob</h3>
+  <p>flow 模块的核心表 <code>dbgpt_serve_flow</code> 字段非常丰富——
+    除了常规的 <code>uid / name / user_name / sys_code</code>，最重要的是 <code>flow_data</code>：</p>
+  <pre><code><span class="com"># flow/models/models.py</span>
+<span class="k">class</span> <span class="type">ServeEntity</span>(Model):
+    __tablename__ = SERVER_APP_TABLE_NAME  <span class="com"># "dbgpt_serve_flow"</span>
+    __table_args__ = (<span class="fn">UniqueConstraint</span>(<span class="s">"uid"</span>, name=<span class="s">"uk_uid"</span>),)
+
+    id = <span class="fn">Column</span>(Integer, primary_key=<span class="kw">True</span>)
+    uid = <span class="fn">Column</span>(String(<span class="n">128</span>), index=<span class="kw">True</span>, nullable=<span class="kw">False</span>)
+    dag_id = <span class="fn">Column</span>(String(<span class="n">128</span>), index=<span class="kw">True</span>)  <span class="com"># FlowFactory.build 生成</span>
+    name = <span class="fn">Column</span>(String(<span class="n">128</span>), index=<span class="kw">True</span>)
+    flow_category = <span class="fn">Column</span>(String(<span class="n">64</span>))  <span class="com"># CHAT_AGENT / CHAT_FLOW / COMMON</span>
+    flow_data = <span class="fn">Column</span>(Text)  <span class="com"># ★ 整个 DAG 的 JSON 表示</span>
+    state = <span class="fn">Column</span>(String(<span class="n">32</span>))  <span class="com"># INITIALIZING / DEPLOYED / RUNNING / LOAD_FAILED / DISABLED</span>
+    error_message = <span class="fn">Column</span>(String(<span class="n">512</span>))
+    source = <span class="fn">Column</span>(String(<span class="n">64</span>))  <span class="com"># flow 来源: dbgpts / web / ...</span>
+    define_type = <span class="fn">Column</span>(String(<span class="n">32</span>), default=<span class="s">"json"</span>)  <span class="com"># json or python</span>
+    editable = <span class="fn">Column</span>(Integer)  <span class="com"># 0 可编辑, 1 不可编辑</span>
+    variables = <span class="fn">Column</span>(Text)  <span class="com"># 变量定义 JSON</span>
+    gmt_created = <span class="fn">Column</span>(DateTime, default=datetime.now)
+    gmt_modified = <span class="fn">Column</span>(DateTime, default=datetime.now)</code></pre>
+
+  <p>注意 <code>define_type</code> 有两种值：<code>"json"</code>（前端拖拽产生）和
+    <code>"python"</code>（DBGPTs 包里的 Python DAG 定义）。这两种来源的 flow <em>共用同一张表</em>。</p>
+
+  <h3>7.2 状态机：State 枚举</h3>
+  <p>flow 的 <code>state</code> 字段由 <code>FlowFactory.State</code> 管理，
+    <code>State.can_change_state</code> 定义了合法的状态迁移：</p>
+  <div class="mermaid">stateDiagram-v2
+    [*] --> INITIALIZING
+    INITIALIZING --> DEPLOYED: deploy
+    INITIALIZING --> LOAD_FAILED: load failed
+    DEPLOYED --> RUNNING: register OK
+    DEPLOYED --> LOAD_FAILED: build failed
+    RUNNING --> DISABLED: disable
+    DISABLED --> DEPLOYED: enable</div>
+
+  <h3>7.3 持久化：create_and_save_dag 的两阶段</h3>
+  <p>当用户在前端点"保存并部署"时，前端会 POST <code>/api/v2/serve/awel/flows</code>，
+    进入 <code>create_and_save_dag</code>。这个方法是 flow Service 的灵魂：</p>
+  <pre><code><span class="com"># flow/service/service.py</span>
+<span class="k">def</span> <span class="fn">create_and_save_dag</span>(<span class="kw">self</span>, request, save_failed_flow=<span class="kw">False</span>) -> ServerResponse:
+    <span class="k">try</span>:
+        <span class="com"># 阶段 1: 构建内存中的 DAG 对象</span>
+        <span class="k">if</span> request.define_type == <span class="s">"json"</span>:
+            dag = <span class="kw">self</span>._flow_factory.<span class="fn">build</span>(request)  <span class="com"># JSON → DAG</span>
+        <span class="k">else</span>:
+            dag = request.flow_dag  <span class="com"># Python 定义直接拿</span>
+        request.dag_id = dag.dag_id
+        request.flow_category = <span class="kw">self</span>.<span class="fn">_parse_flow_category</span>(dag)
+    <span class="k">except</span> Exception <span class="k">as</span> e:
+        <span class="k">if</span> save_failed_flow:  <span class="com"># 允许保存失败 flow（调试用）</span>
+            request.state = State.LOAD_FAILED
+            request.error_message = <span class="fn">str</span>(e)
+            <span class="k">return</span> <span class="kw">self</span>.dao.<span class="fn">create</span>(request)
+        <span class="k">raise</span> <span class="fn">ValueError</span>(...)
+
+    <span class="com"># 阶段 2: 写库</span>
+    <span class="kw">self</span>.dao.<span class="fn">create</span>(request)
+    res = <span class="kw">self</span>.<span class="fn">get</span>({<span class="s">"uid"</span>: request.uid})
+
+    <span class="com"># 阶段 3: 如果 state=DEPLOYED，注册到 DAGManager（真正"激活"）</span>
+    state = request.state
+    <span class="k">try</span>:
+        <span class="k">if</span> state == State.DEPLOYED:
+            <span class="kw">self</span>.dag_manager.<span class="fn">register_dag</span>(dag, request.uid)
+            request.state = State.RUNNING  <span class="com"># 注册成功 → RUNNING</span>
+            request.error_message = <span class="s">""</span>
+            <span class="kw">self</span>.dao.<span class="fn">update</span>({<span class="s">"uid"</span>: request.uid}, request)
+        <span class="k">else</span>:
+            logger.<span class="fn">info</span>(<span class="s">f"Flow state is </span>{state}<span class="s">, skip register DAG"</span>)
+    <span class="k">except</span> Exception <span class="k">as</span> e:
+        <span class="k">if</span> save_failed_flow:
+            request.state = State.LOAD_FAILED
+            <span class="kw">self</span>.dao.<span class="fn">update</span>(...)
+        <span class="k">else</span>:
+            <span class="kw">self</span>.<span class="fn">delete</span>(request.uid)  <span class="com"># 回滚</span>
+        <span class="k">raise</span> e
+    <span class="k">return</span> res</code></pre>
+
+  <div class="callout warn">
+    <strong>三阶段事务的脆弱点：</strong>这个方法在 <code>dao.create</code> 之后还做了
+    <code>dag_manager.register_dag</code>。如果中间崩溃，会出现"DB 里有但 DAGManager 里没注册"的脏数据。
+    代码用 <code>try/except + delete 回滚</code> 兜底，但回滚本身可能失败。
+    生产环境部署 flow 时建议监控 LOAD_FAILED 状态。
+  </div>
+
+  <h3>7.4 启动加载：从 DB 和 dbgpts 包两处恢复</h3>
+  <p>应用启动时，flow Service 的 <code>before_start</code> 和 <code>after_start</code> 会做两轮加载：
+    <code>_pre_load_dag_from_db</code> 先预热依赖（<code>pre_load_requirements</code>），
+    然后 <code>load_dag_from_db</code> 真正 build + register：</p>
+  <pre><code><span class="com"># flow/service/service.py</span>
+<span class="k">def</span> <span class="fn">load_dag_from_db</span>(<span class="kw">self</span>):
+    entities = <span class="kw">self</span>.dao.<span class="fn">get_list</span>({})
+    <span class="k">for</span> entity <span class="k">in</span> entities:
+        <span class="k">try</span>:
+            <span class="k">if</span> entity.define_type != <span class="s">"json"</span>: <span class="k">continue</span>  <span class="com"># 跳过 Python 定义</span>
+            dag = <span class="kw">self</span>._flow_factory.<span class="fn">build</span>(entity)
+            <span class="k">if</span> entity.state <span class="kw">in</span> [State.DEPLOYED, State.RUNNING] <span class="kw">or</span> (
+                entity.version == <span class="s">"0.1.0"</span> <span class="kw">and</span> entity.state == State.INITIALIZING
+            ):
+                <span class="kw">self</span>.dag_manager.<span class="fn">register_dag</span>(dag, entity.uid)
+                entity.state = State.RUNNING
+                entity.error_message = <span class="s">""</span>
+                <span class="kw">self</span>.dao.<span class="fn">update</span>({<span class="s">"uid"</span>: entity.uid}, entity)
+        <span class="k">except</span> Exception <span class="k">as</span> e:
+            logger.<span class="fn">warning</span>(<span class="s">f"Load DAG(</span>{entity.name}<span class="s">) error: </span>{e}<span class="s">"</span>)
+
+<span class="k">def</span> <span class="fn">load_dag_from_dbgpts</span>(<span class="kw">self</span>, is_first_load=<span class="kw">False</span>):
+    flows = <span class="kw">self</span>.dbgpts_loader.<span class="fn">get_flows</span>()  <span class="com"># 扫描已安装的 dbgpts 包</span>
+    <span class="k">for</span> flow <span class="k">in</span> flows:
+        <span class="k">try</span>:
+            flow.state = State.DEPLOYED
+            exist_inst = <span class="kw">self</span>.dao.<span class="fn">get_one</span>({<span class="s">"name"</span>: flow.name})
+            <span class="k">if not</span> exist_inst:
+                <span class="kw">self</span>.<span class="fn">create_and_save_dag</span>(flow, save_failed_flow=<span class="kw">True</span>)
+            <span class="k">elif</span> is_first_load <span class="kw">or</span> exist_inst.state != State.RUNNING:
+                flow.uid = exist_inst.uid
+                <span class="kw">self</span>.<span class="fn">update_flow</span>(flow, check_editable=<span class="kw">False</span>, save_failed_flow=<span class="kw">True</span>)
+        <span class="k">except</span> Exception <span class="k">as</span> e:
+            logger.<span class="fn">warning</span>(<span class="s">f"Load DAG </span>{flow.name}<span class="s"> from dbgpts error"</span>)
+
+<span class="k">def</span> <span class="fn">after_start</span>(<span class="kw">self</span>):
+    <span class="kw">self</span>.<span class="fn">load_dag_from_db</span>()
+    <span class="kw">self</span>.<span class="fn">load_dag_from_dbgpts</span>(is_first_load=<span class="kw">True</span>)
+    <span class="com"># 周期性扫 dbgpts 包（默认 5 秒）</span>
+    schedule.<span class="fn">every</span>(<span class="kw">self</span>._serve_config.load_dbgpts_interval).seconds.<span class="fn">do</span>(
+        <span class="kw">self</span>.load_dag_from_dbgpts
+    )</code></pre>
+
+  <p>这套加载机制让 DB-GPT 支持"<em>把工作流像 npm 包一样分发</em>"——
+    别人装了你的 dbgpts 包，启动时自动加载并部署里面的 flow。</p>
+
+  <h3>7.5 节点查询与调试：/nodes 和 /flow/debug</h3>
+  <p>前端的 DAG 编辑器需要列出<em>所有可用的 Operator/Resource</em>，
+    这是 <code>/nodes</code> 端点的职责——它从全局 <code>_OPERATOR_REGISTRY</code> 读元数据：</p>
+  <pre><code><span class="kw">@router.get</span>(<span class="s">"/nodes"</span>, dependencies=[<span class="fn">Depends</span>(check_api_key)])
+<span class="k">async def</span> <span class="fn">get_nodes</span>(user_name=<span class="kw">None</span>, sys_code=<span class="kw">None</span>, tags=<span class="kw">None</span>):
+    <span class="k">from</span> dbgpt.core.awel.flow.base <span class="k">import</span> _OPERATOR_REGISTRY
+    tags_dict = <span class="fn">json.loads</span>(tags) <span class="k">if</span> tags <span class="k">else</span> <span class="kw">None</span>
+    metadata_list = <span class="k">await</span> <span class="fn">blocking_func_to_async</span>(
+        global_system_app,
+        _OPERATOR_REGISTRY.metadata_list,
+        tags_dict, user_name, sys_code,
+    )
+    <span class="k">return</span> Result.<span class="fn">succ</span>(metadata_list)
+
+<span class="kw">@router.post</span>(<span class="s">"/flow/debug"</span>, dependencies=[<span class="fn">Depends</span>(check_api_key)])
+<span class="k">async def</span> <span class="fn">debug_flow</span>(flow_debug_request: FlowDebugRequest, service=...):
+    <span class="com"># 流式调试：返回 SSE</span>
+    stream_iter = service.<span class="fn">debug_flow</span>(flow_debug_request, default_incremental=<span class="kw">False</span>)
+    <span class="k">return</span> <span class="fn">StreamingResponse</span>(
+        service.<span class="fn">_wrapper_chat_stream_flow_str</span>(stream_iter),
+        headers={<span class="s">"Content-Type"</span>: <span class="s">"text/event-stream"</span>, ...},
+        media_type=<span class="s">"text/event-stream"</span>,
+    )</code></pre>
+
+  <h3>7.6 VariablesService：变量加密与作用域</h3>
+  <p>flow 还附带 <code>VariablesService</code>——管理 DAG 里复用的变量（如 LLM 的 API Key）。
+    变量有作用域（global / flow / app / agent / datasource）和加密（Fernet）：</p>
+  <pre><code><span class="com"># flow/serve.py</span>
+<span class="k">class</span> <span class="type">Serve</span>(BaseServe):
+    <span class="k">def</span> <span class="fn">__init__</span>(<span class="kw">self</span>, system_app, config=<span class="kw">None</span>,
+                 api_prefix=<span class="kw">None</span>,  <span class="com"># flow 有两个前缀</span>
+                 api_tags=<span class="kw">None</span>, db_url_or_db=<span class="kw">None</span>, try_create_tables=<span class="kw">False</span>):
+        <span class="k">if</span> api_prefix <span class="kw">is</span> <span class="kw">None</span>:
+            api_prefix = [<span class="s">"/api/v1/serve/awel"</span>, <span class="s">"/api/v2/serve/awel"</span>]
+        ...
+        <span class="kw">self</span>._variables_provider = <span class="fn">StorageVariablesProvider</span>(
+            storage=<span class="kw">None</span>,
+            encryption=<span class="fn">FernetEncryption</span>(<span class="kw">self</span>._config.encrypt_key),
+            system_app=system_app,
+        )
+        system_app.<span class="fn">register_instance</span>(<span class="kw">self</span>._variables_provider)
+
+    <span class="k">def</span> <span class="fn">init_app</span>(<span class="kw">self</span>, system_app):
+        <span class="k">for</span> prefix <span class="k">in</span> <span class="kw">self</span>._api_prefix:  <span class="com"># ★ 同一份 router 挂两个前缀</span>
+            <span class="kw">self</span>._system_app.app.<span class="fn">include_router</span>(router, prefix=prefix, tags=...)</code></pre>
+
+  <p>这里有个<em>关键技巧</em>：flow 的路由同时挂在 <code>/api/v1/serve/awel</code> 和
+    <code>/api/v2/serve/awel</code> 两个前缀下。v1 给老前端用（鉴权放行），
+    v2 给新前端和 OpenAI 兼容客户端用（必须带 API Key）。</p>
+
+  <!-- ===================== 7.7 其他模块对比 ===================== -->
+  <h3>7.7 其他模块的差异化设计</h3>
+  <p>除了 conversation 和 flow 两个"明星模块"，其他 Serve 子模块虽然走同样的四层模板，
+    但在<em>对接的 core 子系统</em>和<em>特有的业务逻辑</em>上各有差异。
+    下面对照着读源码，看看它们的"同"与"不同"。</p>
+
+  <h4>agent 模块：多 DAO 协作</h4>
+  <p>agent 模块的目录结构是 Serve 层里最复杂的——它包含 <code>chat / app / hub / team / resource / evaluation</code>
+    六个子子模块，每个都是一套独立的小 Serve。<code>agent/chat/</code> 负责聊天记录的 CRUD，
+    <code>agent/app/</code> 负责"应用"（独立部署的 Agent）管理，<code>agent/hub/</code> 是 Agent 插件市场。
+    这种"<em> Serve 里嵌套 Serve</em>"的结构，是为了让每个子能力都能独立挂路由。</p>
+  <pre><code><span class="com"># agent/chat/service/service.py</span>
+<span class="k">class</span> <span class="type">Service</span>(BaseService[ServeEntity, ServeRequest, ServerResponse]):
+    name = SERVE_SERVICE_COMPONENT_NAME  <span class="com"># "dbgpt_serve_agent_chat_service"</span>
+
+    <span class="k">def</span> <span class="fn">init_app</span>(<span class="kw">self</span>, system_app):
+        <span class="fn">super</span>().<span class="fn">init_app</span>(system_app)
+        <span class="kw">self</span>._dao = <span class="kw">self</span>._dao <span class="kw">or</span> <span class="fn">ServeDao</span>(<span class="kw">self</span>._serve_config)
+        <span class="kw">self</span>._system_app = system_app</code></pre>
+
+  <p>agent 的 Service 类结构和其他模块几乎一样，但它的业务方法（<code>list_apps / install_app /
+    uninstall_app</code>）会调用 <code>dbgpt.agent</code> 下的 <code>AgentManager</code>、
+    <code>PluginManager</code>，而不只是单纯查库。这是 <em>"Serve = core 能力的 HTTP 外壳"</em> 这句话的最好例证。</p>
+
+  <h4>model 模块：桥接 WorkerManager</h4>
+  <p>model Serve 不像其他模块那样把全部业务放在 Service——它大量使用 <em>Depends 注入</em>的方式
+    把 <code>WorkerManager / BaseModelController / ModelStorage</code> 直接拉到 Endpoint 层：</p>
+  <pre><code><span class="com"># model/api/endpoints.py</span>
+<span class="k">def</span> <span class="fn">get_worker_manager</span>() -> WorkerManager:
+    <span class="com"># 从 SystemApp 拿全局唯一的 WorkerManagerFactory</span>
+    <span class="k">return</span> <span class="fn">WorkerManagerFactory.get_instance</span>(global_system_app).<span class="fn">create</span>()
+
+<span class="k">def</span> <span class="fn">get_model_controller</span>() -> BaseModelController:
+    <span class="k">return</span> <span class="fn">BaseModelController.get_instance</span>(global_system_app)
+
+<span class="k">def</span> <span class="fn">get_model_storage</span>() -> ModelStorage:
+    <span class="k">from</span> ..serve <span class="k">import</span> Serve <span class="k">as</span> ModelServe
+    model_serve = <span class="fn">ModelServe.get_instance</span>(global_system_app)
+    <span class="k">return</span> <span class="fn">ModelStorage</span>(model_serve.model_storage)</code></pre>
+
+  <p>这是因为模型启停 / 列表查询是"重资源"操作，每个端点需要拿到的是不同的 core 组件。
+    model Serve 展示了<em>"不必把所有逻辑塞进 Service 层"</em>的灵活性——
+    当 Endpoint 直接对接 core 组件比绕一层 Service 更清晰时，<em>允许"越层"</em>。</p>
+
+  <h4>rag 模块：多 DAO + 异步同步任务</h4>
+  <p>rag Serve 是除 flow 外<em>第二复杂</em>的 Serve。它的 Service 类同时持有 <em>3 个 DAO</em>：</p>
+  <pre><code><span class="com"># rag/service/service.py</span>
+<span class="k">class</span> <span class="type">Service</span>(BaseService[KnowledgeSpaceEntity, SpaceServeRequest, SpaceServeResponse]):
+    <span class="k">def</span> <span class="fn">__init__</span>(<span class="kw">self</span>, system_app, config,
+                 dao: Optional[KnowledgeSpaceDao] = <span class="kw">None</span>,
+                 document_dao: Optional[KnowledgeDocumentDao] = <span class="kw">None</span>,
+                 chunk_dao: Optional[DocumentChunkDao] = <span class="kw">None</span>):
+        <span class="kw">self</span>._dao = dao                      <span class="com"># 知识空间</span>
+        <span class="kw">self</span>._document_dao = document_dao    <span class="com"># 文档</span>
+        <span class="kw">self</span>._chunk_dao = chunk_dao          <span class="com"># 切片</span></code></pre>
+
+  <p>这是因为 RAG 的数据模型有三层：知识空间 → 文档 → 切片。每层都有独立的表，
+    所以需要三个 DAO。文档同步（<code>/documents/sync</code>）涉及<em>异步长任务</em>：
+    上传文档 → 切分 → embedding → 入库，全程走 <code>blocking_func_to_async</code> 包装，
+    状态用 <code>SyncStatus.TODO/RUNNING/FINISHED/FAILED</code> 枚举追踪。
+    这种"长任务 + 状态轮询"是 rag Serve 特有的模式。</p>
+
+  <h4>datasource 模块：v2 only</h4>
+  <p>datasource 是少有的"<em>只用 v2 前缀</em>"的 Serve：</p>
+  <pre><code><span class="com"># datasource/serve.py</span>
+api_prefix: Optional[str] = <span class="s">"/api/v2/serve"</span>  <span class="com"># 没有 /api/v1 版本</span></code></pre>
+
+  <p>这是因为 datasource 是后加的 Serve，没有兼容老前端的负担。
+    它的 Endpoint 直接用 <code>DatasourceServeRequest</code> 接收连接参数，
+    调 <code>ConnectorManager</code> 测试连通性。这种"纯 v2"的 Serve 是<em>未来新模块的推荐做法</em>——
+    v1 兼容路径最终会被清理。</p>
+
+  <!-- ===================== 8. 数据库迁移 ===================== -->
+  <h2 id="migration">八、数据库迁移与建表策略</h2>
+  <p>DB-GPT 在 serve 层<em>没有使用 alembic</em>（虽然 storage 层支持）。
+    每个 Serve 模块走的是 <em>SQLAlchemy <code>create_all()</code> 自动建表</em>：</p>
+
+  <pre><code><span class="com"># dbgpt_serve/core/serve.py</span>
+<span class="k">def</span> <span class="fn">create_or_get_db_manager</span>(<span class="kw">self</span>) -> DatabaseManager:
+    <span class="k">from</span> dbgpt.storage.metadata <span class="k">import</span> Model, UnifiedDBManagerFactory, db
+
+    db_manager_factory = <span class="kw">self</span>._system_app.<span class="fn">get_component</span>(
+        ComponentType.UNIFIED_METADATA_DB_MANAGER_FACTORY,
+        UnifiedDBManagerFactory, default_component=<span class="kw">None</span>,
+    )
+    <span class="k">if</span> db_manager_factory <span class="kw">is not</span> <span class="kw">None</span> <span class="kw">and</span> db_manager_factory.<span class="fn">create</span>():
+        init_db = db_manager_factory.<span class="fn">create</span>()
+    <span class="k">else</span>:
+        init_db = <span class="kw">self</span>._db_url_or_db <span class="kw">or</span> db
+        init_db = <span class="fn">DatabaseManager.build_from</span>(init_db, base=Model)
+
+    <span class="k">if</span> <span class="kw">self</span>._try_create_tables <span class="kw">and</span> <span class="kw">self</span>._not_create_table:
+        <span class="k">try</span>:
+            init_db.<span class="fn">create_all</span>()  <span class="com"># ★ SQLAlchemy.MetaData.create_all</span>
+        <span class="k">except</span> Exception <span class="k">as</span> e:
+            logger.<span class="fn">warning</span>(<span class="s">f"Failed to create tables: </span>{e}<span class="s">"</span>)
+        <span class="k">finally</span>:
+            <span class="kw">self</span>._not_create_table = <span class="kw">False</span>
+    <span class="k">return</span> init_db</code></pre>
+
+  <div class="callout warn">
+    <strong>为什么不用 alembic？</strong>
+    <ul>
+      <li><strong>create_all 只建不迁移</strong>——表存在就跳过，不会改字段。这给"加字段"造成麻烦：老数据库升级时新字段不会自动加。</li>
+      <li>DB-GPT 的策略是"字段变更走 <code>try/except</code>"——运行时如果缺列报错，开发者手动跑 SQL 或删表重建。</li>
+      <li>这是 serve 层的一个<em>已知技术债</em>。生产部署前建议在测试库验证表结构。</li>
+    </ul>
+  </div>
+
+  <p>Serve 模块还提供了 <em>模板工具</em>（<code>dbgpt_serve/utils/_template_files/default_serve_template/</code>）
+    用于生成新的 Serve 子模块——包含 <code>serve.py / service.py / endpoints.py / schemas.py / models.py / config.py</code>
+    的脚手架。这是保持"四层模板"一致性的关键。</p>
+
+  <!-- ===================== 9. 前端对应 ===================== -->
+  <h2 id="frontend">九、与前端 web/ 的对应</h2>
+  <p>前端 (web/) 通过 <code>client/api/</code> 下的 TypeScript 模块调用 Serve API。
+    下面以 flow 为例展示前后端的精确对应关系：</p>
+
+  <table>
+    <thead><tr><th>前端文件</th><th>HTTP 方法</th><th>URL</th><th>对应 Endpoint</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><code>web/client/api/flow/index.ts → addFlow</code></td>
+        <td>POST</td>
+        <td><code>/api/v2/serve/awel/flows</code></td>
+        <td><code>flow.api.endpoints.create</code></td>
+      </tr>
+      <tr>
+        <td><code>getFlows</code></td>
+        <td>GET</td>
+        <td><code>/api/v2/serve/awel/flows</code></td>
+        <td><code>query_page</code></td>
+      </tr>
+      <tr>
+        <td><code>getFlowById</code></td>
+        <td>GET</td>
+        <td><code>/api/v2/serve/awel/flows/{id}</code></td>
+        <td><code>get_flows</code></td>
+      </tr>
+      <tr>
+        <td><code>updateFlowById</code></td>
+        <td>PUT</td>
+        <td><code>/api/v2/serve/awel/flows/{id}</code></td>
+        <td><code>update</code></td>
+      </tr>
+      <tr>
+        <td><code>deleteFlowById</code></td>
+        <td>DELETE</td>
+        <td><code>/api/v2/serve/awel/flows/{id}</code></td>
+        <td><code>delete</code></td>
+      </tr>
+      <tr>
+        <td><code>getFlowNodes</code></td>
+        <td>GET</td>
+        <td><code>/api/v2/serve/awel/nodes</code></td>
+        <td><code>get_nodes</code></td>
+      </tr>
+      <tr>
+        <td><code>refreshFlowNodeById</code></td>
+        <td>POST</td>
+        <td><code>/api/v2/serve/awel/nodes/refresh</code></td>
+        <td><code>refresh_nodes</code></td>
+      </tr>
+      <tr>
+        <td><code>debugFlow</code></td>
+        <td>POST</td>
+        <td><code>/api/v2/serve/awel/flow/debug</code></td>
+        <td><code>debug_flow</code> (SSE 流)</td>
+      </tr>
+      <tr>
+        <td><code>exportFlow</code></td>
+        <td>GET</td>
+        <td><code>/api/v2/serve/awel/flow/export/{uid}</code></td>
+        <td><code>export_flow</code></td>
+      </tr>
+      <tr>
+        <td><code>importFlow</code></td>
+        <td>POST</td>
+        <td><code>/api/v2/serve/awel/flow/import</code></td>
+        <td><code>import_flow</code></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p>前端的封装（<code>web/client/api/flow/index.ts</code>）：</p>
+  <pre><code><span class="com">// web/client/api/flow/index.ts</span>
+<span class="k">import</span> { DELETE, GET, POST, PUT } <span class="k">from</span> <span class="s">'../index'</span>;
+
+<span class="k">export const</span> <span class="fn">addFlow</span> = (data: IFlowUpdateParam) =&gt; {
+  <span class="k">return</span> <span class="fn">POST</span>&lt;IFlowUpdateParam, IFlow&gt;(<span class="s">'/api/v2/serve/awel/flows'</span>, data);
+};
+<span class="k">export const</span> <span class="fn">getFlowById</span> = (id: string) =&gt; {
+  <span class="k">return</span> <span class="fn">GET</span>&lt;null, IFlow&gt;(<span class="s">`/api/v2/serve/awel/flows/</span>${id}<span class="s">`</span>);
+};
+<span class="k">export const</span> <span class="fn">deleteFlowById</span> = (id: string) =&gt; {
+  <span class="k">return</span> <span class="fn">DELETE</span>&lt;null, null&gt;(<span class="s">`/api/v2/serve/awel/flows/</span>${id}<span class="s">`</span>);
+};
+<span class="k">export const</span> <span class="fn">debugFlow</span> = (data: any) =&gt; {
+  <span class="k">return</span> <span class="fn">POST</span>&lt;any, IFlowNode&gt;(<span class="s">'/api/v2/serve/awel/flow/debug'</span>, data);
+};</code></pre>
+
+  <p>注意前端用的是 <code>/api/v2/</code> 前缀，这是新版本协议——必须带 API Key 鉴权。
+    老版本的 <code>/api/v1/</code> 路径在 <code>check_api_key</code> 里直接放行，
+    是为了向后兼容旧客户端（包括部分 dbgpt-app 的旧路由）。</p>
+
+  <div class="callout tip">
+    <strong>调试技巧：</strong>要在浏览器里直接测试 Serve API，最简单的方式是：
+    <ol>
+      <li>启动后访问 <code>http://localhost:5670/docs</code>——FastAPI 自动生成的 Swagger UI。</li>
+      <li>所有 <code>dbgpt_serve_*</code> tag 下的接口都可以直接在线测试。</li>
+      <li>如果在 <code>.env</code> 里配了 <code>API_KEYS</code>>，点右上角"Authorize"按钮填 key 即可。</li>
+    </ol>
+  </div>
+
+  <div class="callout">
+    <strong>Serve 层与 Scene 层的区别：</strong>
+    Scene（第 8 章）是<em>聊天场景</em>（chat_normal / chat_with_db / chat_excel...），
+    处理的是"一次对话用什么模式"。Serve 是<em>HTTP 接口层</em>，提供所有场景共用的
+    会话/消息/Flow 等 CRUD。<em>Scene 是业务维度的切分，Serve 是技术维度的切分</em>。
+    两者正交：同一个 Scene 下的对话，依然会调 conversation Serve 的 API。
+  </div>
+
+  <!-- ===================== Quiz ===================== -->
+  <h2 id="quiz">十、本章测验</h2>
+  <div class="quiz">
+    <h4>基础题</h4>
+    <ol>
+      <li>列出 Serve 模块的"四层架构"名称，以及每层对应的典型文件名。</li>
+      <li>所有 Serve 模块的 API 前缀都遵循什么命名规则？为什么 flow 模块要挂两个前缀？</li>
+      <li>Endpoint 层返回值为什么类型？它是如何包装业务数据的？</li>
+    </ol>
+  </div>
+  <div class="quiz">
+    <h4>进阶题</h4>
+    <ol start="4">
+      <li><code>BaseServe</code> 的生命周期有哪四个钩子？分别在什么时机被调用？
+        <code>create_or_get_db_manager</code> 应该在哪个钩子里调？</li>
+      <li>flow 的 <code>create_and_save_dag</code> 为什么要"三阶段事务"（build → create → register）？
+        如果第三阶段失败，代码怎么处理？</li>
+      <li>conversation 模块的 <code>ServePreChatHistoryLoadOperator</code> 为什么要写成
+        <code>@property storage</code> 而不是直接在 <code>__init__</code> 里拿 storage？
+        这跟 AWEL 的 DAG 构建时机有什么关系？</li>
+    </ol>
+  </div>
+  <div class="quiz">
+    <h4>设计题</h4>
+    <ol start="7">
+      <li>如果要给 DB-GPT 加一个"用户偏好设置"Serve（<code>dbgpt_serve_user_pref</code>），
+        需要创建哪些文件？每个文件的职责是什么？画一张类似章节里 ASCII 图的依赖图。</li>
+      <li>Serve 层没用 alembic，用 <code>create_all()</code> 自动建表。请分析这种做法的优缺点，
+        并提出一个"既保留 Serve 模板简洁性又支持字段迁移"的方案。</li>
+      <li>flow 模块用 <code>schedule.every(5).seconds.do(load_dag_from_dbgpts)</code> 周期加载
+        dbgpts 包。如果同时有多个 DB-GPT 实例运行，这种轮询会不会导致重复注册 DAG？
+        你会如何改进？（提示：分布式锁 / lease）</li>
+    </ol>
+  </div>
+
+  <div class="callout warn">
+    <strong>小结：</strong>Serve 层是 DB-GPT 工程化最成熟的一层。
+    <ul>
+      <li><strong>模板化</strong>：17+ 个模块共用一套四层架构，90% 代码结构一致</li>
+      <li><strong>FastAPI 优先</strong>：用 Pydantic 自动生成 OpenAPI 文档，用 Depends 做依赖注入</li>
+      <li><strong>组件化</strong>：所有 Serve 通过 <code>SystemApp</code> 注册，跨模块调用走 IoC</li>
+      <li><strong>待改进</strong>：缺 alembic 迁移、错误码语义不强、轮询而非事件驱动</li>
+    </ul>
+    理解了 Serve 层，你就能定位 DB-GPT 90% 的 HTTP 接口 bug；想扩展新功能，
+    "复制粘贴 conversation 模块改名" 是最快的起步方式。
+  </div>
+
+  <div class="pager">
+    <a href="08-scene.html">← 08 · Scene 场景</a>
+    <a href="10-ext.html">10 · Ext 扩展 →</a>
+  </div>
+
+</main>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: 'base',
+    themeVariables: {
+      primaryColor: '#1a2029',
+      primaryTextColor: '#e6e6e6',
+      primaryBorderColor: '#4ec9b0',
+      lineColor: '#569cd6',
+      secondaryColor: '#232b37',
+      tertiaryColor: '#0f1419',
+      textColor: '#e6e6e6',
+      fontFamily: 'JetBrains Mono, Consolas, monospace',
+      fontSize: '16px'
+    },
+    flowchart: { curve: 'basis', padding: 20, useMaxWidth: true }
+  });
+</script>
+</body>
+</html>

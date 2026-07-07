@@ -1,0 +1,1413 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>03 · AWEL 工作流 —— DB-GPT 源码精读</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="layout">
+
+<aside class="sidebar">
+  <h2>DBGPT 精读</h2>
+  <ul><li><a href="index.html">总览</a></li></ul>
+  <div class="group-title">入门</div>
+  <ul>
+    <li><a href="01-architecture.html">01 · 整体架构</a></li>
+    <li><a href="02-startup.html">02 · 启动流程</a></li>
+  </ul>
+  <div class="group-title">核心子系统</div>
+  <ul>
+    <li><a href="03-awel.html" class="active">03 · AWEL 工作流</a></li>
+    <li><a href="04-agent.html">04 · Agent 系统</a></li>
+    <li><a href="05-rag.html">05 · RAG 检索</a></li>
+    <li><a href="06-model.html">06 · 模型层</a></li>
+    <li><a href="07-datasource.html">07 · 数据源</a></li>
+  </ul>
+  <div class="group-title">应用层</div>
+  <ul>
+    <li><a href="08-scene.html">08 · Scene 场景</a></li>
+    <li><a href="09-serve.html">09 · Serve 服务</a></li>
+    <li><a href="10-ext.html">10 · Ext 扩展</a></li>
+  </ul>
+  <div class="group-title">实战</div>
+  <ul><li><a href="11-trace.html">11 · 链路追踪</a></li></ul>
+</aside>
+
+<main class="main">
+  <h1>03 · AWEL —— Agentic Workflow Expression Language <span class="tag">Core ⭐</span></h1>
+  <p class="subtitle">DAG、Operator、Trigger、Task、Flow —— 五大抽象，一套完整的工作流编排语言</p>
+
+  <div class="callout tip">
+    <strong>本章地位：</strong>AWEL 是 DB-GPT 的灵魂。如果你只读一个子系统，就读 AWEL。
+    从"用户输入一句话"到"大模型吐出答案"的完整链路，全由 AWEL DAG 驱动。
+    本章逐段精读 <code>dbgpt/core/awel/</code> 下全部核心源码。
+  </div>
+
+  <div class="toc">
+    <div class="toc-title">本章导览</div>
+    <ol>
+      <li><a href="#what">AWEL 是什么 & 为什么需要它</a></li>
+      <li><a href="#five-abstractions">五大核心抽象总览</a></li>
+      <li><a href="#dag">DAG 容器：节点、边、拓扑序</a></li>
+      <li><a href="#operator">Operator 类型家族</a></li>
+      <li><a href="#compile-run">DAG 编译与执行流程</a></li>
+      <li><a href="#streaming">流式输出实现</a></li>
+      <li><a href="#trigger">HTTPTrigger 把 DAG 变成 API</a></li>
+      <li><a href="#loader">JSON 可视化编排与反序列化</a></li>
+      <li><a href="#example">实战：NL → SQL → 执行 → 图表 DAG</a></li>
+      <li><a href="#quiz">思考题</a></li>
+    </ol>
+  </div>
+
+  <!-- ==================== 一、AWEL 是什么 ==================== -->
+  <h2 id="what">一、AWEL 是什么 & 为什么需要它</h2>
+
+  <p>翻开 AWEL 模块的 docstring，官方给出的定义非常精准：</p>
+
+  <div class="file-block">
+    <div class="file-header">
+      <span>awel/__init__.py</span>
+      <span class="lines">L1-L9</span>
+    </div>
+    <div class="file-body">
+<pre><code><span class="c">"""Agentic Workflow Expression Language (AWEL).
+
+Agentic Workflow Expression Language(AWEL) is a set of intelligent agent workflow
+expression language specially designed for large model application development. It
+provides great functionality and flexibility. Through the AWEL API, you can focus on
+the development of business logic for LLMs applications without paying attention to
+cumbersome model and environment details.
+"""</span>
+</code></pre>
+    </div>
+    <div class="line-explain">
+      <span class="ln">解读</span>AWEL 是一套<strong>专为 LLM 应用设计的工作流表达式语言</strong>。
+      核心思想：把 LLM 应用拆成一个个可复用的 Operator（算子），用 DAG（有向无环图）把它们编排起来。
+    </div>
+  </div>
+
+  <h3>对比其他编排框架</h3>
+  <table>
+    <tr>
+      <th>框架</th>
+      <th>编排方式</th>
+      <th>优点</th>
+      <th>缺点</th>
+    </tr>
+    <tr>
+      <td><strong>LangChain Chain</strong></td>
+      <td>线性链式：A → B → C</td>
+      <td>简单直观</td>
+      <td>无法表达分支、并行、JOIN</td>
+    </tr>
+    <tr>
+      <td><strong>AutoGen</strong></td>
+      <td>对话式：Agent 之间互发消息</td>
+      <td>灵活、适合多轮讨论</td>
+      <td>执行路径不透明、难以可视化</td>
+    </tr>
+    <tr>
+      <td><strong>AWEL (DB-GPT)</strong></td>
+      <td><strong>DAG 算子图</strong></td>
+      <td>可视化编排、支持分支/并行/JOIN/流式、可序列化为 JSON</td>
+      <td>概念较多、学习曲线稍陡</td>
+    </tr>
+  </table>
+
+  <div class="callout">
+    <strong>设计哲学：</strong>AWEL 把 LLM 应用当成<strong>数据流水线</strong>来处理。
+    每一步的输入和输出有明确的类型契约（泛型 <code>IN</code>/<code>OUT</code>），
+    上游输出自动流入下游输入，框架负责调度。开发者只需关注每个算子的业务逻辑。
+  </div>
+
+  <!-- ==================== 二、五大抽象 ==================== -->
+  <h2 id="five-abstractions">二、五大核心抽象总览</h2>
+
+  <p>AWEL 由五个子系统组成，源码目录结构一目了然：</p>
+
+  <div class="mermaid">
+flowchart TD
+    R["awel/<br/>AWEL 根目录"]
+    R --> DAG["① dag/<br/>DAG 容器<br/>节点·边·拓扑序"]
+    R --> OP["② operators/<br/>算子家族<br/>Map/Branch/Join/Stream"]
+    R --> TR["③ trigger/<br/>触发器<br/>HTTP/定时/事件"]
+    R --> TK["④ task/<br/>任务上下文<br/>TaskOutput"]
+    R --> FL["⑤ flow/<br/>可视化元数据<br/>前端编排用"]
+    R --> RN["runner/<br/>DAG 执行器"]
+    R --> UT["util/<br/>工具函数"]
+
+    classDef core fill:#1a3a4a,stroke:#4ec9b0,stroke-width:2px,color:#e6e6e6;
+    classDef aux fill:#232b37,stroke:#569cd6,stroke-width:1px,color:#9aa5b1;
+    class DAG,OP,TR,TK,FL core;
+    class RN,UT,R aux;
+  </div>
+
+  <p>五者关系用一张图概括：</p>
+
+  <div class="mermaid">
+flowchart LR
+    U["用户 HTTP 请求"]
+    U -.->|"命中 Trigger"| T
+
+    subgraph S1["AWEL DAG 容器 ①"]
+        T["Trigger<br/>触发器 ③"]
+        M1["Map Operator ②"]
+        BR{"Branch ②"}
+        M2["Map Operator ②"]
+        M3["Map Operator ②"]
+        JN["Join Operator ②"]
+        T --> M1 --> BR
+        BR --> M2 --> JN
+        BR --> M3 --> JN
+    end
+
+    FE["前端可视化"]
+    FE -.->|"读取 FlowMetadata ⑤"| T
+    JN -->|"TaskOutput 沿边传递 ④"| OUT["HTTP Response"]
+  </div>
+
+  <div class="callout">
+    <strong>五大抽象编号对照：</strong>
+    <span class="badge core">①</span> DAG 容器 ·
+    <span class="badge core">②</span> Operator 算子 ·
+    <span class="badge core">③</span> Trigger 触发器 ·
+    <span class="badge core">④</span> TaskOutput 沿边传递 ·
+    <span class="badge core">⑤</span> FlowMetadata 描述图结构
+  </div>
+
+  <p>各目录下的关键文件清单：</p>
+  <table>
+    <thead><tr><th>目录</th><th>核心文件</th><th>定义的关键类</th></tr></thead>
+    <tbody>
+      <tr><td><code>dag/</code></td><td><code>base.py</code> · <code>loader.py</code> · <code>dag_manager.py</code></td><td>DAG / DAGNode / DAGContext / LocalFileDAGLoader / DAGManager</td></tr>
+      <tr><td><code>operators/</code></td><td><code>base.py</code> · <code>common_operator.py</code> · <code>stream_operator.py</code></td><td>BaseOperator / MapOperator / BranchOperator / JoinOperator / StreamifyAbsOperator</td></tr>
+      <tr><td><code>trigger/</code></td><td><code>base.py</code> · <code>http_trigger.py</code></td><td>Trigger / HttpTrigger</td></tr>
+      <tr><td><code>task/</code></td><td><code>base.py</code> · <code>task_impl.py</code></td><td>TaskOutput / TaskContext / SimpleTaskOutput / SimpleStreamTaskOutput</td></tr>
+      <tr><td><code>flow/</code></td><td><code>base.py</code></td><td>ViewMixin / ViewMetadata / Parameter</td></tr>
+      <tr><td><code>runner/</code></td><td><code>local_runner.py</code></td><td>DefaultWorkflowRunner</td></tr>
+    </tbody>
+  </table>
+
+  <!-- ==================== 三、DAG 容器 ==================== -->
+  <h2 id="dag">三、DAG 容器：节点、边、拓扑序</h2>
+
+  <h3>3.1 DAGNode —— 图的节点基类</h3>
+
+  <p>所有能放进 DAG 的东西都继承 <code>DAGNode</code>。它实现了 Python 运算符重载，
+  让你用 <code>&lt;&lt;</code> 和 <code>&gt;&gt;</code> 像写管道一样连接节点。</p>
+
+  <div class="file-block">
+    <div class="file-header">
+      <span>awel/dag/base.py</span>
+      <span class="lines">L51-L133</span>
+    </div>
+    <div class="file-body">
+<pre><code><span class="k">class</span> <span class="t">DependencyMixin</span>(ABC):
+    <span class="c">"""mixin：定义上下游关系的接口 + 运算符重载"""</span>
+
+    <span class="k">def</span> <span class="f">__lshift__</span>(<span class="k">self</span>, nodes) <span class="k">-></span> DependencyType:
+        <span class="c"># node &lt;&lt; input_node  等价于  node.set_upstream(input_node)</span>
+        <span class="k">self</span>.set_upstream(nodes)
+        <span class="k">return</span> nodes
+
+    <span class="k">def</span> <span class="f">__rshift__</span>(<span class="k">self</span>, nodes) <span class="k">-></span> DependencyType:
+        <span class="c"># node &gt;&gt; next_node  等价于  node.set_downstream(next_node)</span>
+        <span class="k">self</span>.set_downstream(nodes)
+        <span class="k">return</span> nodes
+
+<span class="k">class</span> <span class="t">DAGNode</span>(DAGLifecycle, DependencyMixin, ViewMixin, ABC):
+    <span class="k">def</span> <span class="f">__init__</span>(<span class="k">self</span>, dag=<span class="k">None</span>, node_id=<span class="k">None</span>, node_name=<span class="k">None</span>, ...):
+        <span class="k">self</span>._upstream: List[<span class="t">DAGNode</span>] = []
+        <span class="k">self</span>._downstream: List[<span class="t">DAGNode</span>] = []
+        <span class="k">self</span>._dag: Optional[<span class="t">DAG</span>] = dag <span class="k">or</span> DAGVar.get_current_dag()
+        <span class="c"># 如果在 DAG 上下文里创建，自动把自己加进去</span>
+        <span class="k">if</span> <span class="k">self</span>._dag:
+            <span class="k">self</span>._dag._append_node(<span class="k">self</span>)</code></pre>
+    </div>
+    <div class="line-explain">
+      <span class="ln">L84</span><code>__lshift__</code> 实现 <code>node &lt;&lt; input</code>：等价于"把 input 设为我的上游"。<br>
+      <span class="ln">L101</span><code>__rshift__</code> 实现 <code>node &gt;&gt; next</code>：等价于"把 next 设为我的下游"。<br>
+      <span class="ln">L325</span>每个节点维护 <code>_upstream</code> 和 <code>_downstream</code> 两个列表，这就是 DAG 的边。<br>
+      <span class="ln">L327</span>如果不在构造时传 dag，就从 <code>DAGVar</code> 获取当前上下文 DAG（类似 Airflow 的隐式 context manager）。
+    </div>
+  </div>
+
+  <h3>3.2 DAGVar —— 隐式 DAG 上下文</h3>
+
+  <p>DAGVar 使用 <code>threading.local</code>（同步）和 <code>contextvars.ContextVar</code>（异步）来维护
+  "当前正在构建的 DAG"栈。这让你可以用 <code>with DAG(...)</code> 语法隐式注册节点：</p>
+
+  <div class="file-block">
+    <div class="file-header">
+      <span>awel/dag/base.py</span>
+      <span class="lines">L136-L170</span>
+    </div>
+    <div class="file-body">
+<pre><code><span class="k">class</span> <span class="t">DAGVar</span>:
+    <span class="c"># 双轨制：线程本地（同步）+ ContextVar（异步）</span>
+    _thread_local = threading.local()
+    _async_local: contextvars.ContextVar = contextvars.ContextVar(
+        <span class="s">"current_dag_stack"</span>, default=deque()
+    )
+
+    <span class="k">@classmethod</span>
+    <span class="k">def</span> <span class="f">enter_dag</span>(cls, dag):
+        is_async = _is_async_context()
+        <span class="k">if</span> is_async:
+            stack = cls._async_local.get()
+            stack.append(dag)
+            cls._async_local.set(stack)
+        <span class="k">else</span>:
+            <span class="k">if</span> <span class="k">not</span> hasattr(cls._thread_local, <span class="s">"current_dag_stack"</span>):
+                cls._thread_local.current_dag_stack = deque()
+            cls._thread_local.current_dag_stack.append(dag)</code></pre>
+    </div>
+    <div class="line-explain">
+      <span class="ln">解读</span>DAGVar 是 AWEL 的"暗线"——你在 <code>with DAG("my_dag"):</code> 内创建的所有 Operator，
+      构造函数都会自动从 DAGVar 拿到当前 DAG 并把自己注册进去。这就是为什么写 AWEL 代码时不需要显式 <code>dag.add_node()</code>。
+      <strong>双轨制</strong>的原因：Python 的 threading.local 在 asyncio 中无法正确传播，
+      所以异步路径用 contextvars（PEP 567），同步路径用 threading.local。
+    </div>
+  </div>
+
+  <h3>3.3 DAG 类 —— 图容器</h3>
+
+  <p>DAG 是所有节点的容器，负责维护 node_map、计算 root/leaf/trigger 节点、管理运行时上下文。</p>
+
+  <div class="file-block">
+    <div class="file-header">
+      <span>awel/dag/base.py</span>
+      <span class="lines">L788-L872</span>
+    </div>
+    <div class="file-body">
+<pre><code><span class="k">class</span> <span class="t">DAG</span>:
+    <span class="k">def</span> <span class="f">__init__</span>(<span class="k">self</span>, dag_id, resource_group=<span class="k">None</span>, tags=<span class="k">None</span>, ...):
+        <span class="k">self</span>._dag_id = dag_id
+        <span class="k">self</span>.node_map: Dict[str, DAGNode] = {}         <span class="c"># 所有节点</span>
+        <span class="k">self</span>._root_nodes: List[DAGNode] = []            <span class="c"># 无上游的节点</span>
+        <span class="k">self</span>._leaf_nodes: List[DAGNode] = []            <span class="c"># 无下游的节点</span>
+        <span class="k">self</span>._trigger_nodes: List[DAGNode] = []         <span class="c"># TriggerOperator 节点</span>
+        <span class="k">self</span>._event_loop_task_id_to_ctx: Dict[int, DAGContext] = {}  <span class="c"># 运行时上下文</span>
+
+    <span class="k">def</span> <span class="f">_build</span>(<span class="k">self</span>) <span class="k">-></span> <span class="k">None</span>:
+        <span class="c"># 遍历 node_map，递归收集所有可达节点，</span>
+        <span class="c"># 然后按 upstream/downstream 是否为空分类</span>
+        <span class="k">from</span> ..operators.common_operator <span class="k">import</span> TriggerOperator
+        nodes: Set[DAGNode] = <span class="f">set</span>()
+        <span class="k">for</span> _, node <span class="k">in</span> <span class="k">self</span>.node_map.items():
+            nodes = nodes.union(_get_nodes(node))
+        <span class="k">self</span>._root_nodes = <span class="f">list</span>(<span class="f">set</span>(<span class="f">filter</span>(<span class="k">lambda</span> x: <span class="k">not</span> x.upstream, nodes)))
+        <span class="k">self</span>._leaf_nodes = <span class="f">list</span>(<span class="f">set</span>(<span class="f">filter</span>(<span class="k">lambda</span> x: <span class="k">not</span> x.downstream, nodes)))
+        <span class="k">self</span>._trigger_nodes = <span class="f">list</span>(
+            <span class="f">set</span>(<span class="f">filter</span>(<span class="k">lambda</span> x: isinstance(x, TriggerOperator), nodes))
+        )</code></pre>
+    </div>
+    <div class="line-explain">
+      <span class="ln">L806</span><code>node_map</code> 是 DAG 的核心数据结构：<code>{"node_id": DAGNode}</code>。<br>
+      <span class="ln">L862</span><code>_build()</code> 是惰性计算：当 <code>root_nodes</code>/<code>leaf_nodes</code>/<code>trigger_nodes</code> 第一次被访问时才遍历全图。这避免了每次加节点都重算。<br>
+      <span class="ln">L870</span>trigger_nodes 的判定：类型为 <code>TriggerOperator</code> 的节点。这是 DAG 和 HTTP API 的连接点。
+    </div>
+  </div>
+
+  <div class="callout warn">
+    <strong>循环检测：</strong>AWEL 的 DAG 在构建时不做显式的环检测。它依赖<strong>拓扑序执行</strong>来隐式保证无环：
+    <code>DefaultWorkflowRunner._execute_node()</code> 递归先跑完所有 upstream 再跑自己，
+    如果有环就会无限递归导致栈溢出。这是"用约定代替检查"的工程取舍。
+  </div>
+
+  <h3>3.4 DAGContext —— 一次请求的运行时上下文</h3>
+
+  <div class="file-block">
+    <div class="file-header">
+      <span>awel/dag/base.py</span>
+      <span class="lines">L625-L659</span>
+    </div>
+    <div class="file-body">
+<pre><code><span class="k">class</span> <span class="t">DAGContext</span>:
+    <span class="c">"""每次 DAG 被触发时创建一个全新的 DAGContext"""</span>
+
+    <span class="k">def</span> <span class="f">__init__</span>(<span class="k">self</span>, node_to_outputs, share_data, event_loop_task_id,
+                 streaming_call=<span class="k">False</span>, node_name_to_ids=<span class="k">None</span>, ...):
+        <span class="k">self</span>._streaming_call = streaming_call              <span class="c"># 是否流式调用</span>
+        <span class="k">self</span>._curr_task_ctx: Optional[TaskContext] = <span class="k">None</span>  <span class="c"># 当前正在执行的 TaskContext</span>
+        <span class="k">self</span>._share_data: Dict[str, Any] = share_data        <span class="c"># 跨节点共享数据</span>
+        <span class="k">self</span>._node_to_outputs: Dict[str, TaskContext] = node_to_outputs  <span class="c"># 节点输出表</span>
+        <span class="k">self</span>._dag_variables = dag_variables                  <span class="c"># DAG 级变量</span>
+        <span class="k">self</span>._share_data_lock = asyncio.Lock()               <span class="c"># 异步锁保护共享数据</span></code></pre>
+    </div>
+    <div class="line-explain">
+      <span class="ln">L629</span>每次 trigger 都创建新的 DAGContext，保证请求隔离。<br>
+      <span class="ln">L654</span><code>_node_to_outputs</code> 存储每个节点的 TaskContext（含输出），是运行时的"结果表"。<br>
+      <span class="ln">L659</span>共享数据用 asyncio.Lock 保护，支持跨节点读写。
+    </div>
+  </div>
+
+  <!-- ==================== 四、Operator 类型家族 ==================== -->
+  <h2 id="operator">四、Operator 类型家族</h2>
+
+  <p>Operator 是 DAGNode 的可执行子类。BaseOperator 定义了 <code>_do_run()</code> 抽象方法，
+    各种子类用不同策略实现数据转换。</p>
+
+  <h3>4.1 BaseOperator —— 所有算子的基类</h3>
+
+  <div class="file-block">
+    <div class="file-header">
+      <span>awel/operators/base.py</span>
+      <span class="lines">L161-L198</span>
+    </div>
+    <div class="file-body">
+<pre><code><span class="k">class</span> <span class="t">BaseOperator</span>(DAGNode, ABC, Generic[OUT], metaclass=BaseOperatorMeta):
+    streaming_operator: bool = <span class="k">False</span>      <span class="c"># 是否产生流式输出</span>
+    incremental_output: bool = <span class="k">False</span>      <span class="c"># 增量输出标记</span>
+
+    <span class="k">def</span> <span class="f">__init__</span>(<span class="k">self</span>, task_id=<span class="k">None</span>, task_name=<span class="k">None</span>, dag=<span class="k">None</span>,
+                 runner=<span class="k">None</span>, can_skip_in_branch=<span class="k">True</span>, ...):
+        <span class="c"># DAGNode.__init__ 自动注册到 dag.node_map</span>
+        <span class="k">super</span>().__init__(node_id=task_id, node_name=task_name, dag=dag, **kwargs)
+        <span class="k">if</span> <span class="k">not</span> runner:
+            runner = DefaultWorkflowRunner()
+        <span class="k">self</span>._runner: WorkflowRunner = runner
+
+    <span class="k">async</span> <span class="k">def</span> <span class="f">_run</span>(<span class="k">self</span>, dag_ctx: DAGContext, task_log_id: str) <span class="k">-></span> TaskOutput[OUT]:
+        CURRENT_DAG_CONTEXT.<span class="f">set</span>(dag_ctx)           <span class="c"># 设置 ContextVar</span>
+        <span class="k">await</span> <span class="k">self</span>._resolve_variables(dag_ctx)    <span class="c"># 解析变量占位符</span>
+        <span class="k">return</span> <span class="k">await</span> <span class="k">self</span>._do_run(dag_ctx)        <span class="c"># 子类实现</span>
+
+    <span class="k">async</span> <span class="k">def</span> <span class="f">call</span>(<span class="k">self</span>, call_data=EMPTY_DATA, ...) <span class="k">-></span> OUT:
+        <span class="c"># 同步调用入口</span>
+        out_ctx = <span class="k">await</span> <span class="k">self</span>._runner.execute_workflow(<span class="k">self</span>, call_data)
+        <span class="k">return</span> out_ctx.current_task_context.task_output.output
+
+    <span class="k">async</span> <span class="k">def</span> <span class="f">call_stream</span>(<span class="k">self</span>, call_data=EMPTY_DATA, ...) <span class="k">-></span> AsyncIterator[OUT]:
+        <span class="c"># 流式调用入口</span>
+        out_ctx = <span class="k">await</span> <span class="k">self</span>._runner.execute_workflow(
+            <span class="k">self</span>, call_data, streaming_call=<span class="k">True</span>
+        )
+        <span class="k">return</span> out_ctx.current_task_context.task_output.output_stream</code></pre>
+    </div>
+    <div class="line-explain">
+      <span class="ln">L167</span><code>streaming_operator = False</code>：类属性，子类设为 True 表示输出流。<br>
+      <span class="ln">L240</span><code>_run()</code> 是 Runner 调用的入口：先设 ContextVar，再解析变量，最后调 <code>_do_run()</code>。<br>
+      <span class="ln">L262</span><code>call()</code> 是对外的同步接口：执行完返回最终 output。<br>
+      <span class="ln">L316</span><code>call_stream()</code> 是流式接口：传 <code>streaming_call=True</code> 给 Runner。
+    </div>
+  </div>
+
+  <h3>4.2 BaseOperatorMeta —— 元类自动注入依赖</h3>
+
+  <div class="file-block">
+    <div class="file-header">
+      <span>awel/operators/base.py</span>
+      <span class="lines">L91-L158</span>
+    </div>
+    <div class="file-body">
+<pre><code><span class="k">class</span> <span class="t">BaseOperatorMeta</span>(ABCMeta):
+    <span class="c">"""元类：在 __init__ 前自动注入 dag / runner / system_app / executor"""</span>
+
+    <span class="k">@classmethod</span>
+    <span class="k">def</span> <span class="f">_apply_defaults</span>(cls, func: F) <span class="k">-></span> F:
+        <span class="k">def</span> <span class="f">apply_defaults</span>(<span class="k">self</span>, *args, **kwargs):
+            dag = kwargs.get(<span class="s">"dag"</span>) <span class="k">or</span> DAGVar.get_current_dag()
+            system_app = kwargs.get(<span class="s">"system_app"</span>) <span class="k">or</span> DAGVar.get_current_system_app()
+            executor = kwargs.get(<span class="s">"executor"</span>) <span class="k">or</span> DAGVar.get_executor()
+            <span class="c"># ... 自动填充 kwargs 里缺失的字段</span>
+            <span class="k">if</span> <span class="k">not</span> kwargs.get(<span class="s">"dag"</span>): kwargs[<span class="s">"dag"</span>] = dag
+            <span class="k">if</span> <span class="k">not</span> kwargs.get(<span class="s">"runner"</span>): kwargs[<span class="s">"runner"</span>] = default_runner
+            <span class="k">return</span> func(<span class="k">self</span>, *args, **kwargs)
+        <span class="k">return</span> cast(F, apply_defaults)
+
+    <span class="k">def</span> <span class="f">__new__</span>(cls, name, bases, namespace, **kwargs):
+        new_cls = <span class="k">super</span>().__new__(cls, name, bases, namespace, **kwargs)
+        new_cls.__init__ = cls._apply_defaults(new_cls.__init__)  <span class="c"># 包装 __init__</span>
+        <span class="k">return</span> new_cls</code></pre>
+    </div>
+    <div class="line-explain">
+      <span class="ln">解读</span>这个元类是 AWEL "少写样板代码"的关键。每个 Operator 子类的 <code>__init__</code> 都被包了一层，
+      自动从 DAGVar 注入 dag / system_app / executor / runner。<strong>用户写 <code>MapOperator(map_function=fn)</code> 就够了，
+      不用传 dag、不用传 runner。</strong>
+    </div>
+  </div>
+
+  <h3>4.3 Operator 类型家族对比表</h3>
+
+  <table>
+    <tr>
+      <th>Operator</th>
+      <th>输入</th>
+      <th>输出</th>
+      <th>核心方法</th>
+      <th>典型用途</th>
+    </tr>
+    <tr>
+      <td><code>InputOperator</code></td>
+      <td>InputSource</td>
+      <td>OUT</td>
+      <td><code>map()</code></td>
+      <td>DAG 数据入口（测试用）</td>
+    </tr>
+    <tr>
+      <td><code>TriggerOperator</code></td>
+      <td>SimpleCallDataInputSource</td>
+      <td>OUT</td>
+      <td>继承自 InputOperator</td>
+      <td>HTTP 触发的数据入口</td>
+    </tr>
+    <tr>
+      <td><code>MapOperator</code></td>
+      <td>IN（单上游）</td>
+      <td>OUT</td>
+      <td><code>map_function</code> 或重写 <code>map()</code></td>
+      <td>1→1 转换（最常用）</td>
+    </tr>
+    <tr>
+      <td><code>JoinOperator</code></td>
+      <td>多上游</td>
+      <td>OUT</td>
+      <td><code>combine_function(*inputs)</code></td>
+      <td>多路合并</td>
+    </tr>
+    <tr>
+      <td><code>BranchOperator</code></td>
+      <td>IN（单上游）</td>
+      <td>IN（透传）</td>
+      <td><code>branches: {func: node_name}</code></td>
+      <td>条件分支，跳过下游</td>
+    </tr>
+    <tr>
+      <td><code>ReduceStreamOperator</code></td>
+      <td>AsyncIterator[IN]</td>
+      <td>OUT</td>
+      <td><code>reduce_function(a, b)</code></td>
+      <td>流→标量聚合</td>
+    </tr>
+    <tr>
+      <td><code>StreamifyAbsOperator</code></td>
+      <td>IN（标量）</td>
+      <td>AsyncIterator[OUT]</td>
+      <td><code>streamify(input)</code></td>
+      <td>标量→流</td>
+    </tr>
+    <tr>
+      <td><code>UnstreamifyAbsOperator</code></td>
+      <td>AsyncIterator[IN]</td>
+      <td>OUT</td>
+      <td><code>unstreamify(stream)</code></td>
+      <td>流→标量</td>
+    </tr>
+    <tr>
+      <td><code>TransformStreamAbsOperator</code></td>
+      <td>AsyncIterator[IN]</td>
+      <td>AsyncIterator[OUT]</td>
+      <td><code>transform_stream(stream)</code></td>
+      <td>流→流转换</td>
+    </tr>
+    <tr>
+      <td><code>BranchJoinOperator</code></td>
+      <td>多上游</td>
+      <td>OUT</td>
+      <td>继承 JoinOperator</td>
+      <td>分支后的合并点</td>
+    </tr>
+  </table>
+
+  <h3>4.4 MapOperator 精读 —— 最常用的算子</h3>
+
+  <div class="file-block">
+    <div class="file-header">
+      <span>awel/operators/common_operator.py</span>
+      <span class="lines">L128-L198</span>
+    </div>
+    <div class="file-body">
+<pre><code><span class="k">class</span> <span class="t">MapOperator</span>(BaseOperator, Generic[IN, OUT]):
+    <span class="c">"""1→1 转换算子，把 IN 映射为 OUT"""</span>
+
+    <span class="k">def</span> <span class="f">__init__</span>(<span class="k">self</span>, map_function: Optional[MapFunc] = <span class="k">None</span>, **kwargs):
+        <span class="k">super</span>().__init__(**kwargs)
+        <span class="k">if</span> map_function <span class="k">and</span> <span class="k">not</span> callable(map_function):
+            <span class="k">raise</span> ValueError(<span class="s">"map_function must be callable"</span>)
+        <span class="k">self</span>.map_function = map_function
+
+    <span class="k">async</span> <span class="k">def</span> <span class="f">_do_run</span>(<span class="k">self</span>, dag_ctx: DAGContext) <span class="k">-></span> TaskOutput[OUT]:
+        curr_task_ctx = dag_ctx.current_task_context
+        <span class="c"># MapOperator 只允许单上游</span>
+        <span class="k">if</span> <span class="k">not</span> curr_task_ctx.call_data <span class="k">and</span> <span class="k">not</span> curr_task_ctx.task_input.check_single_parent():
+            <span class="k">raise</span> ValueError(<span class="s">"MapOperator expects single parent"</span>)
+
+        map_function = <span class="k">self</span>.map_function <span class="k">or</span> <span class="k">self</span>.map  <span class="c"># 有函数用函数，否则用子类重写的 map()</span>
+        <span class="c"># 对上游输出应用 map_function</span>
+        input_ctx = <span class="k">await</span> curr_task_ctx.task_input.map(map_function)
+        output = input_ctx.parent_outputs[<span class="n">0</span>].task_output
+        curr_task_ctx.set_task_output(output)
+        <span class="k">return</span> output
+
+    <span class="k">async</span> <span class="k">def</span> <span class="f">map</span>(<span class="k">self</span>, input_value: IN) <span class="k">-></span> OUT:
+        <span class="k">raise</span> NotImplementedError  <span class="c"># 子类必须实现 map 或传 map_function</span></code></pre>
+    </div>
+    <div class="line-explain">
+      <span class="ln">L135</span>两种用法：① 传 <code>map_function=lambda x: x.upper()</code>；② 继承 MapOperator 重写 <code>map()</code>。<br>
+      <span class="ln">L172</span><code>check_single_parent()</code> 确保只有1个上游输出——这是 MapOperator 的数据契约。<br>
+      <span class="ln">L178</span><code>self.map_function or self.map</code>：优先用构造函数传入的函数，否则用子类重写的 <code>map()</code> 方法。<br>
+      <span class="ln">L190</span><code>task_input.map(fn)</code> 会自动处理流式/非流式：如果是流，map 会逐元素应用并返回新流。
+    </div>
+  </div>
+
+  <h3>4.5 BranchOperator 精读 —— 条件分支</h3>
+
+  <div class="file-block">
+    <div class="file-header">
+      <span>awel/operators/common_operator.py</span>
+      <span class="lines">L206-L314</span>
+    </div>
+    <div class="file-body">
+<pre><code><span class="k">class</span> <span class="t">BranchOperator</span>(BaseOperator, Generic[IN, OUT]):
+    <span class="c">"""根据条件函数决定下游哪些节点被执行、哪些被跳过"""</span>
+
+    <span class="k">def</span> <span class="f">__init__</span>(<span class="k">self</span>, branches: Optional[Dict[BranchFunc[IN], BranchTaskType]] = <span class="k">None</span>, **kwargs):
+        <span class="c"># branches = {条件函数: "下游节点名"}</span>
+        <span class="k">super</span>().__init__(**kwargs)
+        <span class="k">self</span>._branches = branches
+
+    <span class="k">async</span> <span class="k">def</span> <span class="f">_do_run</span>(<span class="k">self</span>, dag_ctx) <span class="k">-></span> TaskOutput[OUT]:
+        curr_task_ctx = dag_ctx.current_task_context
+        branches = <span class="k">self</span>._branches <span class="k">or</span> (<span class="k">await</span> <span class="k">self</span>.branches())
+
+        <span class="c"># 对每个分支条件并行求值</span>
+        branch_func_tasks = []
+        <span class="k">for</span> func, node_name <span class="k">in</span> branches.items():
+            branch_func_tasks.append(
+                curr_task_ctx.task_input.predicate_map(func, failed_value=<span class="k">None</span>)
+            )
+        branch_input_ctxs = <span class="k">await</span> asyncio.gather(*branch_func_tasks)
+
+        <span class="c"># 条件为 False 的分支，其下游节点名被加入 skip_node_names</span>
+        skip_node_names = []
+        <span class="k">for</span> i, ctx <span class="k">in</span> enumerate(branch_input_ctxs):
+            <span class="k">if</span> ctx.parent_outputs[<span class="n">0</span>].task_output.is_none:
+                skip_node_names.append(branch_nodes[i])
+        curr_task_ctx.update_metadata(<span class="s">"skip_node_names"</span>, skip_node_names)
+        <span class="k">return</span> parent_output  <span class="c"># 透传上游输出</span></code></pre>
+    </div>
+    <div class="line-explain">
+      <span class="ln">L220</span><code>branches</code> 是一个字典：key 是条件函数 <code>IN -&gt; bool</code>，value 是目标节点名。<br>
+      <span class="ln">L275</span>对每个条件并行求值（<code>asyncio.gather</code>），返回 None 表示该分支为 False。<br>
+      <span class="ln">L298</span>把条件为 False 的下游节点名写入 metadata 的 <code>skip_node_names</code>。<br>
+      <span class="ln">解读</span>BranchOperator 本身不做转换，它只决定"后续谁该跳过"。Runner 在执行下游时读 skip_node_names 并跳过对应节点。
+    </div>
+  </div>
+
+  <!-- ==================== 五、编译与执行 ==================== -->
+  <h2 id="compile-run">五、DAG 编译与执行流程</h2>
+
+  <p>AWEL 没有 Airville 那种显式的 "compile" 步骤，"编译"隐含在 Runner 的拓扑遍历中。</p>
+
+  <h3>5.1 执行流程图</h3>
+
+  <div class="mermaid">
+flowchart TD
+    IN["用户调用 operator.call(data)"]
+    IN --> S1
+
+    subgraph Runner["DefaultWorkflowRunner.execute_workflow(end_node)"]
+        direction TB
+        S1["① JobManager.build_from_end_node<br/>从 end_node 递归收集所有<br/>upstream → all_nodes<br/>找出 root_nodes"]
+        S2["② 创建 DAGContext<br/>node_to_outputs = <br/>share_data = "]
+        S3["③ job_manager.before_dag_run()<br/>并行调用所有节点的钩子"]
+        S4["④ _execute_node(end_node) ← 递归"]
+        S5["⑤ _after_dag_end()<br/>调用所有节点的 after 钩子<br/>清理 DAGContext"]
+
+        S1 --> S2 --> S3 --> S4 --> S5
+    end
+
+    subgraph Recurse["_execute_node 递归展开"]
+        direction TB
+        R1["for upstream in node.upstream:<br/>_execute_node(upstream)<br/>先跑完所有上游"]
+        R2["收集上游输出 → InputContext<br/>创建 TaskContext(INIT)<br/>检查是否在 skip 集合"]
+        R3["node._run(dag_ctx)<br/>├─ resolve_variables()<br/>└─ _do_run(dag_ctx) 子类实现"]
+        R4["node_outputs（id） = ctx"]
+        R1 --> R2 --> R3 --> R4
+        R4 -.->|"幂等检查<br/>递归"| R1
+    end
+
+    S4 -.-> R1
+  </div>
+
+  <h3>5.2 DefaultWorkflowRunner 精读</h3>
+
+  <div class="file-block">
+    <div class="file-header">
+      <span>awel/runner/local_runner.py</span>
+      <span class="lines">L43-L123</span>
+    </div>
+    <div class="file-body">
+<pre><code><span class="k">async</span> <span class="k">def</span> <span class="f">execute_workflow</span>(<span class="k">self</span>, node, call_data=<span class="k">None</span>, streaming_call=<span class="k">False</span>,
+                          exist_dag_ctx=<span class="k">None</span>, dag_variables=<span class="k">None</span>):
+    <span class="c"># ① 从 end_node 反向遍历，收集所有节点</span>
+    job_manager = JobManager.build_from_end_node(node, call_data)
+
+    <span class="c"># ② 创建（或复用）DAGContext</span>
+    <span class="k">if</span> <span class="k">not</span> exist_dag_ctx:
+        node_outputs: Dict[str, TaskContext] = {}
+        share_data: Dict[str, Any] = {}
+        event_loop_task_id = id(asyncio.current_task())
+    <span class="k">else</span>:
+        node_outputs = exist_dag_ctx._node_to_outputs
+        share_data = exist_dag_ctx._share_data
+
+    dag_ctx = DAGContext(event_loop_task_id, node_outputs, share_data,
+                         streaming_call, ...)
+
+    <span class="c"># ③ 生命周期钩子：before_dag_run</span>
+    <span class="k">await</span> job_manager.before_dag_run()
+
+    <span class="c"># ④ 递归执行（核心！）</span>
+    skip_node_ids: Set[str] = <span class="f">set</span>()
+    <span class="k">await</span> <span class="k">self</span>._execute_node(job_manager, node, dag_ctx,
+                               node_outputs, skip_node_ids, system_app)
+
+    <span class="c"># ⑤ 非流式调用才触发 after_dag_end</span>
+    <span class="k">if</span> <span class="k">not</span> streaming_call <span class="k">and</span> node.dag <span class="k">and</span> exist_dag_ctx <span class="k">is</span> <span class="k">None</span>:
+        <span class="k">await</span> node.dag._after_dag_end(dag_ctx._event_loop_task_id)
+
+    <span class="k">return</span> dag_ctx</code></pre>
+    </div>
+    <div class="line-explain">
+      <span class="ln">L65</span><code>JobManager.build_from_end_node</code> 从叶子节点开始递归 <code>node.upstream</code>，收集整张图。<br>
+      <span class="ln">L66</span>如果传了 <code>exist_dag_ctx</code>，说明这是一个子 DAG 嵌套调用，复用父 DAG 的上下文。<br>
+      <span class="ln">L102</span><code>before_dag_run()</code> 是生命周期钩子，所有节点的 before 钩子并行执行。<br>
+      <span class="ln">L117</span><strong>关键：流式调用不触发 after_dag_end</strong>——因为流还没消费完，DAG 不能结束。
+    </div>
+  </div>
+
+  <h3>5.3 _execute_node —— 拓扑序递归</h3>
+
+  <div class="file-block">
+    <div class="file-header">
+      <span>awel/runner/local_runner.py</span>
+      <span class="lines">L125-L212</span>
+    </div>
+    <div class="file-body">
+<pre><code><span class="k">async</span> <span class="k">def</span> <span class="f">_execute_node</span>(<span class="k">self</span>, job_manager, node, dag_ctx, node_outputs, skip_node_ids, ...):
+    <span class="c"># 幂等：如果该节点已经跑过，直接返回</span>
+    <span class="k">if</span> node.node_id <span class="k">in</span> node_outputs:
+        <span class="k">return</span>
+
+    <span class="c"># 先递归跑完所有上游（深度优先 = 拓扑序）</span>
+    <span class="k">for</span> upstream_node <span class="k">in</span> node.upstream:
+        <span class="k">await</span> <span class="k">self</span>._execute_node(job_manager, upstream_node, dag_ctx, ...)
+
+    <span class="c"># 收集上游输出，构建 InputContext</span>
+    inputs = [node_outputs[up.node_id] <span class="k">for</span> up <span class="k">in</span> node.upstream]
+    input_ctx = DefaultInputContext(inputs)
+
+    <span class="c"># 创建当前节点的 TaskContext</span>
+    task_ctx = DefaultTaskContext(node.node_id, TaskState.INIT, ...)
+    <span class="k">if</span> current_call_data:
+        task_ctx.set_call_data(current_call_data)
+    task_ctx.set_task_input(input_ctx)
+    dag_ctx.set_current_task_context(task_ctx)
+    task_ctx.set_current_state(TaskState.RUNNING)
+
+    <span class="c"># 检查跳过</span>
+    <span class="k">if</span> node.node_id <span class="k">in</span> skip_node_ids:
+        task_ctx.set_current_state(TaskState.SKIP)
+        task_ctx.set_task_output(SimpleTaskOutput(SKIP_DATA))
+        node_outputs[node.node_id] = task_ctx
+        <span class="k">return</span>
+
+    <span class="c"># 执行！</span>
+    <span class="k">await</span> node._run(dag_ctx, task_ctx.log_id)
+    node_outputs[node.node_id] = dag_ctx.current_task_context
+    task_ctx.set_current_state(TaskState.SUCCESS)
+
+    <span class="c"># 如果是 BranchOperator，把跳过的下游加入 skip_node_ids</span>
+    <span class="k">if</span> isinstance(node, BranchOperator):
+        skip_nodes = task_ctx.metadata.get(<span class="s">"skip_node_names"</span>, [])
+        _skip_current_downstream_by_node_name(node, skip_nodes, skip_node_ids)</code></pre>
+    </div>
+    <div class="line-explain">
+      <span class="ln">L135</span><strong>幂等检查</strong>：用 <code>node_outputs</code> 字典充当 visited 集合，防止节点重复执行。<br>
+      <span class="ln">L141</span><strong>拓扑序</strong>：先递归跑完所有 upstream，再跑自己。这天然保证了执行顺序与 DAG 拓扑序一致。<br>
+      <span class="ln">L169</span><strong>跳过逻辑</strong>：如果节点在 <code>skip_node_ids</code> 中，输出 <code>SKIP_DATA</code> 并直接返回。下游的 MapOperator 看到 SKIP_DATA 可以继续跳过。<br>
+      <span class="ln">L200</span><strong>BranchOperator 特殊处理</strong>：执行完后读取 metadata 中的 skip_node_names，调用 <code>_skip_current_downstream_by_node_name</code> 把下游该跳的节点 ID 加入 skip 集合。<br>
+      <span class="ln">L206</span><strong>异常处理</strong>：try/except 捕获异常，设为 FAILED 状态后重新抛出。
+    </div>
+  </div>
+
+  <h3>5.4 分支跳过的传播规则</h3>
+
+  <p><code>_skip_downstream_by_id</code> 实现了一个精巧的<strong>多父节点跳过规则</strong>：</p>
+
+  <div class="file-block">
+    <div class="file-header">
+      <span>awel/runner/local_runner.py</span>
+      <span class="lines">L241-L257</span>
+    </div>
+    <div class="file-body">
+<pre><code><span class="k">def</span> <span class="f">_skip_downstream_by_id</span>(node: BaseOperator, skip_node_ids: Set[str]):
+    <span class="k">if</span> <span class="k">not</span> node.can_skip_in_branch():
+        <span class="k">return</span>  <span class="c"># 当前节点不允许跳过（如 BranchJoinOperator），停止传播</span>
+
+    <span class="c"># 多父节点（如 JoinOperator）：只有所有上游都被跳过，才跳过自己</span>
+    <span class="k">for</span> parent <span class="k">in</span> node.upstream:
+        <span class="k">if</span> isinstance(parent, BaseOperator) <span class="k">and</span> parent.node_id <span class="k">not</span> <span class="k">in</span> skip_node_ids:
+            <span class="k">return</span>  <span class="c"># 还有父节点没被跳过，当前节点不能跳过</span>
+
+    skip_node_ids.add(node.node_id)
+    <span class="k">for</span> child <span class="k">in</span> node.downstream:
+        _skip_downstream_by_id(child, skip_node_ids)</code></pre>
+    </div>
+    <div class="line-explain">
+      <span class="ln">L242</span><code>can_skip_in_branch()</code> 默认 True，但 <code>BranchJoinOperator</code> 设为 False —— 合并点不能被跳过，否则会丢失另一条分支的数据。<br>
+      <span class="ln">L251</span>多父节点规则：只有<strong>所有</strong>上游都被跳过，当前节点才跳过。这保证了 JoinOperator 只要有一条分支还活着就不会被跳过。
+    </div>
+  </div>
+
+  <!-- ==================== 六、流式输出 ==================== -->
+  <h2 id="streaming">六、流式输出实现</h2>
+
+  <p>LLM 应用中流式输出是刚需。AWEL 用 <code>TaskOutput</code> 的双形态设计来统一处理流和非流。</p>
+
+  <h3>6.1 TaskOutput 双形态</h3>
+
+  <div class="file-block">
+    <div class="file-header">
+      <span>awel/task/task_impl.py</span>
+      <span class="lines">L61-L99, L152-L194</span>
+    </div>
+    <div class="file-body">
+<pre><code><span class="k">class</span> <span class="t">SimpleTaskOutput</span>(TaskOutput[T]):
+    <span class="c">"""非流式输出：包装一个标量值"""</span>
+    <span class="k">def</span> <span class="f">__init__</span>(<span class="k">self</span>, data=<span class="k">EMPTY_DATA</span>):
+        <span class="k">self</span>._data = data
+
+    <span class="k">@property</span>
+    <span class="k">def</span> <span class="f">output</span>(<span class="k">self</span>) <span class="k">-></span> T:
+        <span class="k">return</span> cast(T, <span class="k">self</span>._data)
+
+    <span class="k">async</span> <span class="k">def</span> <span class="f">map</span>(<span class="k">self</span>, map_func) <span class="k">-></span> TaskOutput[OUT]:
+        <span class="c"># 标量 map：直接把函数应用到值上</span>
+        out = <span class="k">await</span> <span class="k">self</span>._apply_func(map_func)
+        <span class="k">return</span> SimpleTaskOutput(out)
+
+    <span class="k">async</span> <span class="k">def</span> <span class="f">streamify</span>(<span class="k">self</span>, transform_func) <span class="k">-></span> TaskOutput[OUT]:
+        <span class="c"># 标量 → 流：用 transform_func 生成 AsyncIterator</span>
+        out = <span class="k">await</span> <span class="k">self</span>._apply_func(transform_func)
+        <span class="k">return</span> SimpleStreamTaskOutput(out)
+
+
+<span class="k">class</span> <span class="t">SimpleStreamTaskOutput</span>(TaskOutput[T]):
+    <span class="c">"""流式输出：包装一个 AsyncIterator"""</span>
+    <span class="k">def</span> <span class="f">__init__</span>(<span class="k">self</span>, data=<span class="k">EMPTY_DATA</span>):
+        <span class="k">self</span>._data = data
+
+    <span class="k">@property</span>
+    <span class="k">def</span> <span class="f">is_stream</span>(<span class="k">self</span>) <span class="k">-></span> bool:
+        <span class="k">return</span> <span class="k">True</span>
+
+    <span class="k">@property</span>
+    <span class="k">def</span> <span class="f">output_stream</span>(<span class="k">self</span>) <span class="k">-></span> AsyncIterator[T]:
+        <span class="k">return</span> cast(AsyncIterator[T], <span class="k">self</span>._data)
+
+    <span class="k">async</span> <span class="k">def</span> <span class="f">map</span>(<span class="k">self</span>, map_func) <span class="k">-></span> TaskOutput[OUT]:
+        <span class="c"># 流 map：逐元素应用，返回新流</span>
+        <span class="k">async</span> <span class="k">def</span> <span class="f">new_iter</span>():
+            <span class="k">async</span> <span class="k">for</span> out <span class="k">in</span> <span class="k">self</span>.output_stream:
+                <span class="k">yield</span> <span class="k">await</span> map_func(out) <span class="k">if</span> asyncio.iscoroutinefunction(map_func) <span class="k">else</span> map_func(out)
+        <span class="k">return</span> SimpleStreamTaskOutput(new_iter())
+
+    <span class="k">async</span> <span class="k">def</span> <span class="f">reduce</span>(<span class="k">self</span>, reduce_func) <span class="k">-></span> TaskOutput[OUT]:
+        <span class="c"># 流 → 标量：遍历整个流累积</span>
+        out = <span class="k">await</span> _reduce_stream(<span class="k">self</span>.output_stream, reduce_func)
+        <span class="k">return</span> SimpleTaskOutput(out)</code></pre>
+    </div>
+    <div class="line-explain">
+      <span class="ln">解读</span>这是 AWEL 流式系统的核心设计：<code>SimpleTaskOutput</code>（标量）和 <code>SimpleStreamTaskOutput</code>（流）都实现相同的 <code>TaskOutput</code> 接口。
+      <code>map()</code> 方法在两种形态下表现不同：标量直接应用函数返回新标量，流则逐元素应用返回新流。<br>
+      <span class="ln">L137</span><code>streamify()</code> 是标量→流的转换器。<br>
+      <span class="ln">L212</span>流的 <code>map()</code> 返回一个 lazy 的 <code>new_iter()</code> generator——只有在最终消费时才真正执行，这就是流式惰性求值。
+    </div>
+  </div>
+
+  <h3>6.2 三种流式算子</h3>
+
+  <div class="file-block">
+    <div class="file-header">
+      <span>awel/operators/stream_operator.py</span>
+      <span class="lines">L11-L118</span>
+    </div>
+    <div class="file-body">
+<pre><code><span class="k">class</span> <span class="t">StreamifyAbsOperator</span>(BaseOperator[OUT], ABC, Generic[IN, OUT]):
+    <span class="c">"""标量 IN → 流 AsyncIterator[OUT]"""</span>
+    streaming_operator = <span class="k">True</span>  <span class="c"># 标记为流式算子</span>
+
+    <span class="k">async</span> <span class="k">def</span> <span class="f">_do_run</span>(<span class="k">self</span>, dag_ctx):
+        <span class="c"># 对上游输出调用 streamify() 方法</span>
+        output = <span class="k">await</span> curr_task_ctx.task_input.parent_outputs[<span class="n">0</span>].task_output.streamify(
+            <span class="k">self</span>.streamify
+        )
+        curr_task_ctx.set_task_output(output)
+
+    <span class="k">async</span> <span class="k">def</span> <span class="f">streamify</span>(<span class="k">self</span>, input_value: IN) <span class="k">-></span> AsyncIterator[OUT]:
+        <span class="k">raise</span> NotImplementedError
+
+
+<span class="k">class</span> <span class="t">UnstreamifyAbsOperator</span>(BaseOperator[OUT], Generic[IN, OUT]):
+    <span class="c">"""流 AsyncIterator[IN] → 标量 OUT"""</span>
+
+    <span class="k">async</span> <span class="k">def</span> <span class="f">_do_run</span>(<span class="k">self</span>, dag_ctx):
+        output = <span class="k">await</span> curr_task_ctx.task_input.parent_outputs[<span class="n">0</span>].task_output.unstreamify(
+            <span class="k">self</span>.unstreamify
+        )
+        curr_task_ctx.set_task_output(output)
+
+
+<span class="k">class</span> <span class="t">TransformStreamAbsOperator</span>(BaseOperator[OUT], Generic[IN, OUT]):
+    <span class="c">"""流 → 流转换"""</span>
+    streaming_operator = <span class="k">True</span>
+
+    <span class="k">async</span> <span class="k">def</span> <span class="f">_do_run</span>(<span class="k">self</span>, dag_ctx):
+        output = <span class="k">await</span> curr_task_ctx.task_input.parent_outputs[<span class="n">0</span>].task_output.transform_stream(
+            <span class="k">self</span>.transform_stream
+        )
+        curr_task_ctx.set_task_output(output)</code></pre>
+    </div>
+    <div class="line-explain">
+      <span class="ln">L14</span><code>streaming_operator = True</code> 告诉框架这个算子输出是流。<br>
+      <span class="ln">L28</span>StreamifyAbsOperator 调 <code>task_output.streamify(self.streamify)</code>，底层就是 SimpleTaskOutput.streamify → 返回 SimpleStreamTaskOutput。<br>
+      <span class="ln">L52</span>UnstreamifyAbsOperator 反过来：流→标量，调用 <code>unstreamify()</code>。<br>
+      <span class="ln">L82</span>TransformStreamAbsOperator 是流→流，调用 <code>transform_stream()</code>，对应 SimpleStreamTaskOutput 的同名方法。<br>
+      <span class="ln">解读</span>三种流式算子 + TaskOutput 的双形态设计，让流可以在 DAG 中自由传递、转换和终止，而不需要每个算子关心"上游是不是流"。
+    </div>
+  </div>
+
+  <h3>6.3 流在 DAG 中的传递路径</h3>
+
+  <div class="mermaid">
+flowchart LR
+    T["HTTPTrigger<br/>call_data"]
+    SO["LLM StreamifyOperator<br/>标量输入"]
+    TS["TransformStream<br/>流式输入"]
+    HR["HTTP Response<br/>流式输出"]
+
+    T -->|"SimpleTaskOutput 标量"| SO
+    SO -->|"streamify<br/>产生 SimpleStreamTaskOutput<br/>AsyncIterator"| TS
+    TS -->|"transform_stream fn"| HR
+    HR -->|"StreamingResponse<br/>逐块 yield"| OUT["客户端"]
+  </div>
+
+  <div class="callout tip">
+    <strong>惰性求值：</strong>流在 DAG 中的传递是<strong>惰性</strong>的。<code>SimpleStreamTaskOutput.map()</code>
+    返回的是一个 generator 函数（<code>new_iter()</code>），只有当最终消费者（如 HTTP StreamingResponse）
+    开始遍历时，整个流管道才会被真正激活。这意味着即使 DAG 有 10 个流式算子串联，也只在消费端拉取时才逐级触发。
+  </div>
+
+  <!-- ==================== 七、HTTPTrigger ==================== -->
+  <h2 id="trigger">七、HTTPTrigger 把 DAG 变成 API</h2>
+
+  <p>HTTPTrigger 是 AWEL 的"门面"：它把一个 DAG 包装成 FastAPI 路由，让 HTTP 请求自动触发 DAG 执行。</p>
+
+  <h3>7.1 Trigger 继承体系</h3>
+
+  <div class="file-block">
+    <div class="file-header">
+      <span>awel/trigger/base.py + common_operator.py</span>
+      <span class="lines">L20-L27</span>
+    </div>
+    <div class="file-body">
+<pre><code><span class="k">class</span> <span class="t">Trigger</span>(TriggerOperator[OUT], ABC, Generic[OUT]):
+    <span class="c">"""所有 Trigger 的基类，继承自 TriggerOperator"""</span>
+
+    <span class="k">@abstractmethod</span>
+    <span class="k">async</span> <span class="k">def</span> <span class="f">trigger</span>(<span class="k">self</span>, **kwargs) <span class="k">-></span> Any:
+        <span class="k">pass</span>
+
+<span class="c"># 继承链：</span>
+<span class="c"># DAGNode → BaseOperator → InputOperator → TriggerOperator → Trigger → HttpTrigger</span></code></pre>
+    </div>
+    <div class="line-explain">
+      <span class="ln">解读</span>Trigger 本质上是一个特殊的 InputOperator：它的数据来源是 HTTP 请求体。
+      <code>SimpleCallDataInputSource</code> 在运行时从 call_data 中取出请求体作为输出。
+    </div>
+  </div>
+
+  <h3>7.2 HttpTrigger 构造函数 —— 注册 FastAPI 路由的参数</h3>
+
+  <div class="file-block">
+    <div class="file-header">
+      <span>awel/trigger/http_trigger.py</span>
+      <span class="lines">L329-L448</span>
+    </div>
+    <div class="file-body">
+<pre><code><span class="k">class</span> <span class="t">HttpTrigger</span>(Trigger):
+    <span class="c">"""Http trigger：用 HTTP 请求触发 DAG"""</span>
+
+    <span class="k">def</span> <span class="f">__init__</span>(<span class="k">self</span>, endpoint, methods=<span class="s">"GET"</span>, request_body=<span class="k">None</span>,
+                 http_trigger_body=<span class="k">None</span>, streaming_response=<span class="k">False</span>,
+                 streaming_predict_func=<span class="k">None</span>,
+                 http_response_body=<span class="k">None</span>, response_model=<span class="k">None</span>,
+                 response_headers=<span class="k">None</span>, status_code=<span class="n">200</span>, ...):
+        <span class="k">super</span>().__init__(**kwargs)
+        <span class="k">if</span> <span class="k">not</span> endpoint.startswith(<span class="s">"/"</span>):
+            endpoint = <span class="s">"/"</span> + endpoint
+        <span class="c"># 从 http_trigger_body 提取 request_body 类型和 streaming 预测函数</span>
+        <span class="k">if</span> <span class="k">not</span> request_body <span class="k">and</span> http_trigger_body:
+            request_body = http_trigger_body.get_body_class()
+            streaming_predict_func = http_trigger_body.streaming_predict_func()
+        <span class="k">self</span>._endpoint = endpoint
+        <span class="k">self</span>._methods = [methods] <span class="k">if</span> isinstance(methods, str) <span class="k">else</span> methods
+        <span class="k">self</span>._streaming_response = _parse_bool(streaming_response)
+        <span class="k">self</span>._streaming_predict_func = streaming_predict_func</code></pre>
+    </div>
+    <div class="line-explain">
+      <span class="ln">L410</span><code>endpoint</code> 就是 API 路径，如 <code>/chat/completions</code>。<br>
+      <span class="ln">L431</span><code>http_trigger_body</code> 是一个 <code>BaseHttpBody</code> 子类，定义了请求/响应的数据格式。<br>
+      <span class="ln">L433</span><code>streaming_predict_func</code>：动态判断某次请求是否要流式响应（例如从 body 的 <code>stream</code> 字段判断）。<br>
+      <span class="ln">L439</span><code>streaming_response</code>：固定流式/非流式，或由 predict_func 动态决定。
+    </div>
+  </div>
+
+  <h3>7.3 mount_to_app —— 注册到 FastAPI</h3>
+
+  <div class="file-block">
+    <div class="file-header">
+      <span>awel/trigger/http_trigger.py</span>
+      <span class="lines">L487-L520</span>
+    </div>
+    <div class="file-body">
+<pre><code><span class="k">def</span> <span class="f">mount_to_app</span>(<span class="k">self</span>, app, global_prefix=<span class="k">None</span>) <span class="k">-></span> HttpTriggerMetadata:
+    <span class="k">from</span> dbgpt.util.fastapi <span class="k">import</span> PriorityAPIRouter
+
+    endpoint = <span class="k">self</span>._resolved_endpoint()
+    path = join_paths(global_prefix, endpoint) <span class="k">if</span> global_prefix <span class="k">else</span> endpoint
+    dynamic_route_function = <span class="k">self</span>._create_route_func()  <span class="c"># 动态创建路由函数</span>
+    router = cast(PriorityAPIRouter, app.router)
+    router.add_api_route(
+        path, dynamic_route_function,
+        methods=<span class="k">self</span>._methods,
+        response_model=<span class="k">self</span>._response_model,
+        status_code=<span class="k">self</span>._status_code,
+        priority=<span class="n">10</span>,
+    )
+    <span class="k">return</span> HttpTriggerMetadata(path=path, methods=<span class="k">self</span>._methods, ...)</code></pre>
+    </div>
+    <div class="line-explain">
+      <span class="ln">L504</span><code>_create_route_func()</code> 动态生成一个 async 函数，签名为 <code>async def route(body: RequestBody)</code>。<br>
+      <span class="ln">L506</span>用 <code>PriorityAPIRouter</code>（支持优先级路由）注册到 FastAPI app。<br>
+      <span class="ln">解读</span>这意味着每个有 HttpTrigger 的 DAG 会在启动时自动注册为一个 REST API。
+      前端/SDK 通过 HTTP 请求就能触发整个 DAG 执行。
+    </div>
+  </div>
+
+  <h3>7.4 _trigger_dag —— HTTP 请求如何触发 DAG</h3>
+
+  <div class="file-block">
+    <div class="file-header">
+      <span>awel/trigger/http_trigger.py</span>
+      <span class="lines">L706-L728</span>
+    </div>
+    <div class="file-body">
+<pre><code><span class="k">async</span> <span class="k">def</span> <span class="f">_trigger_dag</span>(body, dag, streaming_response=<span class="k">False</span>, ...):
+    <span class="k">from</span> fastapi.responses <span class="k">import</span> StreamingResponse
+
+    leaf_nodes = dag.leaf_nodes
+    <span class="k">if</span> <span class="f">len</span>(leaf_nodes) != <span class="n">1</span>:
+        <span class="k">raise</span> ValueError(<span class="s">"HttpTrigger just support one leaf node in dag"</span>)
+    end_node = cast(BaseOperator, leaf_nodes[<span class="n">0</span>])
+
+    <span class="k">if</span> <span class="k">not</span> streaming_response:
+        <span class="c"># 非流式：call() 直接返回结果</span>
+        <span class="k">return</span> <span class="k">await</span> end_node.call(body)
+    <span class="k">else</span>:
+        <span class="c"># 流式：call_stream() 返回 AsyncIterator → StreamingResponse</span>
+        stream_generator = <span class="k">await</span> end_node.call_stream(body)
+        <span class="k">return</span> StreamingResponse(stream_generator, ...)</code></pre>
+    </div>
+    <div class="line-explain">
+      <span class="ln">L719</span><strong>DAG 只能有 1 个叶子节点</strong>——这是 HttpTrigger 的硬约束。叶子节点就是最终输出节点。<br>
+      <span class="ln">L726</span>非流式：调用 <code>end_node.call(body)</code>，触发从 trigger 到 end_node 的整条链路。<br>
+      <span class="ln">L728</span>流式：调用 <code>end_node.call_stream(body)</code>，返回的 AsyncIterator 包装成 <code>StreamingResponse</code>，实现 SSE 式的流式推送。
+    </div>
+  </div>
+
+  <!-- ==================== 八、Loader ==================== -->
+  <h2 id="loader">八、JSON 可视化编排与反序列化</h2>
+
+  <p>DB-GPT 的可视化编排面板允许用户拖拽连线，生成 JSON 描述。这个 JSON 最终需要反序列化成运行时的 DAG。</p>
+
+  <h3>8.1 LocalFileDAGLoader —— 从 Python 文件加载</h3>
+
+  <div class="file-block">
+    <div class="file-header">
+      <span>awel/dag/loader.py</span>
+      <span class="lines">L28-L49</span>
+    </div>
+    <div class="file-body">
+<pre><code><span class="k">class</span> <span class="t">LocalFileDAGLoader</span>(DAGLoader):
+    <span class="c">"""从本地 .py 文件加载 DAG"""</span>
+
+    <span class="k">def</span> <span class="f">__init__</span>(<span class="k">self</span>, dag_dirs: List[str]):
+        <span class="k">self</span>._dag_dirs = dag_dirs
+
+    <span class="k">def</span> <span class="f">load_dags</span>(<span class="k">self</span>) <span class="k">-></span> List[DAG]:
+        dags = []
+        <span class="k">for</span> filepath <span class="k">in</span> <span class="k">self</span>._dag_dirs:
+            <span class="k">if</span> os.path.isdir(filepath):
+                dags += _process_directory(filepath)
+            <span class="k">else</span>:
+                dags += _process_file(filepath)
+        <span class="k">return</span> dags
+
+
+<span class="k">def</span> <span class="f">_process_modules</span>(mods) <span class="k">-></span> List[DAG]:
+    <span class="c"># 扫描模块顶层变量，收集所有 DAG 实例</span>
+    top_level_dags = (
+        (o, m) <span class="k">for</span> m <span class="k">in</span> mods <span class="k">for</span> o <span class="k">in</span> m.__dict__.values()
+        <span class="k">if</span> isinstance(o, DAG)
+    )
+    <span class="k">return</span> [dag <span class="k">for</span> dag, mod <span class="k">in</span> top_level_dags]</code></pre>
+    </div>
+    <div class="line-explain">
+      <span class="ln">解读</span>加载逻辑非常直接：① 用 <code>importlib</code> 把 .py 文件当成模块导入；② 扫描模块顶层字典 <code>__dict__</code>，
+      找出所有 <code>DAG</code> 类型的变量。这就是为什么 AWEL DAG 通常定义为模块级变量——loader 会在 import 时自动发现它们。
+    </div>
+  </div>
+
+  <h3>8.2 DAGManager —— 注册和调度中心</h3>
+
+  <div class="file-block">
+    <div class="file-header">
+      <span>awel/dag/dag_manager.py</span>
+      <span class="lines">L49-L80</span>
+    </div>
+    <div class="file-body">
+<pre><code><span class="k">class</span> <span class="t">DAGManager</span>(BaseComponent):
+    name = ComponentType.AWEL_DAG_MANAGER
+
+    <span class="k">def</span> <span class="f">__init__</span>(<span class="k">self</span>, system_app, dag_dirs):
+        <span class="k">super</span>().__init__(system_app)
+        <span class="k">self</span>.dag_loader = LocalFileDAGLoader(dag_dirs)
+        <span class="k">self</span>.dag_map: Dict[str, DAG] = {}             <span class="c"># dag_id → DAG</span>
+        <span class="k">self</span>.dag_alias_map: Dict[str, str] = {}       <span class="c"># alias → dag_id</span>
+        <span class="k">self</span>._dag_metadata_map: Dict[str, DAGMetadata] = {}
+        <span class="k">self</span>._tags_to_dag_ids: Dict[str, Dict[str, Set[str]]] = {}  <span class="c"># 按标签索引</span>
+
+    <span class="k">def</span> <span class="f">load_dags</span>(<span class="k">self</span>):
+        dags = <span class="k">self</span>.dag_loader.load_dags()
+        <span class="k">for</span> dag <span class="k">in</span> dags:
+            <span class="c"># 注册到 dag_map，注册 trigger 到 TriggerManager</span>
+            ...</code></pre>
+    </div>
+    <div class="line-explain">
+      <span class="ln">解读</span>DAGManager 是 AWEL 和 SystemApp 的桥梁。启动时 <code>initialize_awel()</code> 创建 DAGManager，
+      调用 <code>load_dags()</code> 加载所有 .py 中的 DAG，然后自动注册 trigger。
+      <code>_tags_to_dag_ids</code> 允许通过标签快速查找 DAG。
+    </div>
+  </div>
+
+  <h3>8.3 FlowMetadata —— 可视化编排的元数据</h3>
+
+  <p>每个 Operator 类都有一个 <code>metadata</code> 类属性（类型 <code>ViewMetadata</code>），描述了这个算子在前端面板上的展示信息：</p>
+
+  <ul>
+    <li><strong>label</strong>：前端显示名（如 "Http Trigger"）</li>
+    <li><strong>inputs / outputs</strong>：输入输出插槽定义</li>
+    <li><strong>parameters</strong>：可配置参数列表（类型、默认值、选项）</li>
+    <li><strong>category</strong>：分类（TRIGGER / COMMOM_OPERATOR / RS ...）</li>
+  </ul>
+
+  <p>前端编排面板读取这些元数据渲染拖拽组件，用户连线后生成 JSON，
+    后端通过 <code>FlowFactory</code> 把 JSON 反序列化重建 DAG 实例并注册到 DAGManager。</p>
+
+  <div class="callout">
+    <strong>两套加载路径：</strong>① <strong>代码方式</strong>：Python 文件中 <code>with DAG(...): ...</code>，
+    loader 自动发现；② <strong>可视化方式</strong>：前端拖拽 → JSON → FlowFactory 反序列化 → 注册。
+    两条路径最终都汇入 DAGManager.dag_map。
+  </div>
+
+  <!-- ==================== 九、Task 体系 ==================== -->
+  <h3>8.4 TaskContext 与 InputContext —— 运行时数据容器</h3>
+
+  <div class="file-block">
+    <div class="file-header">
+      <span>awel/task/base.py</span>
+      <span class="lines">L226-L322</span>
+    </div>
+    <div class="file-body">
+<pre><code><span class="k">class</span> <span class="t">TaskContext</span>(ABC, Generic[T]):
+    <span class="c">"""运行时每个节点的上下文：持有 task_input 和 task_output"""</span>
+    <span class="k">@property</span>
+    <span class="k">@abstractmethod</span>
+    <span class="k">def</span> <span class="f">task_id</span>(<span class="k">self</span>) <span class="k">-></span> str: ...
+    <span class="k">@property</span>
+    <span class="k">@abstractmethod</span>
+    <span class="k">def</span> <span class="f">task_input</span>(<span class="k">self</span>) <span class="k">-></span> InputContext: ...
+    <span class="k">@property</span>
+    <span class="k">@abstractmethod</span>
+    <span class="k">def</span> <span class="f">task_output</span>(<span class="k">self</span>) <span class="k">-></span> TaskOutput[T]: ...
+    <span class="k">@property</span>
+    <span class="k">def</span> <span class="f">call_data</span>(<span class="k">self</span>) <span class="k">-></span> Optional[Dict]:
+        <span class="k">return</span> <span class="k">self</span>.metadata.get(<span class="s">"call_data"</span>)
+
+
+<span class="k">class</span> <span class="t">InputContext</span>(ABC):
+    <span class="c">"""所有上游输出的集合，提供 map/reduce/filter 操作"""</span>
+    <span class="k">@property</span>
+    <span class="k">@abstractmethod</span>
+    <span class="k">def</span> <span class="f">parent_outputs</span>(<span class="k">self</span>) <span class="k">-></span> List[TaskContext]: ...
+
+    <span class="k">def</span> <span class="f">check_single_parent</span>(<span class="k">self</span>) <span class="k">-></span> bool:
+        <span class="k">return</span> <span class="f">len</span>(<span class="k">self</span>.parent_outputs) == <span class="n">1</span>
+
+    <span class="k">def</span> <span class="f">check_stream</span>(<span class="k">self</span>) <span class="k">-></span> bool:
+        <span class="k">for</span> out <span class="k">in</span> <span class="k">self</span>.parent_outputs:
+            <span class="k">if</span> <span class="k">not</span> (out.task_output <span class="k">and</span> out.task_output.is_stream):
+                <span class="k">return</span> <span class="k">False</span>
+        <span class="k">return</span> <span class="k">True</span></code></pre>
+    </div>
+    <div class="line-explain">
+      <span class="ln">解读</span>TaskContext 是运行时每个节点的"工作台"：input 来自上游，output 是自己的产出。
+      InputContext 包装了所有上游的 TaskContext 列表，提供 <code>map()</code> / <code>map_all()</code> / <code>reduce()</code> / <code>filter()</code> / <code>predicate_map()</code> 等操作。
+      <code>check_single_parent()</code> 和 <code>check_stream()</code> 是数据契约校验方法。
+    </div>
+  </div>
+
+  <!-- ==================== 十、实战示例 ==================== -->
+  <h2 id="example">九、实战：NL → SQL → 执行 → 图表 DAG</h2>
+
+  <p>下面用 AWEL API 拼一个完整的 Text2SQL DAG，展示从自然语言到图表的全流程：</p>
+
+  <div class="file-block">
+    <div class="file-header">
+      <span>示例：text2sql_dag.py</span>
+      <span class="lines">完整 DAG 定义</span>
+    </div>
+    <div class="file-body">
+<pre><code><span class="k">from</span> dbgpt.core.awel <span class="k">import</span> (
+    DAG, MapOperator, HttpTrigger, CommonLLMHttpRequestBody, CommonLLMHttpResponseBody
+)
+
+<span class="k">with</span> <span class="t">DAG</span>(<span class="s">"text2sql_chart"</span>) <span class="k">as</span> dag:
+
+    <span class="c"># ① HTTP 触发器：接收自然语言问题</span>
+    trigger = <span class="t">HttpTrigger</span>(
+        endpoint=<span class="s">"/api/v1/text2sql"</span>,
+        methods=[<span class="s">"POST"</span>],
+        request_body=<span class="t">CommonLLMHttpRequestBody</span>,
+        streaming_response=<span class="k">True</span>,  <span class="c"># 流式返回</span>
+    )
+
+    <span class="c"># ② NL → SQL：调大模型生成 SQL</span>
+    <span class="k">class</span> <span class="t">NL2SQLOperator</span>(<span class="t">MapOperator</span>[dict, str]):
+        <span class="k">async</span> <span class="k">def</span> <span class="f">map</span>(<span class="k">self</span>, request: dict) <span class="k">-></span> str:
+            <span class="c"># 调用 LLM 生成 SQL</span>
+            sql = <span class="k">await</span> llm.generate_sql(request[<span class="s">"messages"</span>][<span class="n">0</span>])
+            <span class="k">return</span> sql
+
+    nl2sql = <span class="t">NL2SQLOperator</span>(node_name=<span class="s">"nl2sql"</span>)
+
+    <span class="c"># ③ 执行 SQL：在数据库上跑 SQL</span>
+    <span class="k">class</span> <span class="t">SQLExecOperator</span>(<span class="t">MapOperator</span>[str, list]):
+        <span class="k">async</span> <span class="k">def</span> <span class="f">map</span>(<span class="k">self</span>, sql: str) <span class="k">-></span> list:
+            <span class="k">return</span> <span class="k">await</span> db.execute(sql)
+
+    sql_exec = <span class="t">SQLExecOperator</span>(node_name=<span class="s">"sql_exec"</span>)
+
+    <span class="c"># ④ 数据 → 图表配置</span>
+    <span class="k">class</span> <span class="t">ChartOperator</span>(<span class="t">MapOperator</span>[list, dict]):
+        <span class="k">async</span> <span class="k">def</span> <span class="f">map</span>(<span class="k">self</span>, rows: list) <span class="k">-></span> dict:
+            <span class="k">return</span> {<span class="s">"chart_type"</span>: <span class="s">"bar"</span>, <span class="s">"data"</span>: rows}
+
+    chart = <span class="t">ChartOperator</span>(node_name=<span class="s">"chart"</span>)
+
+    <span class="c"># ⑤ 串联：trigger → nl2sql → sql_exec → chart</span>
+    trigger &gt;&gt; nl2sql &gt;&gt; sql_exec &gt;&gt; chart
+
+<span class="c"># DAG 定义完成！启动后自动注册为 POST /api/v1/text2sql</span></code></pre>
+    </div>
+    <div class="line-explain">
+      <span class="ln">解读</span>整个 Text2SQL 流水线只需 ~30 行代码。<code>with DAG(...)</code> 上下文内，所有 Operator 自动注册。<br>
+      <span class="ln">L9</span>HttpTrigger 定义了 API 端点和请求体类型。<br>
+      <span class="ln">L42</span>用 <code>&gt;&gt;</code> 运算符串联节点，等价于四次 <code>set_downstream()</code> 调用。<br>
+      <span class="ln">注意</span>每个 MapOperator 子类只需实现 <code>map()</code> 方法，类型签名 <code>MapOperator[IN, OUT]</code> 就是数据契约。
+    </div>
+  </div>
+
+  <h3>9.1 这个 DAG 在运行时发生了什么</h3>
+
+  <div class="mermaid">
+sequenceDiagram
+    participant C as 客户端
+    participant HT as HttpTrigger
+    participant CH as chart (leaf)
+    participant SE as sql_exec
+    participant NL as nl2sql
+    participant TR as trigger (root)
+    participant LLM as LLM
+
+    C->>HT: POST /api/v1/text2sql<br/>body: {"messages": ["各省份销售额"], "stream": true}
+    HT->>HT: ① end_node = chart (leaf_node)<br/>② chart.call_stream(body)<br/>→ DefaultWorkflowRunner.execute_workflow(chart)
+
+    Note over HT,TR: ③ _execute_node 递归（深度优先 = 拓扑逆序）
+
+    HT->>CH: _execute_node(chart)
+    CH->>SE: _execute_node(sql_exec)
+    SE->>NL: _execute_node(nl2sql)
+    NL->>TR: _execute_node(trigger)
+
+    TR->>TR: trigger._do_run<br/>从 body 提取数据
+    TR-->>NL: TaskOutput (请求数据)
+
+    NL->>LLM: 调 LLM
+    LLM-->>NL: "SELECT ..." (SQL)
+    NL-->>SE: TaskOutput (SQL 语句)
+
+    SE->>SE: sql_exec._do_run<br/>跑 SQL → [{...}, {...}]
+    SE-->>CH: TaskOutput (查询结果)
+
+    CH->>CH: chart._do_run<br/>生成图表配置
+
+    CH-->>HT: ④ StreamingResponse (chart output stream)
+    HT-->>C: HTTP 200, chunked transfer encoding<br/>data: {"chart_type": "bar", "data": [...]}
+  </div>
+
+  <!-- ==================== 思考题 ==================== -->
+  <h2 id="quiz">十、思考题</h2>
+
+  <div class="quiz">
+    <h4>Q1 — DAG 编译</h4>
+    <p>AWEL 没有 <code>dag.compile()</code> 方法，那么它是如何保证执行顺序正确的？
+    如果用户在代码中创建了环（A → B → A），会发生什么？</p>
+    <details><summary>参考答案</summary>
+      <p>AWEL 用 Runner 的<strong>递归拓扑遍历</strong>代替显式编译：先递归跑完所有 upstream 再跑自己。
+      如果存在环，<code>_execute_node</code> 会无限递归导致 <code>RecursionError</code>。
+      <code>node_outputs</code> 的幂等检查（L135: <code>if node.node_id in node_outputs: return</code>）
+      实际上也会让第二次访问直接返回，但此时输出可能尚未填充，导致 KeyError。AWEL 依赖<strong>约定</strong>而非检查来保证无环。</p>
+    </details>
+  </div>
+
+  <div class="quiz">
+    <h4>Q2 — 流式传递</h4>
+    <p>一个 DAG 中同时有 <code>StreamifyAbsOperator</code>（标量→流）和 <code>MapOperator</code>（1→1），
+    当流经过 MapOperator 时，MapOperator 的行为是什么？最终输出是流还是标量？</p>
+    <details><summary>参考答案</summary>
+      <p>MapOperator 调用 <code>task_input.map(map_function)</code>。当上游是 SimpleStreamTaskOutput（流）时，
+      其 <code>map()</code> 方法会返回一个新的 <code>SimpleStreamTaskOutput</code>（逐元素应用函数的 lazy generator）。
+      所以 MapOperator 透传流：输出仍然是流。流-非流由 TaskOutput 的多态自动处理。</p>
+    </details>
+  </div>
+
+  <div class="quiz">
+    <h4>Q3 — 循环检测</h4>
+    <p>如果要在 AWEL 中加入显式的环检测，应该在哪个类的哪个方法里加？用什么算法？</p>
+    <details><summary>参考答案</summary>
+      <p>在 <code>DAG._build()</code> 方法（L862）中加最合适，因为它已经在遍历全图。
+      算法用<strong>DFS 三色标记法</strong>（白/灰/黑）：遇到灰色节点说明有回边=环。
+      或者用 Kahn 算法（拓扑排序），如果排序后剩余节点数 &lt; 总节点数，说明有环。</p>
+    </details>
+  </div>
+
+  <div class="quiz">
+    <h4>Q4 — Operator 数据契约</h4>
+    <p><code>MapOperator</code> 要求 <code>check_single_parent()</code> 为 True，
+    <code>JoinOperator</code> 没有这个要求。<code>BranchOperator</code> 也有这个要求。
+    为什么 BranchOperator 要求单上游？</p>
+    <details><summary>参考答案</summary>
+      <p>BranchOperator 的语义是"根据输入决定走哪条分支"。如果有多个上游，
+      就无法确定用哪个输入来做分支判断。BranchOperator 把自己当作一个"路由器"，
+      只接受一个输入流，然后把它分发到不同下游。</p>
+    </details>
+  </div>
+
+  <div class="quiz">
+    <h4>Q5 — 元类注入</h4>
+    <p><code>BaseOperatorMeta._apply_defaults</code> 会在每次 <code>__init__</code> 时自动从 DAGVar 注入 dag/runner/system_app。
+    如果你在 <code>with DAG("x"):</code> 块外面创建 Operator，会发生什么？</p>
+    <details><summary>参考答案</summary>
+      <p>DAGVar.get_current_dag() 返回 None，所以 <code>self._dag = None</code>。
+      节点不会被注册到任何 DAG，但它仍然可以独立运行（通过 <code>operator.call()</code> 直接调用）。
+      Runner 会从 <code>node.dag</code> 取 DAG 信息，如果为 None 就跳过 DAG 级操作（如 before_dag_run）。</p>
+    </details>
+  </div>
+
+  <div class="quiz">
+    <h4>Q6 — 分支跳过传播</h4>
+    <p>BranchOperator 下游有两条分支，最终汇入一个 <code>BranchJoinOperator</code>。
+    如果只有一条分支被跳过，BranchJoinOperator 会被跳过吗？为什么？</p>
+    <details><summary>参考答案</summary>
+      <p>不会。因为 <code>BranchJoinOperator</code> 的 <code>can_skip_in_branch</code> 默认为 False
+      （在 __init__ 中 <code>can_skip_in_branch=False</code>）。
+      <code>_skip_downstream_by_id</code> 在 L242 检查这个标记，为 False 就直接 return 停止传播。
+      此外，即使允许跳过，多父节点规则也会阻止：只要有一个上游没被跳过，当前节点就不会被跳过。</p>
+    </details>
+  </div>
+
+  <div class="quiz">
+    <h4>Q7 — HttpTrigger 约束</h4>
+    <p><code>_trigger_dag()</code> 函数要求 <code>len(leaf_nodes) == 1</code>。
+    如果一个 DAG 有两个叶子节点（两条独立链路），HttpTrigger 为什么不支持？</p>
+    <details><summary>参考答案</summary>
+      <p>因为 HTTP 是请求-响应模型：一个请求只能返回一个响应。如果有多个叶子节点，
+      就不知道该把哪个叶子节点的输出作为 HTTP 响应体。如果你确实需要并行两条链路，
+      应该用一个 JoinOperator 把它们合并成一个叶子节点。</p>
+    </details>
+  </div>
+
+  <div class="quiz">
+    <h4>Q8 — DAGContext 隔离</h4>
+    <p>DAGContext 用 <code>event_loop_task_id = id(asyncio.current_task())</code> 作为唯一键。
+    为什么不用线程 ID？为什么用 asyncio.current_task() 的 id？</p>
+    <details><summary>参考答案</summary>
+      <p>因为 AWEL 全异步执行。一个 event loop 可能同时处理多个 HTTP 请求（多个 asyncio Task），
+      它们共享同一个线程但属于不同的 Task。<code>id(asyncio.current_task())</code> 能区分同一个 event loop 中不同的并发 Task，
+      从而实现请求级隔离。用线程 ID 会导致同一 event loop 中的所有并发请求共享同一个 DAGContext，造成数据串扰。</p>
+    </details>
+  </div>
+
+  <!-- ==================== 总结 ==================== -->
+  <h2>本章总结</h2>
+
+  <div class="callout tip">
+    <strong>AWEL 的五层抽象回顾：</strong>
+    <ul>
+      <li><strong>DAG</strong>（<code>dag/base.py</code>）：有向无环图容器，维护节点、边、root/leaf/trigger 分类，提供 ContextManager 语法。</li>
+      <li><strong>Operator</strong>（<code>operators/</code>）：可执行算子，10+ 子类覆盖 Map/Branch/Join/Streamify/TransformStream 等场景。BaseOperatorMeta 元类自动注入依赖。</li>
+      <li><strong>Trigger</strong>（<code>trigger/</code>）：HTTPTrigger 把 DAG 变成 FastAPI 路由，一个 DAG = 一个 REST API。</li>
+      <li><strong>Task</strong>（<code>task/</code>）：TaskOutput 双形态（SimpleTaskOutput / SimpleStreamTaskOutput）统一流式与非流式，InputContext 提供函数式数据操作。</li>
+      <li><strong>Flow</strong>（<code>flow/</code>）：ViewMetadata 描述算子的前端展示信息，支持可视化拖拽编排。</li>
+    </ul>
+  </div>
+
+  <p>理解了 AWEL，你就理解了 DB-GPT 的运行时。Agent 系统的每一步推理、RAG 的每次检索、
+  Chat Scene 的每次对话，底层都是 AWEL DAG 在驱动。下一章我们看 Agent 如何在 AWEL 之上构建自主决策能力。</p>
+
+  <div class="pager">
+    <a href="02-startup.html">← 02 · 启动流程</a>
+    <a href="04-agent.html">04 · Agent 系统 →</a>
+  </div>
+
+</main>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: 'base',
+    themeVariables: {
+      primaryColor: '#1a2029',
+      primaryTextColor: '#e6e6e6',
+      primaryBorderColor: '#4ec9b0',
+      lineColor: '#569cd6',
+      secondaryColor: '#232b37',
+      tertiaryColor: '#0f1419',
+      textColor: '#e6e6e6',
+      fontFamily: 'JetBrains Mono, Consolas, monospace',
+      fontSize: '16px'
+    },
+    flowchart: { curve: 'basis', padding: 20, useMaxWidth: true },
+    sequence: { mirrorActors: false, boxMargin: 8 }
+  });
+</script>
+</body>
+</html>
