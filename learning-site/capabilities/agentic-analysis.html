@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Agentic 数据分析 · DB-GPT 核心能力</title>
+  <link rel="stylesheet" href="./capability.css" />
+</head>
+<body>
+  <header class="topbar">
+    <nav class="nav">
+      <a class="brand" href="../index.html">DB-GPT 文档门户</a>
+      <div>
+        <a href="../index.html#features">核心能力</a>
+        <a href="../index.html#modules">源码模块</a>
+        <a href="../index.html#develop">二次开发</a>
+      </div>
+    </nav>
+  </header>
+  <div class="hero">
+    <div class="hero-inner">
+      <div class="crumb">核心能力 / Agentic 数据分析</div>
+      <h1>让数据分析从“问答”升级为“计划、执行、校验”的 Agent 流程</h1>
+      <p class="lead">Agentic 数据分析是 DB-GPT 的中枢能力。它把用户的自然语言目标转成可执行步骤，结合数据源、知识库、工具、代码解释器和模型推理，逐步产出表格、图表、报告或结论。</p>
+      <div class="meta">
+        <span class="pill">入口：/api/v1/chat/completions</span>
+        <span class="pill">场景：ChatAgent / ChatFlow / ChatDashboard</span>
+        <span class="pill">核心：ConversableAgent / ReActAgent</span>
+      </div>
+    </div>
+  </div>
+  <main>
+    <section>
+      <div class="section-title">
+        <h2>能力定位</h2>
+        <p>这项能力解决的是开放式分析任务：用户给出目标，系统需要自己决定查什么数据、调用什么工具、怎样解释结果。</p>
+      </div>
+      <div class="grid three">
+        <article class="card"><h3>输入不是指令，而是目标</h3><p>例如“分析销售下降原因”，不是单条 SQL，也不是固定报表。Agent 需要理解目标并拆解成可执行动作。</p></article>
+        <article class="card"><h3>输出不是文本，而是结果包</h3><p>答案可能包含 SQL 查询、Python 代码、图表、文件、工具日志、阶段性思考和最终报告。</p></article>
+        <article class="card"><h3>执行过程可观察</h3><p><code>agentic_data_api.py</code> 会把步骤、工具输出和最终响应包装为流式事件，前端可逐步展示进度。</p></article>
+      </div>
+    </section>
+
+    <section>
+      <div class="section-title">
+        <h2>实现链路</h2>
+        <p>Agentic 分析不是单点功能，而是 API、场景、Agent、工具、回调和前端流式渲染协作的结果。</p>
+      </div>
+      <div class="flow">
+        <div class="flow-step"><b>1. 用户请求</b><span>前端通过 <code>useChat</code> 或 react-agent 接口发送任务目标。</span></div>
+        <div class="flow-step"><b>2. 场景判断</b><span><code>api_v1.py</code> 根据 <code>ChatScene</code> 选择普通聊天、Agent、Flow 或知识库。</span></div>
+        <div class="flow-step"><b>3. Agent 构建</b><span><code>ConversableAgent</code> 初始化上下文、资源、LLM 配置和动作。</span></div>
+        <div class="flow-step"><b>4. 执行动作</b><span><code>thinking → act → verify</code> 循环调用 SQL、代码、知识检索或技能。</span></div>
+        <div class="flow-step"><b>5. 流式返回</b><span>步骤事件、工具输出和最终答案通过 SSE 返回前端。</span></div>
+      </div>
+    </section>
+
+    <section>
+      <div class="section-title">
+        <h2>流程图：一次 Agentic 分析如何跑完</h2>
+        <p>先理解这张逻辑图，再看源码会更清楚每个文件为什么存在。</p>
+      </div>
+      <div class="process-diagram">
+        <div class="process-row"><div class="process-label">前端发起</div><div class="process-body"><b>Chat 页面或 Agentic 页面提交任务目标</b><p>前端把用户输入、会话 ID、模型参数、资源选择和 app 信息打包，通过 SSE 接口发给后端。</p></div></div>
+        <div class="process-row"><div class="process-label">API 分流</div><div class="process-body"><b>chat_completions / chat_react_agent 决定执行路径</b><p>普通 chat 走 <code>api_v1.py</code> 的 <code>chat_completions</code>；更强的 agentic data 流程走 <code>agentic_data_api.py</code> 的 <code>chat_react_agent</code>。</p></div></div>
+        <div class="process-row"><div class="process-label">构造 Agent</div><div class="process-body"><b>加载上下文、资源、LLM 配置和工具</b><p><code>ConversableAgent.build()</code> 会准备系统提示词、资源变量、记忆和动作列表，为后续思考和行动做准备。</p></div></div>
+        <div class="process-row"><div class="process-label">执行循环</div><div class="process-body"><b>thinking → act → verify</b><p>Agent 先生成思考或计划，再通过工具执行 SQL、代码、知识检索、技能脚本等动作，最后校验是否得到可用结果。</p></div></div>
+        <div class="process-row"><div class="process-label">流式展示</div><div class="process-body"><b>步骤、工具输出、最终答案逐步回到 UI</b><p><code>stream_callback</code> 和 SSE event 将中间步骤发给前端，用户能看到过程而不只是最终结果。</p></div></div>
+      </div>
+    </section>
+
+    <section>
+      <div class="section-title">
+        <h2>如何实现：源码分层拆解</h2>
+        <p>这项能力由三层组成：API 编排层、Agent 抽象层、工具执行层。</p>
+      </div>
+      <div class="impl-list">
+        <div class="impl-item"><h3>1. API 编排层</h3><p><code>api_v1.py</code> 负责传统聊天场景，<code>agentic_data_api.py</code> 负责更复杂的 ReAct/Manus 风格执行流，包括步骤构造、工具输出分块和下载接口。</p></div>
+        <div class="impl-item"><h3>2. Agent 抽象层</h3><p><code>agent.py</code> 定义 Agent 必须具备的生命周期；<code>base_agent.py</code> 实现上下文管理、模型调用、动作调用和结果校验。</p></div>
+        <div class="impl-item"><h3>3. 具体 Agent 层</h3><p><code>react_agent.py</code> 和 <code>data_analysis_agent.py</code> 在抽象 Agent 基础上实现工具推理和数据分析任务。</p></div>
+        <div class="impl-item"><h3>4. 工具执行层</h3><p><code>agentic_data_api.py</code> 内部注册了知识检索、SQL 查询、代码解释器、HTML 解释器、shell 解释器和 skill 执行等工具函数。</p></div>
+      </div>
+    </section>
+
+    <section>
+      <div class="section-title">
+        <h2>每一块源码是什么样的</h2>
+        <p>下面按职责列出“应该打开看的源码块”。</p>
+      </div>
+      <div class="source-map">
+        <div class="source-file"><header><span>packages/dbgpt-app/src/dbgpt_app/openapi/api_v1/api_v1.py</span><span>聊天 API</span></header><div class="source-desc">看 <code>chat_completions</code> 如何根据 <code>dialogue.chat_mode</code> 选择 ChatScene，并决定走普通流式响应、ChatFlow 还是 ChatAgent。</div></div>
+        <div class="source-file"><header><span>packages/dbgpt-app/src/dbgpt_app/openapi/api_v1/agentic_data_api.py</span><span>Agentic API</span></header><div class="source-desc">看 <code>_react_agent_stream</code>、<code>build_step</code>、<code>step_chunk</code>、<code>knowledge_retrieve</code>、<code>sql_query</code>、<code>code_interpreter</code> 如何把工具执行过程变成前端可展示的步骤流。</div></div>
+        <div class="source-file"><header><span>packages/dbgpt-core/src/dbgpt/agent/core/base_agent.py</span><span>Agent 主体</span></header><div class="source-desc">重点看 <code>generate_reply</code>、<code>thinking</code>、<code>act</code>、<code>verify</code>、<code>load_resource</code>，这是 Agent 行为闭环。</div></div>
+        <div class="source-file"><header><span>packages/dbgpt-core/src/dbgpt/agent/expand/react_agent.py</span><span>ReAct 执行</span></header><div class="source-desc">重点看 <code>act</code> 如何解析工具调用、执行工具并继续组织下一步消息。</div></div>
+      </div>
+    </section>
+
+    <section>
+      <div class="section-title">
+        <h2>关键源码</h2>
+        <p>这些文件构成 Agentic 分析的核心骨架。</p>
+      </div>
+      <div class="table">
+        <div class="row head"><div>文件</div><div>关键对象</div><div>作用</div></div>
+        <div class="row"><div><code>dbgpt_app/openapi/api_v1/api_v1.py</code></div><div><code>chat_completions</code>, <code>ChatScene</code></div><div>聊天主入口，负责选择场景、流式返回、ChatFactory 调度。</div></div>
+        <div class="row"><div><code>dbgpt_app/openapi/api_v1/agentic_data_api.py</code></div><div><code>_react_agent_stream</code>, <code>chat_react_agent</code></div><div>Agentic Data 的独立 API，包含工具、技能、知识检索、SQL、代码解释器。</div></div>
+        <div class="row"><div><code>dbgpt/agent/core/agent.py</code></div><div><code>Agent</code>, <code>AgentMessage</code></div><div>定义 Agent 抽象接口和消息结构。</div></div>
+        <div class="row"><div><code>dbgpt/agent/core/base_agent.py</code></div><div><code>ConversableAgent</code></div><div>实现可对话 Agent 的上下文、思考、行动、校验和流式回调。</div></div>
+        <div class="row"><div><code>dbgpt/agent/expand/react_agent.py</code></div><div><code>ReActAgent</code></div><div>实现 ReAct 风格工具调用流程。</div></div>
+        <div class="row"><div><code>dbgpt/agent/expand/data_analysis_agent.py</code></div><div><code>DataAnalysisAgent</code></div><div>面向数据分析任务的具体 Agent。</div></div>
+      </div>
+    </section>
+
+    <section>
+      <div class="section-title"><h2>关键代码摘录</h2><p>下面直接放真实源码片段，按“入口分流 → Agent 生成回复 → ReAct 动作执行”的顺序阅读。</p></div>
+      <div class="code-card">
+        <div class="code-head"><span>聊天主入口：按 ChatScene 分流并返回 SSE</span><span>packages/dbgpt-app/src/dbgpt_app/openapi/api_v1/api_v1.py:526-573</span></div>
+        <pre> 526: @router.post("/v1/chat/completions")
+ 527: async def chat_completions(
+ 528:     dialogue: ConversationVo = Body(),
+ 529:     flow_service: FlowService = Depends(get_chat_flow),
+ 530:     user_token: UserRequest = Depends(get_user_from_headers),
+ 531: ):
+ 532:     logger.info(
+ 533:         f"chat_completions:{dialogue.chat_mode},{dialogue.select_param},"
+ 534:         f"{dialogue.model_name}, timestamp={int(time.time() * 1000)}"
+ 535:     )
+ 536:     dialogue.user_name = user_token.user_id if user_token else dialogue.user_name
+ 537:     dialogue = adapt_native_app_model(dialogue)
+ 538:
+ 539:     # Handle knowledge space selection from ext_info for normal chat mode
+ 540:     if dialogue.chat_mode == ChatScene.ChatNormal.value() and dialogue.ext_info:
+ 541:         knowledge_space = dialogue.ext_info.get("knowledge_space")
+ 542:         if knowledge_space:
+ 543:             # Switch to chat_knowledge mode with selected space
+ 544:             dialogue.chat_mode = ChatScene.ChatKnowledge.value()
+ 545:             dialogue.select_param = knowledge_space
+ 546:     headers = {
+ 547:         "Content-Type": "text/event-stream",
+ 548:         "Cache-Control": "no-cache",
+ 549:         "Connection": "keep-alive",
+ 550:         "Transfer-Encoding": "chunked",
+ 551:     }
+ 552:     try:
+ 553:         domain_type = _parse_domain_type(dialogue)
+ 554:         if dialogue.chat_mode == ChatScene.ChatAgent.value():
+ 555:             from dbgpt_serve.agent.agents.controller import multi_agents
+ 556:
+ 557:             dialogue.ext_info.update({"model_name": dialogue.model_name})
+ 558:             dialogue.ext_info.update({"incremental": dialogue.incremental})
+ 559:             dialogue.ext_info.update({"temperature": dialogue.temperature})
+ 560:             return StreamingResponse(
+ 561:                 multi_agents.app_agent_chat(
+ 562:                     conv_uid=dialogue.conv_uid,
+ 563:                     chat_mode=dialogue.chat_mode,
+ 564:                     gpts_name=dialogue.app_code,
+ 565:                     user_query=dialogue.user_input,
+ 566:                     user_code=dialogue.user_name,
+ 567:                     sys_code=dialogue.sys_code,
+ 568:                     app_code=dialogue.app_code,
+ 569:                     **dialogue.ext_info,
+ 570:                 ),
+ 571:                 headers=headers,
+ 572:                 media_type="text/event-stream",
+ 573:             )</pre>
+      </div>
+      <div class="code-card">
+        <div class="code-head"><span>Agent 回复生成：初始化消息、追踪 span、接入 stream_callback</span><span>packages/dbgpt-core/src/dbgpt/agent/core/base_agent.py:436-500</span></div>
+        <pre> 436:     async def generate_reply(
+ 437:         self,
+ 438:         received_message: AgentMessage,
+ 439:         sender: Agent,
+ 440:         reviewer: Optional[Agent] = None,
+ 441:         rely_messages: Optional[List[AgentMessage]] = None,
+ 442:         historical_dialogues: Optional[List[AgentMessage]] = None,
+ 443:         is_retry_chat: bool = False,
+ 444:         last_speaker_name: Optional[str] = None,
+ 445:         **kwargs,
+ 446:     ) -&gt; AgentMessage:
+ 447:         """Generate a reply based on the received messages."""
+ 448:         stream_callback = kwargs.pop("stream_callback", None)
+ 449:
+ 450:         async def _emit_stream(event_type: str, payload: Dict[str, Any]) -&gt; None:
+ 451:             if not stream_callback:
+ 452:                 return
+ 453:             try:
+ 454:                 if asyncio.iscoroutinefunction(stream_callback):
+ 455:                     await stream_callback(event_type, payload)
+ 456:                     return
+ 457:                 result = stream_callback(event_type, payload)
+ 458:                 if asyncio.iscoroutine(result):
+ 459:                     await result
+ 460:             except Exception:
+ 461:                 logger.exception("stream_callback error")
+ 462:
+ 463:         logger.info(
+ 464:             f"generate agent reply!sender={sender}, rely_messages_len={rely_messages}"
+ 465:         )
+ 466:         root_span = root_tracer.start_span(
+ 467:             "agent.generate_reply",
+ 468:             metadata={
+ 469:                 "sender": sender.name,
+ 470:                 "recipient": self.name,
+ 471:                 "reviewer": reviewer.name if reviewer else None,
+ 472:                 "received_message": json.dumps(received_message.to_dict()),
+ 473:                 "conv_uid": self.not_null_agent_context.conv_id,
+ 474:                 "rely_messages": (
+ 475:                     [msg.to_dict() for msg in rely_messages] if rely_messages else None
+ 476:                 ),
+ 477:             },
+ 478:         )
+ 479:         reply_message = None
+ 480:
+ 481:         try:
+ 482:             with root_tracer.start_span(
+ 483:                 "agent.generate_reply._init_reply_message",
+ 484:             ) as span:
+ 485:                 # initialize reply message
+ 486:                 a_reply_message: Optional[
+ 487:                     AgentMessage
+ 488:                 ] = await self._a_init_reply_message(received_message=received_message)
+ 489:                 if a_reply_message:
+ 490:                     reply_message = a_reply_message
+ 491:                 else:
+ 492:                     reply_message = self._init_reply_message(
+ 493:                         received_message=received_message
+ 494:                     )
+ 495:                 span.metadata["reply_message"] = reply_message.to_dict()
+ 496:
+ 497:             fail_reason = None
+ 498:             current_retry_counter = 0
+ 499:             start_time = time.time()
+ 500:             is_success = True</pre>
+      </div>
+      <div class="code-card">
+        <div class="code-head"><span>ReAct 动作执行：解析当前 step 并限制单次一个 action</span><span>packages/dbgpt-core/src/dbgpt/agent/expand/react_agent.py:231-267</span></div>
+        <pre> 231:     async def act(
+ 232:         self,
+ 233:         message: AgentMessage,
+ 234:         sender: Agent,
+ 235:         reviewer: Optional[Agent] = None,
+ 236:         is_retry_chat: bool = False,
+ 237:         last_speaker_name: Optional[str] = None,
+ 238:         **kwargs,
+ 239:     ) -&gt; ActionOutput:
+ 240:         """Perform actions."""
+ 241:         message_content = message.content
+ 242:         if not message_content:
+ 243:             raise ValueError("The response is empty.")
+ 244:         try:
+ 245:             steps = self.parser.parse_current_step(message_content)
+ 246:             err_msg = None
+ 247:             if not steps:
+ 248:                 err_msg = (
+ 249:                     "No correct response found. Please check your response, which must"
+ 250:                     " be in the format indicated in the system prompt."
+ 251:                 )
+ 252:             elif len(steps) != 1:
+ 253:                 err_msg = "Only one action is allowed each time."
+ 254:             if err_msg:
+ 255:                 return ActionOutput(is_exe_success=False, content=err_msg)
+ 256:         except Exception as e:
+ 257:             logger.warning(f"review error: {e}")
+ 258:
+ 259:         action_output = await super().act(
+ 260:             message=message,
+ 261:             sender=sender,
+ 262:             reviewer=reviewer,
+ 263:             is_retry_chat=is_retry_chat,
+ 264:             last_speaker_name=last_speaker_name,
+ 265:             **kwargs,
+ 266:         )
+ 267:         return action_output</pre>
+      </div>
+    </section>
+
+    <section>
+      <div class="section-title"><h2>二次开发切入点</h2><p>如果要扩展 Agentic 分析，可以从以下位置入手。</p></div>
+      <div class="grid two">
+        <article class="card"><h3>新增工具</h3><p>在 <code>agentic_data_api.py</code> 的工具函数组里增加可调用函数，并处理输出分块、错误和展示格式。</p></article>
+        <article class="card"><h3>新增 Agent</h3><p>继承 <code>ConversableAgent</code> 或参考 <code>DataAnalysisAgent</code>，重写资源准备、act 参数和记忆片段。</p></article>
+        <article class="card"><h3>调整步骤展示</h3><p>关注 <code>build_step</code>、<code>step_chunk</code>、<code>stream_callback</code>，这些影响前端如何展示执行过程。</p></article>
+        <article class="card"><h3>接入新资源</h3><p>把数据库、知识库、文件或外部工具包装成 Agent 可用资源，供 <code>load_resource</code> 或 tool action 调用。</p></article>
+      </div>
+    </section>
+
+    <section class="callout">学习这项能力时，重点不是背函数名，而是掌握一个模型：Agent 接收目标，构造上下文，选择动作，执行工具，校验结果，再把过程流式返回。</section>
+    <section class="next">
+      <a class="button" href="./text2sql-datasource.html">下一项：自主 SQL 与数据源</a>
+      <a class="button alt" href="../index.html#features">返回核心能力</a>
+    </section>
+  </main>
+  <footer>DB-GPT 核心能力文档 · Agentic 数据分析</footer>
+</body>
+</html>

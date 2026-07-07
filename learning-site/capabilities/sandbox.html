@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>沙箱代码执行 · DB-GPT 核心能力</title>
+  <link rel="stylesheet" href="./capability.css" />
+</head>
+<body>
+  <header class="topbar"><nav class="nav"><a class="brand" href="../index.html">DB-GPT 文档门户</a><div><a href="../index.html#features">核心能力</a><a href="../index.html#deploy">部署</a></div></nav></header>
+  <div class="hero"><div class="hero-inner"><div class="crumb">核心能力 / 沙箱代码执行</div><h1>让模型生成的代码在受控环境中运行</h1><p class="lead">DB-GPT 的 sandbox 包定义了统一的 SandboxRuntime 和 SandboxSession 抽象，支持 local、docker、podman、nerdctl 等执行后端，用于隔离运行 Python、bash 或分析脚本。</p><div class="meta"><span class="pill">包：dbgpt-sandbox</span><span class="pill">抽象：SandboxRuntime / SandboxSession</span><span class="pill">调用：agentic_data_api shell_interpreter</span></div></div></div>
+  <main>
+    <section><div class="section-title"><h2>能力定位</h2></div><div class="grid three"><article class="card"><h3>隔离执行</h3><p>模型生成代码需要运行，但不应该直接影响主服务进程和宿主环境。</p></article><article class="card"><h3>统一接口</h3><p>无论 local、docker 还是 podman，都通过 <code>SandboxRuntime</code> 和 <code>SandboxSession</code> 抽象调用。</p></article><article class="card"><h3>资源限制</h3><p>执行层可以设置工作目录、超时、内存和环境变量，降低失控风险。</p></article></div></section>
+    <section><div class="section-title"><h2>实现链路</h2></div><div class="flow"><div class="flow-step"><b>1. Agent 生成代码</b><span>分析任务需要运行 Python 或 shell。</span></div><div class="flow-step"><b>2. 调用解释器</b><span><code>code_interpreter</code> 或 <code>shell_interpreter</code> 接收代码。</span></div><div class="flow-step"><b>3. 创建 Session</b><span><code>LocalRuntime.create_session</code> 创建临时执行目录。</span></div><div class="flow-step"><b>4. 执行并限制</b><span><code>execute</code> 写入脚本文件并通过子进程执行。</span></div><div class="flow-step"><b>5. 返回结果</b><span><code>ExecutionResult</code> 包含 stdout、stderr、状态和耗时。</span></div></div></section>
+    <section><div class="section-title"><h2>流程图：代码如何进入沙箱并返回结果</h2></div><div class="process-diagram"><div class="process-row"><div class="process-label">生成代码</div><div class="process-body"><b>Agent 或技能产生 Python / shell 片段</b><p>代码可能来自用户任务、skill 脚本或工具调用。</p></div></div><div class="process-row"><div class="process-label">解释器入口</div><div class="process-body"><b>code_interpreter / shell_interpreter</b><p><code>agentic_data_api.py</code> 负责接收代码，并创建 sandbox runtime。</p></div></div><div class="process-row"><div class="process-label">Session 创建</div><div class="process-body"><b>选择 LocalRuntime / DockerRuntime 等</b><p><code>create_session</code> 创建临时目录、环境变量和执行配置。</p></div></div><div class="process-row"><div class="process-label">执行限制</div><div class="process-body"><b>写入文件并通过子进程运行</b><p><code>LocalSandboxSession.execute</code> 调用 <code>_run_with_limits</code> 执行命令并限制时间。</p></div></div><div class="process-row"><div class="process-label">结果封装</div><div class="process-body"><b>ExecutionResult 返回状态和输出</b><p>stdout、stderr、exit code、耗时被封装后交还给 Agent 或前端。</p></div></div></div></section>
+    <section><div class="section-title"><h2>如何实现：源码分层拆解</h2></div><div class="impl-list"><div class="impl-item"><h3>1. 抽象层</h3><p><code>base.py</code> 定义 <code>ExecutionResult</code>、<code>SessionConfig</code>、<code>SandboxSession</code>、<code>SandboxRuntime</code>。</p></div><div class="impl-item"><h3>2. 本地执行层</h3><p><code>local_runtime.py</code> 创建临时目录、写入代码文件、生成执行命令并收集输出。</p></div><div class="impl-item"><h3>3. 容器执行层</h3><p><code>docker_runtime.py</code>、<code>podman_runtime.py</code>、<code>nerdctl_runtime.py</code> 提供更强隔离方案。</p></div><div class="impl-item"><h3>4. Agent 调用层</h3><p><code>agentic_data_api.py</code> 的 <code>shell_interpreter</code> 直接展示了如何调用 dbgpt-sandbox。</p></div></div></section>
+    <section><div class="section-title"><h2>每一块源码是什么样的</h2></div><div class="source-map"><div class="source-file"><header><span>execution_layer/base.py</span><span>抽象接口</span></header><div class="source-desc">先看这里，理解 runtime 和 session 的职责边界。</div></div><div class="source-file"><header><span>execution_layer/local_runtime.py</span><span>本地实现</span></header><div class="source-desc">重点看 <code>execute</code>、<code>_create_code_file</code>、<code>_get_exec_command</code>、<code>_run_with_limits</code>。</div></div><div class="source-file"><header><span>sandbox/main.py</span><span>服务入口</span></header><div class="source-desc">独立启动 sandbox server 时从这里进入。</div></div><div class="source-file"><header><span>agentic_data_api.py</span><span>调用示例</span></header><div class="source-desc">看 <code>shell_interpreter</code> 如何 import <code>LocalRuntime</code>、创建 session、执行并返回结果。</div></div></div></section>
+    <section><div class="section-title"><h2>关键源码</h2></div><div class="table"><div class="row head"><div>文件</div><div>关键对象</div><div>作用</div></div><div class="row"><div><code>dbgpt_sandbox/sandbox/execution_layer/base.py</code></div><div><code>ExecutionResult</code>, <code>SandboxSession</code>, <code>SandboxRuntime</code></div><div>沙箱执行抽象定义。</div></div><div class="row"><div><code>local_runtime.py</code></div><div><code>LocalSandboxSession</code>, <code>LocalRuntime</code></div><div>本地子进程执行实现。</div></div><div class="row"><div><code>docker_runtime.py</code></div><div><code>DockerRuntime</code></div><div>Docker 隔离执行实现。</div></div><div class="row"><div><code>agentic_data_api.py</code></div><div><code>shell_interpreter</code>, <code>code_interpreter</code></div><div>Agentic 分析调用 sandbox 的入口。</div></div></div></section>
+    <section><div class="section-title"><h2>关键代码摘录</h2><p>沙箱能力要看抽象数据结构、Session/Runtime 边界，以及本地运行时代码如何落盘、执行、回收。</p></div><div class="code-card"><div class="code-head"><span>执行结果与会话配置：统一返回状态、输出和资源信息</span><span>packages/dbgpt-sandbox/src/dbgpt_sandbox/sandbox/execution_layer/base.py:14-56</span></div><pre>  14: class ExecutionStatus(Enum):
+  15:     """执行状态枚举"""
+  16:
+  17:     SUCCESS = "success"
+  18:     ERROR = "error"
+  19:     TIMEOUT = "timeout"
+  20:     RESOURCE_LIMIT = "resource_limit"
+  21:
+  22:
+  23: @dataclass
+  24: class ExecutionResult:
+  25:     """代码执行结果"""
+  26:
+  27:     status: ExecutionStatus
+  28:     output: str = ""
+  29:     error: str = ""
+  30:     execution_time: float = 0.0
+  31:     memory_usage: int = 0  # bytes
+  32:     exit_code: int = 0
+  33:
+  34:     def to_dict(self) -&gt; Dict[str, Any]:
+  35:         """转换为字典格式"""
+  36:         return {
+  37:             "status": self.status.value,
+  38:             "output": self.output,
+  39:             "error": self.error,
+  40:             "execution_time": self.execution_time,
+  41:             "memory_usage": self.memory_usage,
+  42:             "exit_code": self.exit_code,
+  43:         }
+  44:
+  45:
+  46: @dataclass
+  47: class SessionConfig:
+  48:     """会话配置"""
+  49:
+  50:     language: str = "python"
+  51:     timeout: int = 30  # seconds
+  52:     max_memory: int = 256 * 1024 * 1024  # 256MB
+  53:     # max_cpu_percent: float = 50.0
+  54:     max_cpus: int = 1
+  55:     working_dir: str = "/workspace"
+  56:     environment_vars: Dict[str, str] = None</pre></div><div class="code-card"><div class="code-head"><span>沙箱抽象：Session 执行代码，Runtime 管理会话</span><span>packages/dbgpt-sandbox/src/dbgpt_sandbox/sandbox/execution_layer/base.py:64-156</span></div><pre>  64: class SandboxSession(ABC):
+  65:     """沙箱会话抽象类"""
+  66:
+  67:     def __init__(self, session_id: str, config: SessionConfig):
+  68:         self.session_id = session_id
+  69:         self.config = config
+  70:         self.created_at = time.time()
+  71:         self.last_accessed = time.time()
+  72:         self._is_active = False
+  73:
+  74:     @property
+  75:     def is_active(self) -&gt; bool:
+  76:         """检查会话是否活跃"""
+  77:         return self._is_active
+  78:
+  79:     @abstractmethod
+  80:     async def start(self) -&gt; bool:
+  81:         """启动会话"""
+  82:         pass
+  83:
+  84:     @abstractmethod
+  85:     async def stop(self) -&gt; bool:
+  86:         """停止会话"""
+  87:         pass
+  88:
+  89:     @abstractmethod
+  90:     async def execute(self, code: str) -&gt; ExecutionResult:
+  91:         """执行代码"""
+  92:         pass
+  93:
+  94:     @abstractmethod
+  95:     async def get_status(self) -&gt; Dict[str, Any]:
+  96:         """获取会话状态"""
+  97:         pass
+  98:
+  99:     async def install_dependencies(self, dependencies: List[str]) -&gt; ExecutionResult:
+ 100:         """安装依赖（可选）。默认未实现，由具体运行时覆盖。
+ 101:         返回 ExecutionResult，status 为 ERROR 表示未实现或失败。
+ 102:         """
+ 103:         if not dependencies:
+ 104:             return ExecutionResult(
+ 105:                 status=ExecutionStatus.SUCCESS, output="无依赖需要安装", exit_code=0
+ 106:             )
+ 107:         return ExecutionResult(
+ 108:             status=ExecutionStatus.ERROR, error="依赖安装未实现", exit_code=1
+ 109:         )
+ 110:
+ 111:     def update_last_accessed(self):
+ 112:         """更新最后访问时间"""
+ 113:         self.last_accessed = time.time()
+ 114:
+ 115:
+ 116: class SandboxRuntime(ABC):
+ 117:     """沙箱运行时抽象类"""
+ 118:
+ 119:     def __init__(self, runtime_id: str):
+ 120:         self.runtime_id = runtime_id
+ 121:         self.sessions: Dict[str, SandboxSession] = {}
+ 122:
+ 123:     @abstractmethod
+ 124:     async def create_session(
+ 125:         self, session_id: str, config: SessionConfig
+ 126:     ) -&gt; SandboxSession:
+ 127:         """创建新的沙箱会话"""
+ 128:         pass
+ 129:
+ 130:     @abstractmethod
+ 131:     async def destroy_session(self, session_id: str) -&gt; bool:
+ 132:         """销毁沙箱会话"""
+ 133:         pass
+ 134:
+ 135:     @abstractmethod
+ 136:     async def list_sessions(self) -&gt; List[str]:
+ 137:         """列出所有活跃会话"""
+ 138:         pass
+ 139:
+ 140:     @abstractmethod
+ 141:     async def get_session(self, session_id: str) -&gt; Optional[SandboxSession]:
+ 142:         """获取指定会话"""
+ 143:         pass
+ 144:
+ 145:     @abstractmethod
+ 146:     async def cleanup_expired_sessions(self, max_idle_time: int = 3600) -&gt; int:
+ 147:         """清理过期会话，返回清理的会话数量"""
+ 148:         pass
+ 149:
+ 150:     @abstractmethod
+ 151:     async def health_check(self) -&gt; Dict[str, Any]:
+ 152:         """健康检查"""
+ 153:         pass
+ 154:
+ 155:     @abstractmethod
+ 156:     def supports_language(self, language: str) -&gt; bool:</pre></div><div class="code-card"><div class="code-head"><span>本地执行：安全检查、创建临时文件、执行并封装结果</span><span>packages/dbgpt-sandbox/src/dbgpt_sandbox/sandbox/execution_layer/local_runtime.py:94-145</span></div><pre>  94:     async def execute(self, code: str) -&gt; ExecutionResult:
+  95:         """在本地进程中执行代码"""
+  96:         if not self._is_active or not self.work_dir:
+  97:             return ExecutionResult(
+  98:                 status=ExecutionStatus.ERROR, error="会话未启动或工作目录不存在"
+  99:             )
+ 100:
+ 101:         self.update_last_accessed()
+ 102:
+ 103:         # 安全检查
+ 104:         warnings = self.security_utils.validate_code(code, self.config.language)
+ 105:         if warnings and any("危险操作" in w for w in warnings):
+ 106:             return ExecutionResult(
+ 107:                 status=ExecutionStatus.ERROR,
+ 108:                 error=f"代码安全检查失败: {'; '.join(warnings)}",
+ 109:             )
+ 110:
+ 111:         try:
+ 112:             # 创建代码文件
+ 113:             code_file = self._create_code_file(code)
+ 114:
+ 115:             # 获取执行命令
+ 116:             command = self._get_exec_command(code_file)
+ 117:
+ 118:             # 执行代码
+ 119:             start_time = time.time()
+ 120:             result = await self._run_with_limits(command)
+ 121:             execution_time = time.time() - start_time
+ 122:
+ 123:             return ExecutionResult(
+ 124:                 status=ExecutionStatus.SUCCESS
+ 125:                 if result["returncode"] == 0
+ 126:                 else ExecutionStatus.ERROR,
+ 127:                 output=result["stdout"],
+ 128:                 error=result["stderr"],
+ 129:                 execution_time=execution_time,
+ 130:                 memory_usage=result.get("memory_usage", 0),
+ 131:                 exit_code=result["returncode"],
+ 132:             )
+ 133:
+ 134:         except asyncio.TimeoutError:
+ 135:             return ExecutionResult(
+ 136:                 status=ExecutionStatus.TIMEOUT,
+ 137:                 error=f"执行超时 ({self.config.timeout}秒)",
+ 138:             )
+ 139:         except Exception as e:
+ 140:             return ExecutionResult(
+ 141:                 status=ExecutionStatus.ERROR, error=f"执行失败: {str(e)}"
+ 142:             )
+ 143:         finally:
+ 144:             if "code_file" in locals():
+ 145:                 os.unlink(code_file)</pre></div><div class="code-card"><div class="code-head"><span>命令构造与子进程执行：按 language 选择解释器</span><span>packages/dbgpt-sandbox/src/dbgpt_sandbox/sandbox/execution_layer/local_runtime.py:147-220</span></div><pre> 147:     def _create_code_file(self, code: str) -&gt; str:
+ 148:         """创建临时代码文件"""
+ 149:         extensions = {
+ 150:             "python": ".py",
+ 151:             "javascript": ".js",
+ 152:             "java": ".java",
+ 153:             "cpp": ".cpp",
+ 154:             "c": ".c",
+ 155:             "go": ".go",
+ 156:             "rust": ".rs",
+ 157:             "bash": ".sh",
+ 158:         }
+ 159:
+ 160:         ext = extensions.get(self.config.language, ".txt")
+ 161:
+ 162:         with tempfile.NamedTemporaryFile(
+ 163:             mode="w", suffix=ext, dir=self.work_dir, delete=False, encoding="utf-8"
+ 164:         ) as f:
+ 165:             f.write(code)
+ 166:             return f.name
+ 167:
+ 168:     def _get_exec_command(self, code_file: str) -&gt; List[str]:
+ 169:         """根据语言获取执行命令"""
+ 170:         filename = os.path.basename(code_file)
+ 171:
+ 172:         commands = {
+ 173:             "python": ["python", code_file],
+ 174:             "javascript": ["node", code_file],
+ 175:             "java": [
+ 176:                 "sh",
+ 177:                 "-c",
+ 178:                 f"cd {os.path.dirname(code_file)} &amp;&amp; \
+ 179:                     javac {filename} &amp;&amp; java {filename[:-5]}",
+ 180:             ],
+ 181:             "cpp": [
+ 182:                 "sh",
+ 183:                 "-c",
+ 184:                 f"cd {os.path.dirname(code_file)} &amp;&amp; g++ -o program {filename} \
+ 185:                       &amp;&amp; ./program",
+ 186:             ],
+ 187:             "c": [
+ 188:                 "sh",
+ 189:                 "-c",
+ 190:                 f"cd {os.path.dirname(code_file)} &amp;&amp; gcc -o program {filename} \
+ 191:                       &amp;&amp; ./program",
+ 192:             ],
+ 193:             "go": ["go", "run", code_file],
+ 194:             "rust": [
+ 195:                 "sh",
+ 196:                 "-c",
+ 197:                 f"cd {os.path.dirname(code_file)} &amp;&amp; rustc {filename} \
+ 198:                   -o program &amp;&amp; ./program",
+ 199:             ],
+ 200:             "bash": ["bash", code_file],
+ 201:         }
+ 202:
+ 203:         return commands.get(self.config.language, ["cat", code_file])
+ 204:
+ 205:     async def _run_with_limits(self, command: List[str]) -&gt; Dict[str, Any]:
+ 206:         """在资源限制下运行命令"""
+ 207:         process = None
+ 208:         try:
+ 209:             # 启动进程
+ 210:             process = await asyncio.create_subprocess_exec(
+ 211:                 *command,
+ 212:                 stdout=asyncio.subprocess.PIPE,
+ 213:                 stderr=asyncio.subprocess.PIPE,
+ 214:                 cwd=self.work_dir,
+ 215:                 env=dict(os.environ, **self.config.environment_vars),
+ 216:             )
+ 217:
+ 218:             # 记录进程 PID
+ 219:             if process.pid:
+ 220:                 self.process_pool.append(process.pid)</pre></div></section>
+    <section><div class="section-title"><h2>二次开发切入点</h2></div><div class="grid two"><article class="card"><h3>新增运行时</h3><p>实现新的 <code>SandboxRuntime</code>，例如 Kubernetes Job、Firecracker 或远程执行池。</p></article><article class="card"><h3>强化限制</h3><p>增加 CPU、内存、文件大小、网络访问和依赖安装策略。</p></article><article class="card"><h3>结果结构化</h3><p>把 stdout、文件产物、图表和错误栈标准化，便于前端展示。</p></article><article class="card"><h3>审计日志</h3><p>记录执行代码、用户、会话、资源使用和输出文件，用于安全审计。</p></article></div></section>
+    <section class="next"><a class="button" href="./web-console.html">下一项：可视化控制台</a><a class="button alt" href="../index.html#features">返回核心能力</a></section>
+  </main>
+  <footer>DB-GPT 核心能力文档 · 沙箱代码执行</footer>
+</body>
+</html>

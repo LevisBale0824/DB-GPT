@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>RAG 知识库 · DB-GPT 核心能力</title>
+  <link rel="stylesheet" href="./capability.css" />
+</head>
+<body>
+  <header class="topbar"><nav class="nav"><a class="brand" href="../index.html">DB-GPT 文档门户</a><div><a href="../index.html#features">核心能力</a><a href="../index.html#modules">源码模块</a></div></nav></header>
+  <div class="hero"><div class="hero-inner"><div class="crumb">核心能力 / RAG 知识库</div><h1>把企业文档转成模型可检索、可引用的上下文</h1><p class="lead">RAG 知识库能力负责知识空间管理、文档上传、切分、embedding、向量存储、召回测试和知识增强回答。</p><div class="meta"><span class="pill">API：/knowledge/*</span><span class="pill">核心：KnowledgeService</span><span class="pill">场景：ChatKnowledge</span></div></div></div>
+  <main>
+    <section><div class="section-title"><h2>能力定位</h2><p>RAG 的目标是解决模型无法知道企业私有知识的问题。DB-GPT 将文档处理成可检索片段，并在回答时注入上下文。</p></div><div class="grid three"><article class="card"><h3>知识空间</h3><p>按业务、项目或团队创建 space，隔离不同知识集合。</p></article><article class="card"><h3>文档处理</h3><p>上传文档后执行切分、保存、embedding 和同步。</p></article><article class="card"><h3>召回与回答</h3><p>根据用户问题召回相关 chunks，再结合模型生成答案。</p></article></div></section>
+    <section><div class="section-title"><h2>实现链路</h2></div><div class="flow"><div class="flow-step"><b>1. 创建 Space</b><span><code>/knowledge/space/add</code> 创建知识空间。</span></div><div class="flow-step"><b>2. 上传文档</b><span><code>/document/upload</code> 保存文件并登记文档。</span></div><div class="flow-step"><b>3. 文档同步</b><span><code>/document/sync</code> 触发切分和 embedding。</span></div><div class="flow-step"><b>4. 召回测试</b><span><code>/recall_test</code> 验证 retriever 策略。</span></div><div class="flow-step"><b>5. 知识聊天</b><span>ChatKnowledge 使用检索结果增强回答。</span></div></div></section>
+    <section><div class="section-title"><h2>流程图：文档如何变成可问答知识库</h2></div><div class="process-diagram"><div class="process-row"><div class="process-label">创建知识空间</div><div class="process-body"><b>按业务主题隔离知识</b><p><code>space_add</code> 调用 <code>KnowledgeService.create_knowledge_space</code> 创建 space。</p></div></div><div class="process-row"><div class="process-label">上传文档</div><div class="process-body"><b>文件进入知识空间</b><p><code>document_upload</code> 保存原始文件并创建文档记录。</p></div></div><div class="process-row"><div class="process-label">切分与向量化</div><div class="process-body"><b>chunk + embedding</b><p><code>document_sync</code> 触发切分策略，生成 chunk，再写入向量存储。</p></div></div><div class="process-row"><div class="process-label">召回测试</div><div class="process-body"><b>验证检索效果</b><p><code>recall_test</code> 可以检查 query 是否能召回正确片段。</p></div></div><div class="process-row"><div class="process-label">知识聊天</div><div class="process-body"><b>检索结果注入 prompt</b><p>ChatKnowledge 根据用户问题召回 chunks，把片段作为上下文交给模型回答。</p></div></div></div></section>
+    <section><div class="section-title"><h2>如何实现：源码分层拆解</h2></div><div class="impl-list"><div class="impl-item"><h3>1. Knowledge API 层</h3><p><code>knowledge/api.py</code> 暴露 space、document、chunk、recall、summary 等接口。</p></div><div class="impl-item"><h3>2. KnowledgeService 层</h3><p><code>KnowledgeService</code> 承载业务逻辑，包括创建空间、文档同步、chunk 查询和 summary。</p></div><div class="impl-item"><h3>3. RAG Core 层</h3><p><code>dbgpt/rag</code> 负责文档加载、切分、assembler、retriever 和 embedding 组合。</p></div><div class="impl-item"><h3>4. Storage 扩展层</h3><p><code>dbgpt_ext/storage</code> 负责接入 Chroma、Milvus、Qdrant 等向量存储。</p></div></div></section>
+    <section><div class="section-title"><h2>每一块源码是什么样的</h2></div><div class="source-map"><div class="source-file"><header><span>knowledge/api.py</span><span>知识库 API</span></header><div class="source-desc">看 <code>space_add</code>、<code>document_upload</code>、<code>document_sync</code>、<code>recall_test</code>、<code>chunk_list</code>。</div></div><div class="source-file"><header><span>knowledge/service.py</span><span>业务服务</span></header><div class="source-desc">看 <code>create_knowledge_space</code>、<code>create_knowledge_document</code>、<code>async_doc_embedding</code>、<code>get_document_chunks</code>。</div></div><div class="source-file"><header><span>dbgpt/rag</span><span>RAG 核心</span></header><div class="source-desc">这里包含 chunk、retriever、embedding、assembler 等可复用 RAG 能力。</div></div><div class="source-file"><header><span>web/pages/construct/knowledge</span><span>前端入口</span></header><div class="source-desc">看知识空间、文档列表、上传、同步和 chunk 管理的页面实现。</div></div></div></section>
+    <section><div class="section-title"><h2>关键源码</h2></div><div class="table"><div class="row head"><div>文件</div><div>关键对象</div><div>作用</div></div><div class="row"><div><code>dbgpt_app/knowledge/api.py</code></div><div>knowledge router</div><div>知识空间、文档、chunk、召回测试和 summary API。</div></div><div class="row"><div><code>dbgpt_app/knowledge/service.py</code></div><div><code>KnowledgeService</code></div><div>知识库业务服务，负责 space、document、chunk、embedding 和 summary。</div></div><div class="row"><div><code>dbgpt/rag</code></div><div>RAG core</div><div>文档切分、retriever、assembler、embedding 等底层能力。</div></div><div class="row"><div><code>dbgpt_ext/storage</code></div><div>vector store</div><div>Chroma、Milvus、Qdrant 等向量存储实现。</div></div><div class="row"><div><code>web/pages/construct/knowledge</code></div><div>Knowledge UI</div><div>知识库管理前端入口。</div></div></div></section>
+    <section><div class="section-title"><h2>关键代码摘录</h2><p>RAG 页补充真实源码：先看知识空间，再看文档上传、同步与向量持久化。</p></div><div class="code-card"><div class="code-head"><span>知识空间 API：创建与列表</span><span>packages/dbgpt-app/src/dbgpt_app/knowledge/api.py:84-109</span></div><pre>  84: @router.post("/knowledge/space/add")
+  85: async def space_add(
+  86:     request: KnowledgeSpaceRequest,
+  87:     user_token: UserRequest = Depends(get_user_from_headers),
+  88: ):
+  89:     logger.info(f"/space/add params: {request}")
+  90:     try:
+  91:         await blocking_func_to_async(
+  92:             get_executor(), knowledge_space_service.create_knowledge_space, request
+  93:         )
+  94:         return Result.succ([])
+  95:     except Exception as e:
+  96:         return Result.failed(code="E000X", msg=f"space add error {e}")
+  97:
+  98:
+  99: @router.post("/knowledge/space/list")
+ 100: async def space_list(request: KnowledgeSpaceRequest):
+ 101:     logger.info(f"/space/list params: {request}")
+ 102:     try:
+ 103:         res = await blocking_func_to_async(
+ 104:             get_executor(), knowledge_space_service.get_knowledge_space, request
+ 105:         )
+ 106:         return Result.succ(res)
+ 107:     except Exception as e:
+ 108:         logger.exception(f"Space list error!{str(e)}")
+ 109:         return Result.failed(code="E000X", msg=f"space list error {e}")</pre></div><div class="code-card"><div class="code-head"><span>文档上传与同步：保存文件、创建 document、生成 chunk 参数</span><span>packages/dbgpt-app/src/dbgpt_app/knowledge/api.py:395-489</span></div><pre> 395: @router.post("/knowledge/{space_name}/document/upload")
+ 396: async def document_upload(
+ 397:     space_name: str,
+ 398:     doc_name: str = Form(...),
+ 399:     doc_type: str = Form(...),
+ 400:     doc_file: UploadFile = File(...),
+ 401:     fs: FileStorageClient = Depends(get_fs),
+ 402: ):
+ 403:     print(f"/document/upload params: {space_name}")
+ 404:     try:
+ 405:         if doc_file:
+ 406:             safe_filename = os.path.basename(doc_file.filename)
+ 407:             # Sanitize inputs to prevent path traversal
+ 408:             safe_space_name = os.path.basename(space_name)
+ 409:
+ 410:             custom_metadata = {
+ 411:                 "space_name": space_name,
+ 412:                 "doc_name": doc_name,
+ 413:                 "doc_type": doc_type,
+ 414:             }
+ 415:             bucket = "dbgpt_knowledge_file"
+ 416:             file_uri = await blocking_func_to_async(
+ 417:                 get_executor(),
+ 418:                 fs.save_file,
+ 419:                 bucket,
+ 420:                 safe_filename,
+ 421:                 doc_file.file,
+ 422:                 custom_metadata=custom_metadata,
+ 423:             )
+ 424:
+ 425:             try:
+ 426:                 request = KnowledgeDocumentRequest()
+ 427:                 request.doc_name = doc_name
+ 428:                 request.doc_type = doc_type
+ 429:                 request.content = file_uri
+ 430:
+ 431:                 space_res = await blocking_func_to_async(
+ 432:                     get_executor(),
+ 433:                     knowledge_space_service.get_knowledge_space,
+ 434:                     KnowledgeSpaceRequest(name=safe_space_name),
+ 435:                 )
+ 436:                 if len(space_res) == 0:
+ 437:                     # create default space
+ 438:                     if "default" != safe_space_name:
+ 439:                         raise Exception("you have not create your knowledge space.")
+ 440:                     await blocking_func_to_async(
+ 441:                         get_executor(),
+ 442:                         knowledge_space_service.create_knowledge_space,
+ 443:                         KnowledgeSpaceRequest(
+ 444:                             name=safe_space_name,
+ 445:                             desc="first db-gpt rag application",
+ 446:                             owner="dbgpt",
+ 447:                         ),
+ 448:                     )
+ 449:                 res = await blocking_func_to_async(
+ 450:                     get_executor(),
+ 451:                     knowledge_space_service.create_knowledge_document,
+ 452:                     space=safe_space_name,
+ 453:                     request=request,
+ 454:                 )
+ 455:                 return Result.succ(res)
+ 456:             except Exception as e:
+ 457:                 # Clean up temp file if anything goes wrong
+ 458:                 raise e
+ 459:
+ 460:         return Result.failed(code="E000X", msg="doc_file is None")
+ 461:     except Exception as e:
+ 462:         return Result.failed(code="E000X", msg=f"document add error {e}")
+ 463:
+ 464:
+ 465: @router.post("/knowledge/{space_name}/document/sync")
+ 466: async def document_sync(
+ 467:     space_name: str,
+ 468:     request: DocumentSyncRequest,
+ 469:     service: Service = Depends(get_rag_service),
+ 470: ):
+ 471:     logger.info(f"Received params: {space_name}, {request}")
+ 472:     try:
+ 473:         space = service.get({"name": space_name})
+ 474:         if space is None:
+ 475:             return Result.failed(code="E000X", msg=f"space {space_name} not exist")
+ 476:         if request.doc_ids is None or len(request.doc_ids) == 0:
+ 477:             return Result.failed(code="E000X", msg="doc_ids is None")
+ 478:         sync_request = KnowledgeSyncRequest(
+ 479:             doc_id=request.doc_ids[0],
+ 480:             space_id=str(space.id),
+ 481:             model_name=request.model_name,
+ 482:         )
+ 483:         sync_request.chunk_parameters = ChunkParameters(
+ 484:             chunk_strategy="Automatic",
+ 485:             chunk_size=request.chunk_size or 512,
+ 486:             chunk_overlap=request.chunk_overlap or 50,
+ 487:         )
+ 488:         doc_ids = await service.sync_document(requests=[sync_request])
+ 489:         return Result.succ(doc_ids)</pre></div><div class="code-card"><div class="code-head"><span>向量持久化：assembler.persist 写入向量库并记录 chunk</span><span>packages/dbgpt-app/src/dbgpt_app/knowledge/service.py:510-544</span></div><pre> 510:     def async_doc_embedding(self, assembler, chunk_docs, doc):
+ 511:         """async document embedding into vector db
+ 512:         Args:
+ 513:             - client: EmbeddingEngine Client
+ 514:             - chunk_docs: List[Document]
+ 515:             - doc: KnowledgeDocumentEntity
+ 516:         """
+ 517:
+ 518:         logger.info(
+ 519:             f"async doc embedding sync, doc:{doc.doc_name}, chunks length is "
+ 520:             f"{len(chunk_docs)}"
+ 521:         )
+ 522:         try:
+ 523:             with root_tracer.start_span(
+ 524:                 "app.knowledge.assembler.persist",
+ 525:                 metadata={"doc": doc.doc_name, "chunks": len(chunk_docs)},
+ 526:             ):
+ 527:                 vector_ids = assembler.persist()
+ 528:             doc.status = SyncStatus.FINISHED.name
+ 529:             doc.result = "document embedding success"
+ 530:             if vector_ids is not None:
+ 531:                 doc.vector_ids = ",".join(vector_ids)
+ 532:             logger.info(f"async document embedding, success:{doc.doc_name}")
+ 533:             # save chunk details
+ 534:             chunk_entities = [
+ 535:                 DocumentChunkEntity(
+ 536:                     doc_name=doc.doc_name,
+ 537:                     doc_type=doc.doc_type,
+ 538:                     document_id=doc.id,
+ 539:                     content=chunk_doc.content,
+ 540:                     meta_info=str(chunk_doc.metadata),
+ 541:                     gmt_created=datetime.now(),
+ 542:                     gmt_modified=datetime.now(),
+ 543:                 )
+ 544:                 for chunk_doc in chunk_docs</pre></div></section>
+    <section><div class="section-title"><h2>二次开发切入点</h2></div><div class="grid two"><article class="card"><h3>新增文件解析格式</h3><p>扩展 RAG 文档加载和 chunk strategy，让更多文件类型可以进入知识库。</p></article><article class="card"><h3>替换向量库</h3><p>在 <code>dbgpt_ext/storage</code> 增加 vector store 实现，并补配置项。</p></article><article class="card"><h3>优化召回策略</h3><p>调整 retriever、top-k、rerank、相似度阈值和 chunk 策略。</p></article><article class="card"><h3>增加知识库 UI 操作</h3><p>在前端 knowledge 页面增加召回测试、chunk 预览或同步状态展示。</p></article></div></section>
+    <section class="next"><a class="button" href="./skills.html">下一项：Skills 能力复用</a><a class="button alt" href="../index.html#features">返回核心能力</a></section>
+  </main>
+  <footer>DB-GPT 核心能力文档 · RAG 知识库</footer>
+</body>
+</html>

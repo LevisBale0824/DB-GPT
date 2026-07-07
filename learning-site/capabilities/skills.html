@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Skills 能力复用 · DB-GPT 核心能力</title>
+  <link rel="stylesheet" href="./capability.css" />
+</head>
+<body>
+  <header class="topbar"><nav class="nav"><a class="brand" href="../index.html">DB-GPT 文档门户</a><div><a href="../index.html#features">核心能力</a><a href="../index.html#develop">二次开发</a></div></nav></header>
+  <div class="hero"><div class="hero-inner"><div class="crumb">核心能力 / Skills 驱动的能力复用</div><h1>把分析方法、领域流程和工具调用沉淀为可复用技能</h1><p class="lead">Skills 是 DB-GPT 的可扩展能力载体。它让团队可以把固定分析流程、脚本、说明和资源打包，然后通过前端上传、GitHub 导入或 Agent 调用复用。</p><div class="meta"><span class="pill">API：/api/v1/skills/*</span><span class="pill">前端：construct/skills</span><span class="pill">执行：agentic_data_api.py</span></div></div></div>
+  <main>
+    <section><div class="section-title"><h2>能力定位</h2></div><div class="grid three"><article class="card"><h3>方法沉淀</h3><p>把 CSV 分析、财报分析、销售分析等固定流程沉淀为目录和脚本。</p></article><article class="card"><h3>团队共享</h3><p>通过上传或 GitHub 导入，让不同用户复用同一套技能。</p></article><article class="card"><h3>Agent 调用</h3><p>Agent 可以加载 skill 文件、执行脚本，并将输出写入分析过程。</p></article></div></section>
+    <section><div class="section-title"><h2>实现链路</h2></div><div class="flow"><div class="flow-step"><b>1. 技能发现</b><span><code>/v1/skills/list</code> 扫描内置和用户技能目录。</span></div><div class="flow-step"><b>2. 查看详情</b><span><code>/v1/skills/detail</code> 返回文件树和文件内容。</span></div><div class="flow-step"><b>3. 上传技能</b><span><code>/v1/skills/upload</code> 校验并安装 zip 包。</span></div><div class="flow-step"><b>4. GitHub 导入</b><span><code>/v1/skills/import_github</code> 下载仓库并抽取技能目录。</span></div><div class="flow-step"><b>5. Agent 执行</b><span>通过 <code>execute_skill_script</code> 或工具函数执行技能脚本。</span></div></div></section>
+    <section><div class="section-title"><h2>流程图：技能如何被安装、查看和调用</h2></div><div class="process-diagram"><div class="process-row"><div class="process-label">技能来源</div><div class="process-body"><b>内置目录、上传 zip、GitHub 仓库</b><p>系统同时支持内置技能和用户技能，GitHub 导入会下载并抽取目标目录。</p></div></div><div class="process-row"><div class="process-label">技能登记</div><div class="process-body"><b>安装到用户技能目录</b><p><code>_install_skill_from_dir</code> 处理目录复制、覆盖和基础校验。</p></div></div><div class="process-row"><div class="process-label">前端查看</div><div class="process-body"><b>技能列表和文件树</b><p><code>skills/detail</code> 返回树结构，前端可以浏览 README、脚本和资源。</p></div></div><div class="process-row"><div class="process-label">Agent 加载</div><div class="process-body"><b>读取技能文件和脚本</b><p><code>load_skill</code>、<code>execute_skill_script</code> 让 Agent 在分析过程中使用技能。</p></div></div><div class="process-row"><div class="process-label">结果输出</div><div class="process-body"><b>技能脚本输出进入分析流</b><p>脚本结果被作为工具输出或上下文，参与最终回答。</p></div></div></div></section>
+    <section><div class="section-title"><h2>如何实现：源码分层拆解</h2></div><div class="impl-list"><div class="impl-item"><h3>1. API 管理层</h3><p><code>agentic_data_api.py</code> 提供 list/detail/upload/import/download 等技能管理接口。</p></div><div class="impl-item"><h3>2. 技能安装层</h3><p><code>_install_skill_from_dir</code>、<code>_extract_skill_from_zip</code>、<code>_parse_github_url</code> 处理安装来源。</p></div><div class="impl-item"><h3>3. 技能执行层</h3><p><code>execute_skill_script</code>、<code>execute_skill_script_file</code> 负责执行技能内脚本。</p></div><div class="impl-item"><h3>4. 前端管理层</h3><p><code>web/pages/construct/skills/index.tsx</code> 负责列表、详情、上传、GitHub 导入弹窗。</p></div></div></section>
+    <section><div class="section-title"><h2>每一块源码是什么样的</h2></div><div class="source-map"><div class="source-file"><header><span>agentic_data_api.py</span><span>技能 API</span></header><div class="source-desc">看 <code>list_skills</code>、<code>skill_detail</code>、<code>skill_upload</code>、<code>skill_import_from_github_v2</code>。</div></div><div class="source-file"><header><span>skills/</span><span>技能样例</span></header><div class="source-desc">看 <code>csv-data-analysis</code>、<code>financial-report-analyzer</code> 等目录如何组织 README、脚本和资源。</div></div><div class="source-file"><header><span>dbgpt/agent/skill</span><span>Agent 集成</span></header><div class="source-desc">看 <code>SkillsAgent</code> 和 middleware 如何把技能能力接入 Agent。</div></div><div class="source-file"><header><span>web/pages/construct/skills/index.tsx</span><span>前端入口</span></header><div class="source-desc">看 axios/fetch 调用 <code>/api/v1/skills/list</code>、<code>detail</code>、<code>upload</code>、<code>import_github</code>。</div></div></div></section>
+    <section><div class="section-title"><h2>关键源码</h2></div><div class="table"><div class="row head"><div>文件</div><div>关键对象</div><div>作用</div></div><div class="row"><div><code>dbgpt_app/openapi/api_v1/agentic_data_api.py</code></div><div><code>list_skills</code>, <code>skill_detail</code>, <code>skill_upload</code></div><div>Skills API 主入口。</div></div><div class="row"><div><code>skills/</code></div><div>内置技能目录</div><div>示例技能，如 CSV 分析、财报分析、skill creator。</div></div><div class="row"><div><code>web/pages/construct/skills/index.tsx</code></div><div>Skills UI</div><div>技能列表、详情、上传、GitHub 导入。</div></div><div class="row"><div><code>dbgpt/agent/skill</code></div><div>SkillsAgent / middleware</div><div>Agent 层的技能整合能力。</div></div></div></section>
+    <section><div class="section-title"><h2>关键代码摘录</h2><p>Skills 能力要看三件事：如何扫描技能目录、如何防止路径越界、如何安装上传包。</p></div><div class="code-card"><div class="code-head"><span>技能列表：SkillLoader 扫描目录并提取 metadata</span><span>packages/dbgpt-app/src/dbgpt_app/openapi/api_v1/agentic_data_api.py:309-380</span></div><pre> 309: @router.get("/v1/skills/list", response_model=Result)
+ 310: async def list_skills(
+ 311:     user_token: UserRequest = Depends(get_user_from_headers),
+ 312: ):
+ 313:     """List all available skills from the skills directory.
+ 314:
+ 315:     Returns a list of skills with their metadata, including:
+ 316:     - id: Unique identifier for the skill
+ 317:     - name: Display name of the skill
+ 318:     - description: Brief description of what the skill does
+ 319:     - version: Skill version
+ 320:     - author: Skill author
+ 321:     - skill_type: Type of skill (e.g., data_analysis, chat, coding)
+ 322:     - tags: List of tags for categorization
+ 323:     - type: 'official' for claude/ directory, 'personal' for user/ directory
+ 324:     - file_path: Relative path to the skill file
+ 325:     """
+ 326:     from dbgpt.agent.skill.loader import SkillLoader
+ 327:
+ 328:     skills_data = []
+ 329:     skills_dir = DEFAULT_SKILLS_DIR
+ 330:     skills_dir_resolved = Path(skills_dir).expanduser().resolve()
+ 331:
+ 332:     try:
+ 333:         loader = SkillLoader()
+ 334:         skills = loader.load_skills_from_directory(skills_dir, recursive=True)
+ 335:
+ 336:         for skill in skills:
+ 337:             if not skill or not skill.metadata:
+ 338:                 continue
+ 339:
+ 340:             metadata = skill.metadata
+ 341:             # Determine if the skill is official or personal based on file path
+ 342:             file_path = getattr(metadata, "file_path", None) or ""
+ 343:             if not file_path and hasattr(skill, "_config"):
+ 344:                 file_path = skill._config.get("file_path", "")
+ 345:
+ 346:             # Convert absolute file_path to relative (relative to skills_dir)
+ 347:             if file_path:
+ 348:                 try:
+ 349:                     file_path = str(
+ 350:                         Path(file_path)
+ 351:                         .expanduser()
+ 352:                         .resolve()
+ 353:                         .relative_to(skills_dir_resolved)
+ 354:                     )
+ 355:                 except Exception:
+ 356:                     pass
+ 357:
+ 358:             # Determine type based on directory structure
+ 359:             skill_type_category = "official"
+ 360:             if "user/" in file_path or "/user/" in file_path:
+ 361:                 skill_type_category = "personal"
+ 362:             elif "claude/" in file_path or "/claude/" in file_path:
+ 363:                 skill_type_category = "official"</pre></div><div class="code-card"><div class="code-head"><span>技能详情：把 file_path 限制在 DEFAULT_SKILLS_DIR 下</span><span>packages/dbgpt-app/src/dbgpt_app/openapi/api_v1/agentic_data_api.py:392-430</span></div><pre> 392: @router.get("/v1/skills/detail", response_model=Result)
+ 393: async def skill_detail(
+ 394:     skill_name: str = Query("", description="Skill name"),
+ 395:     file_path: str = Query("", description="Skill file path"),
+ 396:     user_token: UserRequest = Depends(get_user_from_headers),
+ 397: ):
+ 398:     """Load a skill detail, including file tree and SKILL.md content."""
+ 399:     if not file_path:
+ 400:         return Result.failed(code="E4001", msg="file_path is required")
+ 401:
+ 402:     skills_dir = Path(DEFAULT_SKILLS_DIR).expanduser().resolve()
+ 403:
+ 404:     # Always treat file_path as relative to skills_dir.
+ 405:     # If an absolute path was provided (legacy), try to make it relative first.
+ 406:     fp = Path(file_path).expanduser()
+ 407:     if fp.is_absolute():
+ 408:         try:
+ 409:             fp = fp.resolve().relative_to(skills_dir)
+ 410:         except Exception:
+ 411:             return Result.failed(code="E4002", msg="Invalid skill file path")
+ 412:     target = (skills_dir / fp).resolve()
+ 413:
+ 414:     # Security: ensure target is under skills_dir
+ 415:     try:
+ 416:         target.relative_to(skills_dir)
+ 417:     except Exception:
+ 418:         return Result.failed(code="E4002", msg="Invalid skill file path")
+ 419:
+ 420:     if not target.exists():
+ 421:         return Result.failed(code="E4040", msg="Skill file not found")
+ 422:
+ 423:     root_dir = target if target.is_dir() else target.parent
+ 424:
+ 425:     def build_tree(path: Path, base: Path) -&gt; Dict[str, Any]:
+ 426:         rel = path.relative_to(base)
+ 427:         node: Dict[str, Any] = {
+ 428:             "title": path.name,
+ 429:             "key": str(rel),
+ 430:         }</pre></div><div class="code-card"><div class="code-head"><span>技能上传：zip/.skill 解包或单文件安装到 user 目录</span><span>packages/dbgpt-app/src/dbgpt_app/openapi/api_v1/agentic_data_api.py:548-620</span></div><pre> 548: @router.post("/v1/skills/upload", response_model=Result)
+ 549: async def skill_upload(
+ 550:     file: UploadFile = File(...),
+ 551:     user_token: UserRequest = Depends(get_user_from_headers),
+ 552: ):
+ 553:     """Upload a skill package (.zip, .skill) or a single file to pilot/tmp/."""
+ 554:     if not file.filename:
+ 555:         return Result.failed(code="E4001", msg="No file provided")
+ 556:
+ 557:     upload_dir = Path(resolve_root_path("pilot/tmp") or "pilot/tmp").resolve()
+ 558:     upload_dir.mkdir(parents=True, exist_ok=True)
+ 559:
+ 560:     skills_dir = Path(DEFAULT_SKILLS_DIR).expanduser().resolve()
+ 561:     user_dir = skills_dir / "user"
+ 562:     user_dir.mkdir(parents=True, exist_ok=True)
+ 563:
+ 564:     try:
+ 565:         filename = _validate_upload_filename(file.filename)
+ 566:     except ValueError as exc:
+ 567:         return Result.failed(code="E4002", msg=str(exc))
+ 568:
+ 569:     suffix = Path(filename).suffix.lower()
+ 570:     stem = Path(filename).stem
+ 571:
+ 572:     try:
+ 573:         content_bytes = await file.read()
+ 574:
+ 575:         tmp_file = upload_dir / filename
+ 576:         tmp_file.write_bytes(content_bytes)
+ 577:
+ 578:         is_archive = False
+ 579:         if suffix == ".zip":
+ 580:             is_archive = True
+ 581:         elif suffix == ".skill":
+ 582:             buf = io.BytesIO(content_bytes)
+ 583:             is_archive = zipfile.is_zipfile(buf)
+ 584:
+ 585:         if is_archive:
+ 586:             # Reuse the robust _extract_skill_from_zip helper (same one used
+ 587:             # by the GitHub import endpoint) to avoid the nested-directory bug
+ 588:             # that the old inline extractall logic suffered from.
+ 589:             #
+ 590:             # strict=False: uploaded packages may not contain a SKILL.md yet.
+ 591:             tmp_zip = upload_dir / f"{uuid.uuid4().hex}.zip"
+ 592:             tmp_zip.write_bytes(content_bytes)
+ 593:             try:
+ 594:                 with tempfile.TemporaryDirectory(dir=upload_dir) as tmp_extract:
+ 595:                     dest_in_tmp = Path(tmp_extract) / "skill"
+ 596:                     try:
+ 597:                         dest_name = _extract_skill_from_zip(
+ 598:                             tmp_zip, subpath=None, dest_dir=dest_in_tmp, strict=False
+ 599:                         )
+ 600:                     except ValueError as exc:
+ 601:                         return Result.failed(code="E4002", msg=str(exc))
+ 602:
+ 603:                     rel_path = _install_skill_from_dir(dest_in_tmp, dest_name, user_dir)
+ 604:             finally:
+ 605:                 tmp_zip.unlink(missing_ok=True)
+ 606:
+ 607:         else:
+ 608:             dest = user_dir / stem
+ 609:             dest.mkdir(parents=True, exist_ok=True)
+ 610:
+ 611:             if suffix in (".md", ".skill"):
+ 612:                 target_name = "SKILL.md"
+ 613:             else:
+ 614:                 target_name = filename
+ 615:             target_file = dest / target_name
+ 616:
+ 617:             target_file.write_bytes(content_bytes)
+ 618:
+ 619:             rel_path = str(dest.relative_to(skills_dir))</pre></div></section>
+    <section><div class="section-title"><h2>二次开发切入点</h2></div><div class="grid two"><article class="card"><h3>设计技能规范</h3><p>明确 skill 目录结构、元数据、入口脚本、示例数据和 README 格式。</p></article><article class="card"><h3>增强安全校验</h3><p>上传和导入时增强文件名、路径穿越、zip 内容和依赖安装校验。</p></article><article class="card"><h3>增加技能市场</h3><p>在前端加入分类、标签、预览、安装状态和版本信息。</p></article><article class="card"><h3>接入 sandbox</h3><p>让技能执行默认走隔离环境，并对 stdout、文件输出和错误做结构化展示。</p></article></div></section>
+    <section class="next"><a class="button" href="./sandbox.html">下一项：沙箱代码执行</a><a class="button alt" href="../index.html#features">返回核心能力</a></section>
+  </main>
+  <footer>DB-GPT 核心能力文档 · Skills 能力复用</footer>
+</body>
+</html>

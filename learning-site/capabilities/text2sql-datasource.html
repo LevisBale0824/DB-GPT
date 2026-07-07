@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>自主 SQL 与数据源 · DB-GPT 核心能力</title>
+  <link rel="stylesheet" href="./capability.css" />
+</head>
+<body>
+  <header class="topbar">
+    <nav class="nav">
+      <a class="brand" href="../index.html">DB-GPT 文档门户</a>
+      <div><a href="../index.html#features">核心能力</a><a href="../index.html#api">API</a><a href="../index.html#develop">二次开发</a></div>
+    </nav>
+  </header>
+  <div class="hero">
+    <div class="hero-inner">
+      <div class="crumb">核心能力 / 自主 SQL 与数据源</div>
+      <h1>把自然语言问题转成可执行的数据查询</h1>
+      <p class="lead">DB-GPT 的数据源能力围绕数据库连接、schema summary、Text2SQL、查询执行和结果解释展开。它让业务用户可以通过自然语言访问结构化数据。</p>
+      <div class="meta"><span class="pill">API：/api/v1/chat/db/*</span><span class="pill">场景：ChatWithDbQA / ChatWithDbExecute</span><span class="pill">核心：DBConfig / DBSummaryClient</span></div>
+    </div>
+  </div>
+  <main>
+    <section>
+      <div class="section-title"><h2>能力定位</h2><p>Text2SQL 不是简单让模型写 SQL。DB-GPT 先管理数据源，再抽取表结构摘要，让模型基于真实 schema 查询。</p></div>
+      <div class="grid three">
+        <article class="card"><h3>连接管理</h3><p>通过 <code>DBConfig</code> 保存数据库类型、连接参数、用户归属和备注信息。</p></article>
+        <article class="card"><h3>结构理解</h3><p>刷新数据源会触发 <code>async_db_summary_embedding</code>，为 Text2SQL 提供表结构上下文。</p></article>
+        <article class="card"><h3>查询闭环</h3><p>模型生成 SQL 后执行查询，再把表格结果解释成自然语言或图表。</p></article>
+      </div>
+    </section>
+    <section>
+      <div class="section-title"><h2>实现链路</h2><p>从数据源页面到后端数据服务，核心链路如下。</p></div>
+      <div class="flow">
+        <div class="flow-step"><b>1. 新增连接</b><span>前端提交数据库类型、host、port、用户名等参数。</span></div>
+        <div class="flow-step"><b>2. API 接收</b><span><code>db_connect_add</code> 调用 <code>local_db_manager.add_db</code>。</span></div>
+        <div class="flow-step"><b>3. 测试连接</b><span><code>test_connect</code> 验证数据库参数是否可用。</span></div>
+        <div class="flow-step"><b>4. 刷新摘要</b><span><code>db_connect_refresh</code> 删除旧 profile 并重新生成 summary embedding。</span></div>
+        <div class="flow-step"><b>5. 聊天使用</b><span>ChatWithDbQA/Execute 获取表结构上下文，生成 SQL 并解释结果。</span></div>
+      </div>
+    </section>
+    <section><div class="section-title"><h2>流程图：自然语言如何变成 SQL 查询</h2><p>这个流程的重点是先让系统理解数据库结构，再让模型生成查询。</p></div><div class="process-diagram"><div class="process-row"><div class="process-label">数据源配置</div><div class="process-body"><b>用户在控制台新增数据库</b><p>前端提交 DB 类型、host、port、认证信息，后端用 <code>DBConfig</code> 接收并保存。</p></div></div><div class="process-row"><div class="process-label">连接验证</div><div class="process-body"><b>后端测试连接可用性</b><p><code>test_connect</code> 调用 local_db_manager，确认参数可连接真实数据库。</p></div></div><div class="process-row"><div class="process-label">Schema 摘要</div><div class="process-body"><b>刷新 summary embedding</b><p><code>db_connect_refresh</code> 删除旧 profile，再调用 <code>async_db_summary_embedding</code> 生成表结构上下文。</p></div></div><div class="process-row"><div class="process-label">聊天生成</div><div class="process-body"><b>ChatWithDbQA / Execute 使用 summary</b><p>模型基于用户问题和表结构生成 SQL，而不是脱离数据库猜测字段。</p></div></div><div class="process-row"><div class="process-label">执行解释</div><div class="process-body"><b>执行 SQL 并组织答案</b><p>查询结果被转成表格、文本解释或图表输出。</p></div></div></div></section>
+    <section><div class="section-title"><h2>如何实现：源码分层拆解</h2></div><div class="impl-list"><div class="impl-item"><h3>1. API 层</h3><p><code>api_v1.py</code> 提供 <code>db_connect_list/add/edit/delete/refresh/test</code> 等接口。</p></div><div class="impl-item"><h3>2. 数据源服务层</h3><p><code>CFG.local_db_manager</code> 负责数据源持久化、连接测试、summary 生成和数据库 profile 管理。</p></div><div class="impl-item"><h3>3. 数据库适配层</h3><p><code>dbgpt_ext/datasource</code> 放不同数据库的连接器实现，新增数据库类型通常从这里开始。</p></div><div class="impl-item"><h3>4. Chat 场景层</h3><p><code>dbgpt_app/scene/chat_db</code> 定义数据库问答和数据库执行场景的 prompt、parser 和 data loader。</p></div></div></section>
+    <section><div class="section-title"><h2>每一块源码是什么样的</h2></div><div class="source-map"><div class="source-file"><header><span>api_v1.py</span><span>数据库 API</span></header><div class="source-desc">看 <code>@router.get("/v1/chat/db/list")</code> 到 <code>@router.post("/v1/chat/db/refresh")</code> 这一组接口，理解数据源 CRUD 和 summary 刷新。</div></div><div class="source-file"><header><span>dbgpt_serve/datasource</span><span>数据源服务</span></header><div class="source-desc">看连接配置 DAO、db summary client 和 datasource service 如何操作元数据与数据库 profile。</div></div><div class="source-file"><header><span>dbgpt_ext/datasource</span><span>数据库适配器</span></header><div class="source-desc">不同数据库的 SQL 方言、连接参数和 schema 读取逻辑一般在这里扩展。</div></div><div class="source-file"><header><span>web/pages/construct/database.tsx</span><span>前端入口</span></header><div class="source-desc">看表单如何收集连接参数，以及如何调用后端 test/add/refresh 接口。</div></div></div></section>
+    <section>
+      <div class="section-title"><h2>关键源码</h2><p>自主 SQL 与数据源主要分布在 API、服务、扩展数据源和前端管理页。</p></div>
+      <div class="table">
+        <div class="row head"><div>文件</div><div>关键对象</div><div>作用</div></div>
+        <div class="row"><div><code>dbgpt_app/openapi/api_v1/api_v1.py</code></div><div><code>db_connect_list/add/edit/delete/refresh</code></div><div>数据源管理 API。</div></div>
+        <div class="row"><div><code>dbgpt_serve/datasource</code></div><div>Datasource service / DAO</div><div>连接配置、元数据、summary 和数据源服务。</div></div>
+        <div class="row"><div><code>dbgpt_ext/datasource</code></div><div>各数据库实现</div><div>MySQL、Postgres、ClickHouse、DuckDB、Hive 等外部数据库适配。</div></div>
+        <div class="row"><div><code>dbgpt_app/scene/chat_db</code></div><div>ChatWithDb 场景</div><div>数据库问答和执行场景的提示词、解析和数据加载。</div></div>
+        <div class="row"><div><code>web/pages/construct/database.tsx</code></div><div>数据源管理页面</div><div>前端新增、编辑、测试和刷新数据源。</div></div>
+      </div>
+    </section>
+    <section>
+      <div class="section-title"><h2>关键代码摘录</h2><p>数据源能力的核心入口在同一个 router 里：列表、添加、编辑、删除、刷新 summary、测试连接。</p></div>
+      <div class="code-card">
+        <div class="code-head"><span>数据源 API：CRUD 与 summary 刷新</span><span>packages/dbgpt-app/src/dbgpt_app/openapi/api_v1/api_v1.py:174-228</span></div>
+        <pre> 174: @router.get("/v1/chat/db/list", response_model=Result)
+ 175: async def db_connect_list(
+ 176:     db_name: Optional[str] = Query(default=None, description="database name"),
+ 177:     user_info: UserRequest = Depends(get_user_from_headers),
+ 178: ):
+ 179:     results = CFG.local_db_manager.get_db_list(
+ 180:         db_name=db_name, user_id=user_info.user_id
+ 181:     )
+ 182:     # 排除部分数据库不允许用户访问
+ 183:     if results and len(results):
+ 184:         results = [
+ 185:             d
+ 186:             for d in results
+ 187:             if d.get("db_name") not in ["auth", "dbgpt", "test", "public"]
+ 188:         ]
+ 189:     return Result.succ(results)
+ 190:
+ 191:
+ 192: @router.post("/v1/chat/db/add", response_model=Result)
+ 193: async def db_connect_add(
+ 194:     db_config: DBConfig = Body(),
+ 195:     user_token: UserRequest = Depends(get_user_from_headers),
+ 196: ):
+ 197:     return Result.succ(CFG.local_db_manager.add_db(db_config, user_token.user_id))
+ 198:
+ 199:
+ 208: @router.post("/v1/chat/db/edit", response_model=Result)
+ 209: async def db_connect_edit(
+ 210:     db_config: DBConfig = Body(),
+ 211:     user_token: UserRequest = Depends(get_user_from_headers),
+ 212: ):
+ 213:     return Result.succ(CFG.local_db_manager.edit_db(db_config))
+ 214:
+ 215:
+ 216: @router.post("/v1/chat/db/delete", response_model=Result[bool])
+ 217: async def db_connect_delete(db_name: str = None):
+ 218:     CFG.local_db_manager.db_summary_client.delete_db_profile(db_name)
+ 219:     return Result.succ(CFG.local_db_manager.delete_db(db_name))
+ 220:
+ 221:
+ 222: @router.post("/v1/chat/db/refresh", response_model=Result[bool])
+ 223: async def db_connect_refresh(db_config: DBConfig = Body()):
+ 224:     CFG.local_db_manager.db_summary_client.delete_db_profile(db_config.db_name)
+ 225:     success = await CFG.local_db_manager.async_db_summary_embedding(
+ 226:         db_config.db_name, db_config.db_type
+ 227:     )
+ 228:     return Result.succ(success)</pre>
+      </div>
+    </section>
+    <section>
+      <div class="section-title"><h2>二次开发切入点</h2></div>
+      <div class="grid two">
+        <article class="card"><h3>新增数据库类型</h3><p>在 <code>dbgpt_ext/datasource</code> 增加适配实现，并确保支持连接测试、schema 读取和查询执行。</p></article>
+        <article class="card"><h3>改进 Text2SQL 上下文</h3><p>调整 summary 生成内容，例如增加字段注释、样例值、主外键关系或业务别名。</p></article>
+        <article class="card"><h3>前端增加连接字段</h3><p>修改数据源页面表单、类型定义和后端 <code>DBConfig</code> 解析。</p></article>
+        <article class="card"><h3>强化权限控制</h3><p>在列表、查询和删除接口中按用户、系统库和数据源归属做过滤。</p></article>
+      </div>
+    </section>
+    <section class="next"><a class="button" href="./rag-knowledge.html">下一项：RAG 知识库</a><a class="button alt" href="../index.html#features">返回核心能力</a></section>
+  </main>
+  <footer>DB-GPT 核心能力文档 · 自主 SQL 与数据源</footer>
+</body>
+</html>

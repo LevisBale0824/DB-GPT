@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>可视化数据智能控制台 · DB-GPT 核心能力</title>
+  <link rel="stylesheet" href="./capability.css" />
+</head>
+<body>
+  <header class="topbar"><nav class="nav"><a class="brand" href="../index.html">DB-GPT 文档门户</a><div><a href="../index.html#features">核心能力</a><a href="../index.html#modules">源码模块</a></div></nav></header>
+  <div class="hero"><div class="hero-inner"><div class="crumb">核心能力 / 可视化数据智能控制台</div><h1>把后端 AI 能力变成可配置、可调试、可复用的产品界面</h1><p class="lead">DB-GPT Web 不只是聊天页，它还提供数据源、知识库、模型、Prompt、Flow、Skills、应用构建和分享等管理页面，让数据智能能力可操作、可维护。</p><div class="meta"><span class="pill">前端：Next.js + React</span><span class="pill">聊天：useChat + fetchEventSource</span><span class="pill">管理：web/pages/construct</span></div></div></div>
+  <main>
+    <section><div class="section-title"><h2>能力定位</h2></div><div class="grid three"><article class="card"><h3>统一入口</h3><p>用户通过 Web UI 使用聊天、数据源、知识库、Skills 和模型配置。</p></article><article class="card"><h3>流式交互</h3><p><code>useChat</code> 基于 <code>fetchEventSource</code> 接收后端流式响应。</p></article><article class="card"><h3>管理控制台</h3><p><code>construct</code> 页面族承载应用构建、数据库、知识库、模型、技能、工作流等管理功能。</p></article></div></section>
+    <section><div class="section-title"><h2>实现链路</h2></div><div class="flow"><div class="flow-step"><b>1. 页面入口</b><span><code>web/pages/chat/index.tsx</code> 读取路由参数和上下文。</span></div><div class="flow-step"><b>2. Hook 封装</b><span><code>useChat</code> 封装请求、SSE、abort 和状态回调。</span></div><div class="flow-step"><b>3. API 请求</b><span>请求拼接 <code>API_BASE_URL</code> 和后端接口。</span></div><div class="flow-step"><b>4. 消息渲染</b><span>前端按流式 chunk 更新聊天内容、图表和工具输出。</span></div><div class="flow-step"><b>5. 控制台管理</b><span>construct 页面通过 axios/fetch 调用数据源、知识库、技能等 API。</span></div></div></section>
+    <section><div class="section-title"><h2>流程图：前端如何把能力组织成产品</h2></div><div class="process-diagram"><div class="process-row"><div class="process-label">页面路由</div><div class="process-body"><b>Next.js pages 定义产品入口</b><p><code>web/pages/chat</code> 是聊天主界面，<code>web/pages/construct</code> 是管理控制台。</p></div></div><div class="process-row"><div class="process-label">状态与 Hook</div><div class="process-body"><b>上下文和 hooks 组织交互状态</b><p><code>ChatContext</code> 管理当前模型和会话，<code>useChat</code> 管理流式请求。</p></div></div><div class="process-row"><div class="process-label">API 调用</div><div class="process-body"><b>axios / fetchEventSource 调后端</b><p>聊天走 SSE，管理页多用 axios/fetch 调用普通 REST API。</p></div></div><div class="process-row"><div class="process-label">渲染结果</div><div class="process-body"><b>消息、表格、图表、文件和工具日志</b><p>前端根据后端返回的不同内容类型渲染不同组件。</p></div></div><div class="process-row"><div class="process-label">管理闭环</div><div class="process-body"><b>配置数据源、知识库、模型、技能</b><p>construct 页面把后端能力暴露成可配置、可维护的产品功能。</p></div></div></div></section>
+    <section><div class="section-title"><h2>如何实现：源码分层拆解</h2></div><div class="impl-list"><div class="impl-item"><h3>1. 页面层</h3><p><code>web/pages</code> 负责路由入口，Chat、construct、share、mobile 都从这里进入。</p></div><div class="impl-item"><h3>2. 组件层</h3><p><code>web/components</code> 和 <code>web/new-components</code> 承载聊天消息、布局、面板、编辑器等 UI。</p></div><div class="impl-item"><h3>3. 数据层</h3><p><code>web/hooks</code> 和 <code>web/client</code> 封装请求、流式响应和业务状态。</p></div><div class="impl-item"><h3>4. 后端映射层</h3><p>每个页面最终都会落到后端的 <code>/api</code> 或 <code>/knowledge</code> 路由，应通过接口路径反查 Python router。</p></div></div></section>
+    <section><div class="section-title"><h2>每一块源码是什么样的</h2></div><div class="source-map"><div class="source-file"><header><span>web/pages/chat/index.tsx</span><span>聊天主页面</span></header><div class="source-desc">看路由参数、ChatContext、useChat、历史消息和消息输入如何组织。</div></div><div class="source-file"><header><span>web/hooks/use-chat.ts</span><span>流式请求</span></header><div class="source-desc">重点看 <code>fetchEventSource</code> 如何消费 <code>/api/v1/chat/completions</code> 的 SSE 输出。</div></div><div class="source-file"><header><span>web/pages/construct/skills/index.tsx</span><span>技能管理</span></header><div class="source-desc">这是理解普通 REST 管理页的好入口：列表、详情、上传、导入都在一个页面里。</div></div><div class="source-file"><header><span>web/components/layout/side-bar.tsx</span><span>导航入口</span></header><div class="source-desc">看 construct 下各功能如何进入侧边栏，例如 skills、database 等。</div></div></div></section>
+    <section><div class="section-title"><h2>关键源码</h2></div><div class="table"><div class="row head"><div>文件</div><div>关键对象</div><div>作用</div></div><div class="row"><div><code>web/pages/chat/index.tsx</code></div><div><code>Chat</code></div><div>聊天主页面，管理路由参数、状态和消息区域。</div></div><div class="row"><div><code>web/hooks/use-chat.ts</code></div><div><code>useChat</code>, <code>fetchEventSource</code></div><div>封装流式聊天请求。</div></div><div class="row"><div><code>web/pages/construct/skills/index.tsx</code></div><div>Skills UI</div><div>技能列表、详情、上传和 GitHub 导入。</div></div><div class="row"><div><code>web/pages/construct/database.tsx</code></div><div>Datasource UI</div><div>数据源管理入口。</div></div><div class="row"><div><code>web/pages/construct/knowledge</code></div><div>Knowledge UI</div><div>知识库管理入口。</div></div></div></section>
+    <section><div class="section-title"><h2>关键代码摘录</h2><p>控制台前端重点看两类代码：聊天用 SSE 流式消费，管理页用普通 REST 请求维护资源。</p></div><div class="code-card"><div class="code-head"><span>聊天 Hook：封装参数、发起 SSE、处理 open/close/error/message</span><span>web/hooks/use-chat.ts:50-115</span></div><pre>  50: const useChat = ({ queryAgentURL = '/api/v1/chat/completions', app_code }: Props) =&gt; {
+  51:   const [ctrl, setCtrl] = useState&lt;AbortController&gt;({} as AbortController);
+  52:   const lastMessageRef = useRef&lt;string&gt;('');
+  53:   const { scene } = useContext(ChatContext);
+  54:   const [contextStatus, setContextStatus] = useState&lt;ChatContextStatus | null&gt;(null);
+  55:   const chat = useCallback(
+  56:     async ({ data, chatId, onMessage, onClose, onDone, onError, ctrl }: ChatParams) =&gt; {
+  57:       ctrl &amp;&amp; setCtrl(ctrl);
+  58:       lastMessageRef.current = '';
+  59:       setContextStatus(null);
+  60:       if (!data?.user_input &amp;&amp; !data?.doc_id) {
+  61:         message.warning(i18n.t('no_context_tip'));
+  62:         return;
+  63:       }
+  64:
+  65:       // Ensure prompt_code is preserved and not overwritten
+  66:       const params: Record&lt;string, any&gt; = {
+  67:         conv_uid: chatId,
+  68:         app_code,
+  69:       };
+  70:
+  71:       // Add data fields, ensuring prompt_code is set correctly
+  72:       if (data) {
+  73:         Object.keys(data).forEach(key =&gt; {
+  74:           params[key] = data[key];
+  75:         });
+  76:       }
+  77:
+  78:       try {
+  79:         await fetchEventSource(`${process.env.API_BASE_URL ?? ''}${queryAgentURL}`, {
+  80:           method: 'POST',
+  81:           headers: {
+  82:             'Content-Type': 'application/json',
+  83:             [HEADER_USER_ID_KEY]: getUserId() ?? '',
+  84:           },
+  85:           body: JSON.stringify(params),
+  86:           signal: ctrl ? ctrl.signal : null,
+  87:           openWhenHidden: true,
+  88:           async onopen(response) {
+  89:             if (response.ok &amp;&amp; response.headers.get('content-type') === EventStreamContentType) {
+  90:               return;
+  91:             }
+  92:             if (response.headers.get('content-type') === 'application/json') {
+  93:               response.json().then(data =&gt; {
+  94:                 onMessage?.(data);
+  95:                 onDone?.();
+  96:                 ctrl &amp;&amp; ctrl.abort();
+  97:               });
+  98:             }
+  99:           },
+ 100:           onclose() {
+ 101:             ctrl &amp;&amp; ctrl.abort();
+ 102:             lastMessageRef.current = '';
+ 103:             onClose?.();
+ 104:           },
+ 105:           onerror(err) {
+ 106:             throw new Error(err);
+ 107:           },
+ 108:           onmessage: event =&gt; {
+ 109:             let message = event.data;
+ 110:             let needReplaceNewline = false;
+ 111:             let parsedData;
+ 112:
+ 113:             try {
+ 114:               parsedData = JSON.parse(message);
+ 115:</pre></div><div class="code-card"><div class="code-head"><span>Skills 管理页：列表和详情接口调用</span><span>web/pages/construct/skills/index.tsx:120-155</span></div><pre> 120:       const response = (await axios.get(`${process.env.API_BASE_URL ?? ''}/api/v1/skills/list`)) as any;
+ 121:       if (currentFetch !== listFetchCountRef.current) return;
+ 122:       if (response?.success &amp;&amp; Array.isArray(response.data)) {
+ 123:         setSkillsList(response.data as SkillItem[]);
+ 124:       } else {
+ 125:         setSkillsList([]);
+ 126:       }
+ 127:     } catch (err) {
+ 128:       if (currentFetch !== listFetchCountRef.current) return;
+ 129:       console.error('[Skills] Failed to fetch list:', err);
+ 130:       setSkillsList([]);
+ 131:     } finally {
+ 132:       if (currentFetch === listFetchCountRef.current) {
+ 133:         setListLoading(false);
+ 134:       }
+ 135:     }
+ 136:   }, []);
+ 137:
+ 138:   useEffect(() =&gt; {
+ 139:     fetchSkillsList();
+ 140:   }, [fetchSkillsList]);
+ 141:
+ 142:   const fetchDetail = useCallback(async (skillName: string, filePath: string) =&gt; {
+ 143:     setDetailLoading(true);
+ 144:     try {
+ 145:       const response = await (axios.get(`${process.env.API_BASE_URL ?? ''}/api/v1/skills/detail`, {
+ 146:         params: { skill_name: skillName, file_path: filePath },
+ 147:       }) as Promise&lt;any&gt;);
+ 148:       if (response?.success &amp;&amp; response.data) {
+ 149:         setSkillDetail(response.data as SkillDetail);
+ 150:       } else {
+ 151:         setSkillDetail(null);
+ 152:       }
+ 153:     } catch (err) {
+ 154:       console.error('[Skills] Failed to fetch detail:', err);
+ 155:       setSkillDetail(null);</pre></div></section>
+    <section><div class="section-title"><h2>二次开发切入点</h2></div><div class="grid two"><article class="card"><h3>新增控制台页面</h3><p>在 <code>web/pages/construct</code> 下增加页面，并在侧边栏注册入口。</p></article><article class="card"><h3>新增 API client</h3><p>把后端接口封装到 client 或 hook，统一错误处理和 loading 状态。</p></article><article class="card"><h3>增强流式展示</h3><p>扩展消息类型，支持工具步骤、文件、图表、代码块和执行日志。</p></article><article class="card"><h3>联调后端能力</h3><p>从页面操作追到 Network，再通过接口路径回搜后端 router。</p></article></div></section>
+    <section class="next"><a class="button" href="./agentic-analysis.html">回到：Agentic 数据分析</a><a class="button alt" href="../index.html#features">返回核心能力</a></section>
+  </main>
+  <footer>DB-GPT 核心能力文档 · 可视化控制台</footer>
+</body>
+</html>
